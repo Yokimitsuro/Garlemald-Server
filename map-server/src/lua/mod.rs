@@ -139,6 +139,31 @@ impl QuestHookArg {
     }
 }
 
+/// Convert a wire-format [`common::luaparam::LuaParam`] into the matching
+/// `mlua::Value` for handoff to a Lua coroutine. Used by
+/// [`LuaEngine::call_director_on_event_started`] to forward the original
+/// `EventStartPacket` lua_params tail through to the script — pmeteor's
+/// `LuaUtils.CreateLuaParamObjectList` does the equivalent on the C# side.
+fn lua_param_to_value(lua: &Lua, param: common::luaparam::LuaParam) -> mlua::Result<Value> {
+    use common::luaparam::LuaParam;
+    Ok(match param {
+        LuaParam::Int32(v) => Value::Integer(v as mlua::Integer),
+        LuaParam::UInt32(v) => Value::Integer(v as mlua::Integer),
+        LuaParam::String(s) => Value::String(lua.create_string(&s)?),
+        LuaParam::True => Value::Boolean(true),
+        LuaParam::False => Value::Boolean(false),
+        LuaParam::Nil => Value::Nil,
+        LuaParam::Actor(id) => Value::Integer(id as mlua::Integer),
+        LuaParam::Byte(b) => Value::Integer(b as mlua::Integer),
+        LuaParam::Short(s) => Value::Integer(s as mlua::Integer),
+        // Type7/Type9 are exotic — director scripts that need them can read
+        // the raw u32/u64 fallbacks; for now we'd never hit this on the
+        // EventStart path, so log and forward Nil.
+        LuaParam::Type7 { actor_id, .. } => Value::Integer(actor_id as mlua::Integer),
+        LuaParam::Type9 { item1, .. } => Value::Integer(item1 as mlua::Integer),
+    })
+}
+
 pub struct LuaEngine {
     resolver: PathResolver,
     catalogs: Arc<Catalogs>,
@@ -594,6 +619,60 @@ impl LuaEngine {
         }
 
         PartialLuaCallResult { commands, error }
+    }
+
+    /// High-level wrapper around [`Self::spawn_director_on_event_started`]
+    /// — builds the canonical pmeteor argument shape `(player, director,
+    /// eventType, eventName, ...lua_params)` from owned, `Send`-safe inputs
+    /// and dispatches `onEventStarted`. Used by `handle_event_start` when
+    /// an inbound `EventStartPacket` targets a content director.
+    ///
+    /// The pmeteor reference is `LuaEngine.cs::EventStarted` (lines 651-682):
+    /// it prepends `eventType` then `eventName` as `LuaParam`s before calling
+    /// `Director.OnEventStart(player, args)`, which then prepends `player +
+    /// director`. So the final coroutine receives `(player, director,
+    /// eventType, eventName, ...originalLuaParams)`. Garlemald's 1.x director
+    /// scripts (e.g. `QuestDirectorMan0g001.lua::onEventStarted(player, actor,
+    /// triggerName)`) declare three parameters; Lua silently ignores extras.
+    pub fn call_director_on_event_started(
+        &self,
+        script_path: &Path,
+        player_snapshot: userdata::PlayerSnapshot,
+        director_handle: userdata::LuaDirectorHandle,
+        event_name: String,
+        event_type: u8,
+        lua_params: Vec<common::luaparam::LuaParam>,
+    ) -> PartialLuaCallResult {
+        self.spawn_director_on_event_started(script_path, |lua, queue| {
+            let player = userdata::LuaPlayer {
+                snapshot: player_snapshot,
+                queue: queue.clone(),
+            };
+            let director = userdata::LuaDirectorHandle {
+                queue: queue.clone(),
+                ..director_handle
+            };
+            let player_ud = lua
+                .create_userdata(player)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+            let director_ud = lua
+                .create_userdata(director)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaDirectorHandle): {e}"))?;
+            let mut mv = MultiValue::new();
+            mv.push_back(Value::UserData(player_ud));
+            mv.push_back(Value::UserData(director_ud));
+            mv.push_back(Value::Integer(event_type as mlua::Integer));
+            let event_name_lua = lua
+                .create_string(&event_name)
+                .map_err(|e| anyhow::anyhow!("create_string(event_name): {e}"))?;
+            mv.push_back(Value::String(event_name_lua));
+            for p in lua_params {
+                let v = lua_param_to_value(lua, p)
+                    .map_err(|e| anyhow::anyhow!("lua_param_to_value: {e}"))?;
+                mv.push_back(v);
+            }
+            Ok(mv)
+        })
     }
 
     /// Run a director's `onEventStarted(player, director, eventName, ...)`
@@ -1467,6 +1546,120 @@ mod tests {
         assert!(
             result.error.is_none(),
             "missing onCreate should be a quiet no-op; got {:?}",
+            result.error,
+        );
+        assert!(result.commands.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `call_director_on_event_started` should run the director's
+    /// `onEventStarted(player, director, eventType, eventName, ...)` hook
+    /// in a coroutine, drain commands the hook emits up to the first
+    /// yield, and park the coroutine on `_WAIT_EVENT` when it yields via
+    /// `callClientFunction`. Mirrors pmeteor `LuaEngine.cs::EventStarted`
+    /// → `Director.OnEventStart` end-to-end.
+    #[test]
+    fn call_director_on_event_started_runs_until_first_callclientfunction_yield() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+        // Stand-in for QuestDirectorMan0g001.lua's onEventStarted body —
+        // emits one SendMessage, then a callClientFunction (RunEventFunction
+        // + yield on _WAIT_EVENT). The test asserts both commands surface
+        // in the returned PartialLuaCallResult.
+        std::fs::write(
+            root.join("global.lua"),
+            r#"
+                function callClientFunction(player, fn_name, ...)
+                    player:RunEventFunction(fn_name, ...)
+                    return coroutine.yield("_WAIT_EVENT", player)
+                end
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("directors/Quest/QuestDirectorTestEv.lua"),
+            r#"
+                require ("global")
+                function onEventStarted(player, director, eventType, eventName)
+                    player:SendMessage(0x20, "", "Starting")
+                    callClientFunction(player, "delegateEvent", player, "processTtrBtl001")
+                    -- never reached on the first slice
+                    player:EndEvent()
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("directors/Quest/QuestDirectorTestEv.lua");
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_director_on_event_started(
+            &script_path,
+            sample_snapshot(),
+            sample_director(dummy_queue),
+            "noticeEvent".to_string(),
+            5,
+            vec![],
+        );
+
+        assert!(
+            result.error.is_none(),
+            "onEventStarted errored: {:?}",
+            result.error,
+        );
+        let has_send_msg = result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::SendMessage { .. }));
+        let has_run_event = result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::RunEventFunction { .. }));
+        assert!(
+            has_send_msg,
+            "missing SendGameMessage; got {:?}",
+            result.commands,
+        );
+        assert!(
+            has_run_event,
+            "missing RunEventFunction (callClientFunction emit); got {:?}",
+            result.commands,
+        );
+        // EndEvent shouldn't fire — the coroutine yielded on _WAIT_EVENT
+        // before reaching it.
+        assert!(
+            !result.commands.iter().any(|c| matches!(c, LuaCommand::EndEvent { .. })),
+            "EndEvent should be deferred until coroutine resumes; got {:?}",
+            result.commands,
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Missing `onEventStarted` global is a quiet no-op — many directors
+    /// only define `init` / `main`.
+    #[test]
+    fn call_director_on_event_started_missing_hook_is_a_quiet_no_op() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+        std::fs::write(
+            root.join("directors/Quest/QuestDirectorTestNoHook.lua"),
+            "function init() return \"/Director/Quest/QuestDirectorTestNoHook\" end",
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("directors/Quest/QuestDirectorTestNoHook.lua");
+        let result = engine.call_director_on_event_started(
+            &script_path,
+            sample_snapshot(),
+            sample_director(CommandQueue::new()),
+            "noticeEvent".to_string(),
+            5,
+            vec![],
+        );
+        assert!(
+            result.error.is_none(),
+            "missing onEventStarted should be quiet: {:?}",
             result.error,
         );
         assert!(result.commands.is_empty());

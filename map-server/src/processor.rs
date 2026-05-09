@@ -6326,6 +6326,13 @@ impl PacketProcessor {
 
         let owner_actor_id = pkt.owner_actor_id;
         let event_name_for_match = pkt.event_name.clone();
+        // Snapshot the EventStart payload before the fields are moved into
+        // `start_event`. The director-onEventStarted branch below replays
+        // the event_name + event_type + lua_params into the Lua coroutine
+        // (mirrors pmeteor `LuaEngine.cs::EventStarted`).
+        let event_name_for_director = pkt.event_name.clone();
+        let event_type_for_director = pkt.event_type;
+        let lua_params_for_director = pkt.lua_params.clone();
         let mut outbox = EventOutbox::new();
         {
             let mut chara = handle.character.write().await;
@@ -6342,6 +6349,34 @@ impl PacketProcessor {
             dispatch_event_event(&e, &self.registry, &self.world, &self.db, self.lua.as_ref())
                 .await;
         }
+
+        // Content-director `onEventStarted` dispatch. When the EventStart's
+        // `owner_actor_id` matches the player's `active_content_script`
+        // director, route into the director's `onEventStarted(player,
+        // director, eventType, eventName, ...)` hook. Without this the
+        // SEQ_005 combat-tutorial cinematic body never runs — the
+        // `KickEvent("noticeEvent")` that `man0g0::doContentArea` sends
+        // pre-warp results in the client posting `EventStart(eventType=5)`
+        // post-warp, but the existing quest-hook switch below only matches
+        // `eventType` 0–3 so the dispatch falls through and the director's
+        // `onEventStarted` body (which calls `callClientFunction(...,
+        // "processTtrBtl001", ...)` to play the cinematic) is never run.
+        //
+        // Mirrors pmeteor `LuaEngine.cs::EventStarted` (lines 651-682):
+        // `if (mSleepingOnPlayerEvent.ContainsKey(player.Id)) resume the
+        // parked coroutine; else if (target is Director) Director.OnEventStart;
+        // else CallLuaFunction(player, target, "onEventStarted", …)`. We
+        // implement the parked-resume + fresh-dispatch arms here; the NPC
+        // fallback is the existing quest-hook fan-out further down.
+        self.dispatch_event_start_to_content_director(
+            &handle,
+            session_id,
+            owner_actor_id,
+            event_name_for_director,
+            event_type_for_director,
+            lua_params_for_director,
+        )
+        .await;
 
         // Fire the per-quest event hook based on the EventStart's
         // `event_type`. Meteor's convention is to fire for *every* active
@@ -6401,6 +6436,166 @@ impl PacketProcessor {
             "event start dispatched",
         );
         Ok(())
+    }
+
+    /// EventStart router for content directors — pmeteor `LuaEngine.cs::
+    /// EventStarted` lines 651-682. If the player has an active content
+    /// script and the EventStart's owner is that content's director, run
+    /// the director's `onEventStarted` (or resume a parked coroutine
+    /// waiting on `_WAIT_EVENT`). Translates emitted event-flavoured
+    /// commands through `EventOutbox` + `dispatch_event_event` and applies
+    /// the rest through the runtime drain.
+    async fn dispatch_event_start_to_content_director(
+        &self,
+        handle: &ActorHandle,
+        session_id: u32,
+        owner_actor_id: u32,
+        event_name: String,
+        event_type: u8,
+        lua_params: Vec<common::luaparam::LuaParam>,
+    ) {
+        let Some(active) = self
+            .world
+            .session(session_id)
+            .await
+            .and_then(|s| s.active_content_script)
+        else {
+            return;
+        };
+        if owner_actor_id != active.director_actor_id {
+            return;
+        }
+        let Some(lua) = self.lua.as_ref() else {
+            return;
+        };
+
+        let actor_id = handle.actor_id;
+
+        // First, try to resume a parked `_WAIT_EVENT` coroutine. When the
+        // director's `onEventStarted` body has already run once and parked
+        // on a `callClientFunction(...)` yield, a subsequent EventStart
+        // from the client's cinematic completion should resume *that*
+        // coroutine, not start a fresh dispatch. Pmeteor's
+        // `mSleepingOnPlayerEvent` check is the same gate.
+        let resumed = lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new());
+        let commands = match resumed {
+            Some(cmds) if !cmds.is_empty() => {
+                tracing::debug!(
+                    player = actor_id,
+                    director = owner_actor_id,
+                    commands = cmds.len(),
+                    "EventStart resumed parked director coroutine",
+                );
+                cmds
+            }
+            _ => {
+                // Fresh dispatch — load the director script and run
+                // `onEventStarted` in a coroutine.
+                let script_path = lua.resolver().director(&active.director_name);
+                if !script_path.exists() {
+                    tracing::debug!(
+                        director = owner_actor_id,
+                        director_name = %active.director_name,
+                        script = %script_path.display(),
+                        "EventStart for content director skipped — script not on disk",
+                    );
+                    return;
+                }
+                let snapshot = {
+                    let c = handle.character.read().await;
+                    build_player_snapshot_from_character(&c)
+                };
+                let director_handle = crate::lua::userdata::LuaDirectorHandle {
+                    name: active.director_name.clone(),
+                    actor_id: active.director_actor_id,
+                    class_path: active.area_class_path.clone(),
+                    queue: crate::lua::command::CommandQueue::new(),
+                };
+                let lua_clone = lua.clone();
+                let script_path_clone = script_path.clone();
+                let event_name_clone = event_name.clone();
+                let lua_params_clone = lua_params;
+                let result = tokio::task::spawn_blocking(move || {
+                    lua_clone.call_director_on_event_started(
+                        &script_path_clone,
+                        snapshot,
+                        director_handle,
+                        event_name_clone,
+                        event_type,
+                        lua_params_clone,
+                    )
+                })
+                .await;
+                let partial = match result {
+                    Ok(p) => p,
+                    Err(join_err) => {
+                        tracing::warn!(
+                            director = owner_actor_id,
+                            error = %join_err,
+                            "director onEventStarted dispatch panicked",
+                        );
+                        return;
+                    }
+                };
+                if let Some(e) = partial.error {
+                    tracing::debug!(
+                        director = owner_actor_id,
+                        director_name = %active.director_name,
+                        error = %e,
+                        "director onEventStarted errored; applying partial commands",
+                    );
+                } else {
+                    tracing::debug!(
+                        director = owner_actor_id,
+                        director_name = %active.director_name,
+                        event_name = %event_name,
+                        commands = partial.commands.len(),
+                        "director onEventStarted fired",
+                    );
+                }
+                partial.commands
+            }
+        };
+
+        if commands.is_empty() {
+            return;
+        }
+
+        // Translate event-flavoured commands (`RunEventFunction` /
+        // `EndEvent` / `KickEvent`) through the EventOutbox + dispatcher
+        // so cinematic packets reach the wire. Without this step the
+        // commands fall through `apply_runtime_lua_command`'s catch-all
+        // branch and are silently dropped (see `processor.rs:1684` log).
+        // Mirrors `apply_quest_on_notice` (`runtime/quest_apply.rs:2410-
+        // 2513`) and `fire_quest_event_hook` (`processor.rs:5912-5934`).
+        let event_session_snapshot = {
+            let c = handle.character.read().await;
+            c.event_session.clone()
+        };
+        let mut outbox = crate::event::outbox::EventOutbox::new();
+        crate::event::lua_bridge::translate_lua_commands_into_outbox(
+            &commands,
+            &event_session_snapshot,
+            &mut outbox,
+        );
+        for e in outbox.drain() {
+            Box::pin(dispatch_event_event(
+                &e,
+                &self.registry,
+                &self.world,
+                &self.db,
+                self.lua.as_ref(),
+            ))
+            .await;
+        }
+        crate::runtime::quest_apply::apply_runtime_lua_commands(
+            commands,
+            &self.registry,
+            &self.db,
+            &self.world,
+            self.lua.as_ref(),
+        )
+        .await;
     }
 
     /// Mirror of pmeteor's `RequestQuestJournalCommand.lua::onEventStarted`
@@ -7154,6 +7349,20 @@ fn build_player_snapshot_for_login(c: &Character) -> crate::lua::userdata::Playe
 /// real sequence/flags/counters.
 fn build_player_snapshot_from_character(c: &Character) -> crate::lua::userdata::PlayerSnapshot {
     let mut snapshot = build_player_snapshot_for_login(c);
+    // Overlay the live EventSession state. The Lua bindings for
+    // `player:RunEventFunction(...)` and `player:EndEvent()` read
+    // `current_event_owner` / `current_event_name` / `current_event_type`
+    // from the snapshot to fill the wire packet's owner/name/type fields
+    // — pmeteor `Player.cs::RunEventFunction` does the same with
+    // `currentEventOwner` / `currentEventName` / `currentEventType` it
+    // captured in `StartEvent()`. Without this overlay, every
+    // `RunEventFunction` LuaCommand emitted by a quest/director hook
+    // ships with `event_name=""`, which the 1.x client silently no-ops
+    // — every cutscene `delegateEvent` (`processTtrNomal002`,
+    // `processTtrBtl001`, …) was being dropped on the wire.
+    snapshot.current_event_owner = c.event_session.current_event_owner;
+    snapshot.current_event_name = c.event_session.current_event_name.clone();
+    snapshot.current_event_type = c.event_session.current_event_type;
     snapshot.active_quests = c
         .quest_journal
         .slots
