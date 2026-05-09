@@ -1440,13 +1440,17 @@ impl WorldManager {
         ));
         subpackets.extend([
             tx::actor_inventory::build_inventory_begin_change(actor_id, true),
-            // Empty-package brackets. Loading items via `db.get_item_package`
-            // + `build_inventory_list_x08_n` (with pmeteor's `> 1 → x08`
-            // chunking) STILL crashes the Wine client mid-parse — character
-            // disappears, Yda remains, HUD partial. So the crash isn't
-            // chunking-related; it's in the packet body shape itself
-            // (`encode_item` field offsets) OR in receiving the same
-            // unique_ids twice (LOGIN no-op then post-warp emit).
+            // Empty-package brackets. Even with the `encode_item` fixes
+            // (tags[4] vs tags[8], TAG_EXCLUSIVE) bringing garlemald's
+            // 0x0149 packet body to byte-structural parity with
+            // pmeteor's, the post-warp inventory emission STILL crashes
+            // Wine — suggesting the crash isn't the encoded item shape
+            // but something state-adjacent (the client already knows
+            // about these unique_ids from per-AddItem dispatches at
+            // LOGIN, and a post-warp re-load of the same ids may trip
+            // some duplicate-detection assertion). Disabling inventory
+            // emission here keeps the bundle wire-stable while the
+            // root cause is investigated separately.
             tx::actor_inventory::build_inventory_set_begin(actor_id, 200, 0),
             tx::actor_inventory::build_inventory_set_end(actor_id),
             tx::actor_inventory::build_inventory_set_begin(actor_id, 320, 99),

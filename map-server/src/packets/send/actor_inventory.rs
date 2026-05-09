@@ -552,13 +552,34 @@ fn encode_item(item: &InventoryItem) -> Vec<u8> {
     };
     c.write_u16::<LittleEndian>(slot).unwrap();
     // dealingVal + dealingMode bytes + three dealingAttached u32 — left zero
-    // until trade/bazaar plumbing lights up.
+    // until trade/bazaar plumbing lights up. (1 + 1 + 4 + 4 + 4 = 14 bytes,
+    // landing at offset 0x20.)
     for _ in 0..(1 + 1 + 4 + 4 + 4) {
         c.write_u8(0).unwrap();
     }
-    // tags[] + tagValues[] — 16 bytes total of defaults.
-    for _ in 0..16 {
-        c.write_u8(0).unwrap();
+    // tags[4] + tagValues[4] — 8 bytes total. NOTE: pmeteor's
+    // `InventoryItem.cs:57-58` declares these as `byte[4]`, NOT `byte[8]`.
+    // Earlier this function wrote 16 zero bytes (8+8), which shifted
+    // `quality` from offset 0x28 to 0x30 and crashed the Wine client
+    // mid-parse during the SEQ_005 post-warp inventory respawn.
+    //
+    // tags[0] = dealingTag (0 unless item is up for trade/bazaar).
+    // tags[1] = TAG_EXCLUSIVE (0x03) for character-bound / "exclusive"
+    //   items, else 0. Pmeteor's `InventoryItem.cs:173,186` sets this
+    //   from the item's gamedata `isExclusive` flag — every captured
+    //   pmeteor item in the SEQ_005 post-warp 0x0149 had `tags[1]=3`.
+    //   Garlemald doesn't have an isExclusive plumbing yet, but for
+    //   the starter-item path setting it unconditionally matches
+    //   captured retail behavior (starter weapons / class gear are all
+    //   character-bound).
+    // tags[2..3] = 0 (reserved per pmeteor's only-tags[0]/[1]-set
+    //   convention).
+    c.write_u8(0).unwrap(); // tags[0]
+    c.write_u8(0x03).unwrap(); // tags[1] = TAG_EXCLUSIVE
+    c.write_u8(0).unwrap(); // tags[2]
+    c.write_u8(0).unwrap(); // tags[3]
+    for _ in 0..4 {
+        c.write_u8(0).unwrap(); // tagValues[0..3]
     }
     c.write_u8(item.quality).unwrap();
     out
