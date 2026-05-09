@@ -1006,29 +1006,26 @@ impl PacketProcessor {
                 trigger,
                 args,
             } => {
-                // C# `Player.KickEvent` runs with `eventType = 5` — that
-                // specific value triggers the cutscene dispatcher inside
-                // the 1.23b client. The `actor_id` is the owner (a
-                // director actor); args promote to `LuaParam`s in the
-                // packet body at offset 0x30.
+                // Capture onto the session so `send_zone_in_bundle` can
+                // emit the KickEventPacket at the END of the bundle —
+                // AFTER the player + director + nearby NPCs have all been
+                // re-spawned post-warp.
                 //
-                // Pmeteor sends the KickEvent immediately to the player's
-                // queue (`Player.KickEvent` → `QueuePacket`), letting the
-                // client buffer it and replay it once the targeted actor
-                // exists client-side. The packet-diff against
-                // `captures/pmeteor-quest/20260426-160210-gridania-manual3/`
-                // shows pmeteor's 0x012F lands BEFORE the 0x00E2 warp
-                // marker, while garlemald previously deferred it onto
-                // `session.pending_kick_event` to ride the post-warp
-                // bundle. The deferred version arrived in a Now-Loading
-                // state where the client silently dropped it (no
-                // `EventStart` echo → SEQ_005 cinematic body never ran).
+                // Per meteor-decomp `event_kick_receiver_decomp.md`, the
+                // client's `KickClientOrderEventReceiver::Receive` slot
+                // 2 silently drops kicks whose owner actor either isn't
+                // in the registry OR has `actor[+0x5c] == 0`. The flag is
+                // set when the actor's spawn-packet sequence completes.
+                // Sending the kick BEFORE the spawn (or before
+                // `DeleteAllActors` wipes the actor list) loses it.
                 //
-                // Send immediately when a live client connection exists
-                // (mid-session warp / cutscene chain). Fall back to the
-                // pending-bundle path only if the client isn't reachable
-                // — that branch is the legacy OPENING-flow safety net
-                // for sessions that haven't completed handshake yet.
+                // C# `Player.KickEvent` always uses event_type=5 (the
+                // 2-arg Lua form and 3-arg form both land here); only
+                // the rarely-used `KickEventSpecial` uses 0. The
+                // `actor_id` is the owner (the director). Args from the
+                // script (e.g. the `true` in `player:KickEvent(director,
+                // "noticeEvent", true)`) are promoted to `LuaParam`s
+                // and written into the packet body at offset 0x30.
                 let lua_params: Vec<common::luaparam::LuaParam> = args
                     .into_iter()
                     .map(|a| match a {
@@ -1058,28 +1055,7 @@ impl PacketProcessor {
                         }
                     })
                     .collect();
-                if let Some(client) = self.world.client(handle.session_id).await {
-                    let mut sub = crate::packets::send::events::build_kick_event(
-                        player_id, actor_id, &trigger, 5, &lua_params,
-                    );
-                    sub.set_target_id(handle.session_id);
-                    client.send_bytes(sub.to_bytes()).await;
-                    // Clear any prior deferred capture so the post-warp
-                    // bundle doesn't double-emit.
-                    if let Some(mut snap) = self.world.session(handle.session_id).await {
-                        if snap.pending_kick_event.is_some() {
-                            snap.pending_kick_event = None;
-                            self.world.upsert_session(snap).await;
-                        }
-                    }
-                    tracing::info!(
-                        player = player_id,
-                        target = actor_id,
-                        %trigger,
-                        args = lua_params.len(),
-                        "KickEvent dispatched immediately (mid-session)"
-                    );
-                } else if let Some(mut snap) = self.world.session(handle.session_id).await {
+                if let Some(mut snap) = self.world.session(handle.session_id).await {
                     snap.pending_kick_event = Some(crate::data::PendingKickEvent {
                         trigger_actor_id: player_id,
                         owner_actor_id: actor_id,
@@ -1087,13 +1063,13 @@ impl PacketProcessor {
                         args: lua_params,
                     });
                     self.world.upsert_session(snap).await;
-                    tracing::info!(
-                        player = player_id,
-                        target = actor_id,
-                        %trigger,
-                        "KickEvent captured (no client handle yet — will emit via zone-in bundle)"
-                    );
                 }
+                tracing::info!(
+                    player = player_id,
+                    target = actor_id,
+                    %trigger,
+                    "KickEvent captured (will emit at end of zone-in bundle, after all spawns)"
+                );
             }
             LC::AddQuest {
                 player_id,

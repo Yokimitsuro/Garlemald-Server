@@ -1341,82 +1341,25 @@ impl WorldManager {
         // player sits on "Now Loading" indefinitely after an otherwise
         // clean zone-in bundle.
         //
-        // The login director (if any) is spawned **first** — C#
-        // `Director.StartDirector(spawnImmediate=true)` emits the
-        // director's 7-packet spawn sequence during `onBeginLogin`
-        // BEFORE `DoZoneIn` runs `SendZoneInPackets`. That ordering
-        // matters: the player's `ActorInstantiate` references the
-        // director via `Actor(login_director_actor_id)` inside its
-        // ScriptBind LuaParams, and the client needs to have seen the
-        // director's `AddActor` before it can resolve that reference.
+        // Director spawn packets are appended AFTER the player's full
+        // self-spawn block (see further down in this function), not
+        // prepended. Pmeteor's `Player.SendZoneInPackets`
+        // (`Map Server/Actors/Chara/Player/Player.cs:657-661`) emits
+        // the player FIRST, then iterates `ownedDirectors` — and even
+        // though the player's `ActorInstantiate` references the
+        // director via `LuaParam::Actor(loginInitDirector)`, the 1.x
+        // client tolerates forward actor-id references (an actor id is
+        // just an integer; the client looks it up on first use). The
+        // packet-diff vs `captures/pmeteor-quest/20260426-160210-gridania-manual3/`
+        // showed garlemald inverted the order — and the SEQ_005 hang
+        // appears to need the local player's actor to be fully
+        // respawned client-side before any other actor's events can
+        // dispatch.
         let mut subpackets: Vec<common::subpacket::SubPacket> = Vec::new();
-        if let Some(spec) = &login_director_spec {
-            subpackets.extend(build_director_spawn_subpackets(
-                spec.actor_id,
-                spec.zone_actor_id,
-                &spec.class_path,
-                &spec.class_name,
-                &zone_name,
-            ));
-            tracing::info!(
-                director = spec.actor_id,
-                class_path = %spec.class_path,
-                "login director spawn packets prepended"
-            );
-            // C# `onBeginLogin` calls `player:KickEvent(director,
-            // "noticeEvent", true)` right after `StartDirector(true)` —
-            // this is the packet that actually fires the intro cutscene
-            // on the client. Without it the director exists in the
-            // client's actor table but nothing tells it to play the
-            // opening event. Emit the KickEventPacket here (eventType=5,
-            // which matches `Player.KickEvent` vs KickEventSpecial).
-            if let Some(kick) = &pending_kick_event {
-                subpackets.push(tx::events::build_kick_event(
-                    kick.trigger_actor_id,
-                    kick.owner_actor_id,
-                    &kick.event_name,
-                    5,
-                    &kick.args,
-                ));
-                tracing::info!(
-                    trigger = kick.trigger_actor_id,
-                    owner = kick.owner_actor_id,
-                    event = %kick.event_name,
-                    args = kick.args.len(),
-                    "KickEventPacket appended after director spawn"
-                );
-            }
-        }
-        // Active content director (e.g. SEQ_005's content director).
-        // Mirror of the login-director block above. The post-warp
-        // `DeleteAllActors` wipes the client's actor list; without
-        // re-emitting the content director's spawn packets here, any
-        // KickEvent / RunEventFunction targeting the content director
-        // silently drops at the receiver's `+0x5c` gate (see
-        // meteor-decomp `event_kick_receiver_decomp.md` —
-        // `ActorRegistry_lookup_actor` returns NULL → kick dropped →
-        // cinematic never starts → "Now Loading" forever).
-        //
-        // Skip if the content director is the same as the login
-        // director (already spawned above).
-        if let Some(active) = session.active_content_script.as_ref() {
-            if Some(active.director_actor_id) != login_director_spec.as_ref().map(|s| s.actor_id) {
-                let content_director_class_path =
-                    format!("/Director/{}", active.director_name);
-                subpackets.extend(build_director_spawn_subpackets(
-                    active.director_actor_id,
-                    active.parent_zone_id,
-                    &content_director_class_path,
-                    &active.director_name,
-                    &zone_name,
-                ));
-                tracing::info!(
-                    director = active.director_actor_id,
-                    director_name = %active.director_name,
-                    "content director spawn packets appended (post-warp respawn)"
-                );
-            }
-        }
+        // Director spawns (login + content) are appended further below
+        // in this function — AFTER the player's own self-spawn block
+        // and AFTER any nearby-NPC respawns. See the comment block
+        // earlier in this function for the rationale.
         // Mount-music persistence — port of Meteor commit `ea7bf4b8`.
         // When the player zones while mounted, the normal zone BGM is
         // overridden with the mount theme (64 = rental chocobo, 83 =
@@ -2009,6 +1952,104 @@ impl WorldManager {
             sub.set_target_id(session_id);
             client.send_bytes(sub.to_bytes()).await;
         }
+
+        // Director spawns (login + content) emitted AFTER all player /
+        // NPC / group packets. Per pmeteor `Player.SendZoneInPackets`
+        // (`Map Server/Actors/Chara/Player/Player.cs:657-661`), the
+        // `ownedDirectors` loop runs AFTER the player's self-spawn
+        // and after the nearby-NPC `UpdateInstance` pass. The 1.x
+        // client tolerates the player's `ActorInstantiate` referencing
+        // the director's actor id by forward reference (just an
+        // integer; resolved on first use post-spawn).
+        //
+        // Sending directors LAST also ensures their `+0x5c` flag (the
+        // KickEvent gate per meteor-decomp `event_kick_receiver_decomp.md`)
+        // is still set when the trailing KickEvent fires below.
+        let mut director_subpackets: Vec<common::subpacket::SubPacket> = Vec::new();
+        if let Some(spec) = &login_director_spec {
+            director_subpackets.extend(build_director_spawn_subpackets(
+                spec.actor_id,
+                spec.zone_actor_id,
+                &spec.class_path,
+                &spec.class_name,
+                &zone_name,
+            ));
+            tracing::info!(
+                director = spec.actor_id,
+                class_path = %spec.class_path,
+                "login director spawn packets appended (after player + NPCs)"
+            );
+        }
+        if let Some(active) = session.active_content_script.as_ref() {
+            if Some(active.director_actor_id)
+                != login_director_spec.as_ref().map(|s| s.actor_id)
+            {
+                let content_director_class_path =
+                    format!("/Director/{}", active.director_name);
+                director_subpackets.extend(build_director_spawn_subpackets(
+                    active.director_actor_id,
+                    active.parent_zone_id,
+                    &content_director_class_path,
+                    &active.director_name,
+                    &zone_name,
+                ));
+                tracing::info!(
+                    director = active.director_actor_id,
+                    director_name = %active.director_name,
+                    "content director spawn packets appended (after player + NPCs)"
+                );
+            }
+        }
+        for mut sub in director_subpackets {
+            sub.set_target_id(session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
+
+        // KickEvent emission — DEFERRED to the very end of the bundle.
+        // Per meteor-decomp `event_kick_receiver_decomp.md` slot 2, the
+        // client silently drops `KickEvent (0x012F)` if the owner
+        // actor's `+0x5c` flag isn't set, which requires the actor's
+        // full spawn-packet sequence to have completed. By placing the
+        // kick after every other subpacket has been sent (player
+        // self-spawn + login director spawn + content director spawn +
+        // nearby NPC respawns + group packets + party-marker packets),
+        // we guarantee the target actor is fully alive client-side
+        // before the kick fires.
+        //
+        // For OPENING (no warp): the kick still works because all the
+        // spawn packets land in the same bundle, in order, and the
+        // client processes them in order.
+        //
+        // For SEQ_005 (with warp): the post-warp `DeleteAllActors`
+        // wiped the client's actor list, so the bundle's job is to
+        // re-establish every actor; the kick at the end of the bundle
+        // sees them all alive.
+        if let Some(kick) = pending_kick_event {
+            let mut sub = tx::events::build_kick_event(
+                kick.trigger_actor_id,
+                kick.owner_actor_id,
+                &kick.event_name,
+                5,
+                &kick.args,
+            );
+            sub.set_target_id(session_id);
+            client.send_bytes(sub.to_bytes()).await;
+            tracing::info!(
+                trigger = kick.trigger_actor_id,
+                owner = kick.owner_actor_id,
+                event = %kick.event_name,
+                args = kick.args.len(),
+                "KickEventPacket emitted at end of zone-in bundle (after all spawns)"
+            );
+            // Clear the pending capture so a subsequent `send_zone_in_bundle`
+            // (e.g. a future warp without a fresh `LC::KickEvent`) doesn't
+            // re-emit a stale kick.
+            if let Some(mut snap) = self.session(session_id).await {
+                snap.pending_kick_event = None;
+                self.upsert_session(snap).await;
+            }
+        }
+
         tracing::info!(
             session = session_id,
             actor = actor_id,
