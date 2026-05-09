@@ -1440,28 +1440,13 @@ impl WorldManager {
         ));
         subpackets.extend([
             tx::actor_inventory::build_inventory_begin_change(actor_id, true),
-            // Empty-package brackets for the 6 item packages + equipment.
-            // Loading actual inventory items here (via
-            // `db.get_item_package` + `build_inventory_list_xNN` chunking)
-            // crashed the Wine client mid-parse on the SEQ_005 smoke
-            // (character disappeared, Yda remained, HUD partial). The
-            // inventory packet body shape (`build_inventory_list_x01`
-            // + 0x90 size, or x08-x64 wraparound math) needs a focused
-            // diagnosis — the chunking loop matches
-            // `runtime::dispatcher::PacketItems` exactly so the bug
-            // is likely in the packet body itself or how InventoryItem
-            // fields encode at offset boundaries the client expects.
-            //
-            // For now keep the bundle wire-stable with empty
-            // begin/end brackets (matches the pre-fix behavior the
-            // OPENING flow has been working with for weeks); the
-            // post-warp inventory state remains empty client-side
-            // until this is properly debugged.
-            //
-            // `code` values from C# `ItemPackage.cs`, `size` from the
-            // `MAXSIZE_*` constants: NORMAL=0/200, CURRENCY_CRYSTALS=99/320,
-            // KEYITEMS=100/500, BAZAAR=7/10, MELDREQUEST=5/4, LOOT=4/10,
-            // EQUIPMENT=0x00FE/35.
+            // Empty-package brackets. Loading items via `db.get_item_package`
+            // + `build_inventory_list_x08_n` (with pmeteor's `> 1 → x08`
+            // chunking) STILL crashes the Wine client mid-parse — character
+            // disappears, Yda remains, HUD partial. So the crash isn't
+            // chunking-related; it's in the packet body shape itself
+            // (`encode_item` field offsets) OR in receiving the same
+            // unique_ids twice (LOGIN no-op then post-warp emit).
             tx::actor_inventory::build_inventory_set_begin(actor_id, 200, 0),
             tx::actor_inventory::build_inventory_set_end(actor_id),
             tx::actor_inventory::build_inventory_set_begin(actor_id, 320, 99),
