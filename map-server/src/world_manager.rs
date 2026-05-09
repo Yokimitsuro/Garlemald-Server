@@ -193,6 +193,25 @@ pub fn build_director_spawn_subpackets(
         // flag entries which is fine for a player but C# emits zero
         // for a director.
         build_director_init_packet(actor_id),
+        // 0x0136 SetEventStatus — ENABLE the three conditions
+        // SetNoticeEventCondition (0x016B) registered above. Pmeteor's
+        // `Session.UpdateInstance` (`Map Server/DataObjects/Session.cs:139,
+        // 161`) emits `actor.GetSetEventStatusPackets()` immediately after
+        // every spawn+init pair; for a director that pulls the three
+        // notice-event conditions from `eventConditions` and emits one
+        // `SetEventStatusPacket(enabled=true, type=5, condition_name)`
+        // per condition. Without this enable, the conditions stay
+        // *registered but disabled* on the client and `KickEvent
+        // ("noticeEvent")` silently drops at the receiver's `+0x5c` gate
+        // — directly observed in the SEQ_005 post-warp packet diff
+        // against `captures/pmeteor-quest/20260426-160210-gridania-manual3/`:
+        // pmeteor sends the 0x0136 trio, garlemald did not, and the
+        // client never echoed `EventStart` for the director's
+        // noticeEvent. `type=5` (notice) matches pmeteor's
+        // `noticeEnabled` branch in `GetSetEventStatusPackets`.
+        tx::actor::build_set_event_status(actor_id, true, 5, "noticeEvent"),
+        tx::actor::build_set_event_status(actor_id, true, 5, "noticeRequest"),
+        tx::actor::build_set_event_status(actor_id, true, 5, "reqForChild"),
     ]
 }
 
