@@ -1165,6 +1165,7 @@ impl WorldManager {
     pub async fn send_zone_in_bundle(
         &self,
         registry: &ActorRegistry,
+        db: &crate::database::Database,
         session_id: u32,
         spawn_type: u16,
     ) {
@@ -1439,14 +1440,23 @@ impl WorldManager {
         ));
         subpackets.extend([
             tx::actor_inventory::build_inventory_begin_change(actor_id, true),
-            // Empty-package brackets for the 6 item packages + equipment,
-            // matching the C# `Player.SendZoneInPackets` sequence that
-            // calls `itemPackages[...].SendFullPackage()` for each of
-            // NORMAL/CURRENCY_CRYSTALS/KEYITEMS/BAZAAR/MELDREQUEST/LOOT
-            // followed by `equipment.SendUpdate()`. For a fresh
-            // character each package is empty — the client still needs
-            // to see the (SetBegin, SetEnd) pair to know the package
-            // exists and is empty.
+            // Empty-package brackets for the 6 item packages + equipment.
+            // Loading actual inventory items here (via
+            // `db.get_item_package` + `build_inventory_list_xNN` chunking)
+            // crashed the Wine client mid-parse on the SEQ_005 smoke
+            // (character disappeared, Yda remained, HUD partial). The
+            // inventory packet body shape (`build_inventory_list_x01`
+            // + 0x90 size, or x08-x64 wraparound math) needs a focused
+            // diagnosis — the chunking loop matches
+            // `runtime::dispatcher::PacketItems` exactly so the bug
+            // is likely in the packet body itself or how InventoryItem
+            // fields encode at offset boundaries the client expects.
+            //
+            // For now keep the bundle wire-stable with empty
+            // begin/end brackets (matches the pre-fix behavior the
+            // OPENING flow has been working with for weeks); the
+            // post-warp inventory state remains empty client-side
+            // until this is properly debugged.
             //
             // `code` values from C# `ItemPackage.cs`, `size` from the
             // `MAXSIZE_*` constants: NORMAL=0/200, CURRENCY_CRYSTALS=99/320,
@@ -1464,10 +1474,9 @@ impl WorldManager {
             tx::actor_inventory::build_inventory_set_end(actor_id),
             tx::actor_inventory::build_inventory_set_begin(actor_id, 10, 4),
             tx::actor_inventory::build_inventory_set_end(actor_id),
-            // `equipment.SendUpdate` — ReferencedItemPackage shape with
-            // code=0x00FE, size=35. Empty for a fresh character.
             tx::actor_inventory::build_inventory_set_begin(actor_id, 35, 0x00FE),
         ]);
+        let _ = db;
         // Meteor's `equipment.SendUpdate` calls SetInitialEquipmentPacket
         // (0x014E) between the set-begin/set-end brackets, even for a
         // fully-empty equipment set — the client's DepictionJudge Lua

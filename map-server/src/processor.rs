@@ -427,7 +427,7 @@ impl PacketProcessor {
                 tracing::error!(error = %e, actor = actor_id, "zone change failed");
             } else {
                 self.world
-                    .send_zone_in_bundle(&self.registry, session_id, 0x1)
+                    .send_zone_in_bundle(&self.registry, &self.db, session_id, 0x1)
                     .await;
             }
         }
@@ -596,7 +596,7 @@ impl PacketProcessor {
             tracing::error!(error = %e, actor = actor_id, "login zone change failed");
         } else {
             self.world
-                .send_zone_in_bundle(&self.registry, session_id, 0x1)
+                .send_zone_in_bundle(&self.registry, &self.db, session_id, 0x1)
                 .await;
         }
 
@@ -2467,7 +2467,7 @@ impl PacketProcessor {
         //    the session + character we just updated, so the bundle
         //    spawns the player at the content-area coords.
         self.world
-            .send_zone_in_bundle(&self.registry, session_id, spawn_type as u16)
+            .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
             .await;
 
         // 5. B7 of the SEQ_005 unblock plan — fire the content
@@ -2673,7 +2673,7 @@ impl PacketProcessor {
         //    from the session + character we just updated, so the
         //    bundle spawns the player at the new coords.
         self.world
-            .send_zone_in_bundle(&self.registry, session_id, spawn_type as u16)
+            .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
             .await;
 
         tracing::info!(
