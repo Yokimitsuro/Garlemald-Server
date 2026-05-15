@@ -3942,6 +3942,23 @@ impl UserData for LuaDirectorHandle {
                         a.actor_id
                     } else if let Ok(n) = ud.borrow::<LuaNpc>() {
                         n.base.actor_id
+                    } else if let Ok(d) = ud.borrow::<LuaDirectorHandle>() {
+                        // `director:AddMember(director)` is canonical
+                        // pmeteor (`SimpleContent30010.lua` line `director:AddMember(director)`
+                        // — the director adds itself as a member of its
+                        // own content group). The 1.x client's
+                        // content-group state machine requires the
+                        // director's actor id to be in the roster
+                        // before it'll dispatch any KickEvent targeting
+                        // it. Confirmed by post-warp byte-diff vs
+                        // pmeteor capture (line 31878 of
+                        // captures/pmeteor-quest/.../map-packets.log):
+                        // pmeteor's GroupHeader carries member_count=7
+                        // (player + director + Yda + Papalymo + 3
+                        // wolves), garlemald's was 6 (director
+                        // self-reference dropped because this borrow
+                        // chain didn't recognise LuaDirectorHandle).
+                        d.actor_id
                     } else {
                         0
                     }
