@@ -2586,6 +2586,146 @@ impl PacketProcessor {
             tracing::warn!(player = player_id, "DoZoneChangeContent: no client");
             return;
         };
+
+        // 3a. PRE-WARP emission: content group trio + KickEvent.
+        //
+        // Pmeteor's reference capture (`captures/pmeteor-quest/
+        // 20260426-160210-gridania-manual3/`) shows the SEQ_005 warp
+        // bundle in this order at offset 15:54:31.108:
+        //
+        //   [13] OUT 0x017c GroupHeader        (content group, content director's roster)
+        //   [14] OUT 0x017d GroupBegin
+        //   [15] OUT 0x0183 ContentMembersX08
+        //   [16] OUT 0x017e GroupEnd
+        //   [17] OUT 0x012f KickEvent          ← KICK fires HERE (pre-warp)
+        //   [18] OUT 0x0166 text-sheet
+        //   [19] OUT 0x0007 DeleteAllActors    ← WARP starts
+        //   [20] OUT 0x00e2 warp marker
+        //
+        // The client buffers the kick during warp processing and echoes
+        // back IN 0x012D EventStart for the content director ~2.28
+        // seconds later (verified at line 33975 of the pcap), which
+        // then triggers the cinematic body server-side.
+        //
+        // Garlemald previously emitted the KickEvent at the END of the
+        // post-warp zone-in bundle on the theory that the client gates
+        // KickEvent on `actor[+0x5c] != 0` (per meteor-decomp note) —
+        // but pmeteor's working flow disproves that ordering: the kick
+        // can target an actor the client doesn't have spawned yet, as
+        // long as the GROUP roster (017C/D/F/E trio) is registered
+        // beforehand. The trio survives DeleteAllActors (groups are
+        // separate from the actor list), and the kick gets resolved
+        // post-warp once the spawn bundle materialises the new actors.
+        let mut emitted_pre_warp_kick = false;
+        if let Some(snap) = self.world.session(session_id).await
+            && let Some(active) = snap.active_content_script.as_ref()
+            && let Some(kick) = snap.pending_kick_event.as_ref()
+        {
+            // Only flip the order when the kick targets THIS content
+            // director (ie this is the SEQ_005-style flow). For other
+            // warps with no captured kick (or a kick targeting a
+            // different actor), keep the post-warp ordering — those
+            // were already working under the deferred-emission model.
+            if kick.owner_actor_id == active.director_actor_id {
+                let group_index: u64 = active.director_actor_id as u64;
+                let location_code = parent_zone_id as u64;
+                let sequence_id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or_default();
+                // Build the GroupMember rows from the director's
+                // transient roster (populated by DirectorAddMember
+                // earlier in the doContentArea chain).
+                let roster: Vec<u32> = snap
+                    .transient_director_members
+                    .get(&active.director_actor_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut members: Vec<crate::packets::send::groups::GroupMember> =
+                    Vec::with_capacity(roster.len());
+                for &mid in &roster {
+                    let name = if let Some(h) = self.registry.get(mid).await {
+                        let c = h.character.read().await;
+                        c.base.display_name().to_string()
+                    } else {
+                        format!("bnpc_{mid:08X}")
+                    };
+                    members.push(crate::packets::send::groups::GroupMember {
+                        actor_id: mid,
+                        localized_name: -1,
+                        unknown2: 0,
+                        flag1: false,
+                        is_online: true,
+                        name,
+                    });
+                }
+                const GROUP_TYPE_CONTENT_GROUP: u32 = 30001;
+                let mut offset = 0usize;
+                let pre_warp_subs = vec![
+                    crate::packets::send::groups::build_group_header(
+                        actor_id,
+                        location_code,
+                        sequence_id,
+                        group_index,
+                        GROUP_TYPE_CONTENT_GROUP,
+                        -1,
+                        "",
+                        members.len() as u32,
+                    ),
+                    crate::packets::send::groups::build_group_members_begin(
+                        actor_id,
+                        location_code,
+                        sequence_id,
+                        group_index,
+                        members.len() as u32,
+                    ),
+                    crate::packets::send::groups::build_content_members_x08(
+                        actor_id,
+                        location_code,
+                        sequence_id,
+                        &members,
+                        &mut offset,
+                    ),
+                    crate::packets::send::groups::build_group_members_end(
+                        actor_id,
+                        location_code,
+                        sequence_id,
+                        group_index,
+                    ),
+                    // Then the KickEvent itself, AFTER the group trio
+                    // (matching pmeteor's [13..17] ordering).
+                    crate::packets::send::events::build_kick_event(
+                        kick.trigger_actor_id,
+                        kick.owner_actor_id,
+                        &kick.event_name,
+                        5,
+                        &kick.args,
+                    ),
+                ];
+                for mut sub in pre_warp_subs {
+                    sub.set_target_id(session_id);
+                    client.send_bytes(sub.to_bytes()).await;
+                }
+                emitted_pre_warp_kick = true;
+                tracing::info!(
+                    player = player_id,
+                    director = format!("0x{:08X}", active.director_actor_id),
+                    roster = members.len(),
+                    event = %kick.event_name,
+                    "DoZoneChangeContent: emitted PRE-warp content group trio + KickEvent"
+                );
+            }
+        }
+        // Clear pending_kick_event so send_zone_in_bundle's end-of-bundle
+        // emission doesn't re-fire it. Idempotent — a no-op if we didn't
+        // pre-emit.
+        if emitted_pre_warp_kick
+            && let Some(mut snap) = self.world.session(session_id).await
+        {
+            snap.pending_kick_event = None;
+            self.world.upsert_session(snap).await;
+        }
+
         client
             .send_bytes(
                 crate::packets::send::handshake::build_delete_all_actors(actor_id).to_bytes(),
