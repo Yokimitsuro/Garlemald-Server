@@ -34,10 +34,44 @@ Today's session landed:
 - No more crashes; client cleanly hangs on Now Loading instead
 
 What's left:
-- Director main-coroutine driver needs to resume after warp
+- ~~Director main-coroutine driver needs to resume after warp
   completion + drive its `delegateEvent` calls into wire packets
   via the event-outbox dispatcher (not the login-scoped
-  dispatcher which silently drops them).
+  dispatcher which silently drops them).~~
+
+### 2026-05-15 update — both halves landed
+
+The two halves of this gap landed today:
+
+1. **Login-scoped dispatcher silently dropping `RunEventFunction` /
+   `EndEvent`** — fixed in commit `8de33cd`. New explicit arm in
+   `apply_login_lua_command` (processor.rs:1718) bridges these
+   commands through `translate_lua_commands_into_outbox` +
+   `dispatch_event_event` so the resulting 0x0130/0x0131 packets
+   reach the wire. New unit test:
+   `apply_login_lua_command_routes_run_event_function_through_outbox`.
+
+2. **Director main-coroutine not resuming post-warp** — fixed in
+   commit `<TBD>`. After `apply_do_zone_change_content`'s onZoneIn
+   hook fires, it now calls
+   `lua.fire_player_event_and_drain(player_id, MultiValue::new())`
+   to pop any parked `_WAIT_EVENT` coroutine and resume it. The
+   resumed coroutine's commands (typically `RunEventFunction` +
+   `EndEvent` from the `callClientFunction(player, "delegateEvent",
+   ...)` chain) flow through `apply_runtime_lua_commands` →
+   `apply_login_lua_command`'s new EventOutbox bridge arm → wire.
+
+Smoke-test status (untested as of writing — needs a fresh
+`fresh-start-gridania.sh` run):
+- ✓ Wire-level groundwork solid
+- ✓ EventOutbox bridge for login-scoped event commands
+- ✓ Coroutine resumption after warp completes
+- ? Cinematic body fires through to completion (untested)
+- ? Yda/Papalymo/wolves animate correctly (untested — depends on
+  whether the resumed coroutine's `actor:MoveTo` /
+  `actor:LookAt` calls trigger the existing `build_move_actor_to_position`
+  / `build_set_actor_target_animated` builders, which currently have
+  zero callers in the runtime — see byte-diff opcode table below)
 
 ## Smoke-test journey (chronological — 5 fixes today)
 

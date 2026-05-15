@@ -2680,6 +2680,81 @@ impl PacketProcessor {
                         .await;
                     }
                 }
+
+                // 6. Resume the parked director coroutine, if one was
+                //    spawned pre-warp via `StartDirectorMain` and parked
+                //    on a `coroutine.yield("_WAIT_EVENT", player)`.
+                //
+                //    Why this exists: man0g0 SEQ_005's pre-warp setup
+                //    (`scripts/lua/quests/man/man0g0.lua::doContentArea`)
+                //    runs:
+                //
+                //      contentArea:CreateContentArea(...)   -- spawns NPCs
+                //      director:AddMember(starterPlayer)
+                //      director:StartDirector(false)         -- spawns main coroutine
+                //      player:KickEvent(director, "noticeEvent", true)
+                //      GetWorldManager():DoZoneChangeContent(...)
+                //
+                //    The KickEvent emits a 0x012F packet pre-warp, which
+                //    the client should normally echo back as 0x012F
+                //    EventStart. `handle_event_start` (processor.rs:6630)
+                //    then resumes the parked coroutine so it runs the
+                //    cinematic body (`callClientFunction(player,
+                //    "delegateEvent", ...)` → 0x0130 RunEventFunction +
+                //    `player:EndEvent()` → 0x0131 EndEvent).
+                //
+                //    But the post-warp byte-diff vs pmeteor capture
+                //    (captures/pmeteor-quest/20260426-160210-gridania-manual3/)
+                //    shows the client NEVER echoes EventStart after the
+                //    DoZoneChangeContent warp — so `handle_event_start`
+                //    never fires, the coroutine sits parked, and the
+                //    cinematic body never runs (verified: 0x0130 +
+                //    0x0131 missing post-warp).
+                //
+                //    The fix is to drive the resume here, mirroring the
+                //    "implicit EventStart" that pmeteor's
+                //    `WorldManager.DoZoneChangeContent` final
+                //    `LuaEngine.GetInstance().CallLuaFunction(player,
+                //    contentArea, "onZoneIn", true)` produces — the
+                //    onZoneIn hook above is the surface, and resuming
+                //    the parked director coroutine is the side effect
+                //    pmeteor's engine fires implicitly. We thread it
+                //    explicitly here.
+                //
+                //    The resumed coroutine's `RunEventFunction` /
+                //    `EndEvent` commands flow through
+                //    `apply_runtime_lua_commands` →
+                //    `apply_login_lua_command`'s EventOutbox bridge
+                //    arm (commit `8de33cd`), which dispatches them to
+                //    the wire as 0x0130 / 0x0131. So the cinematic
+                //    body finally lands in the post-warp packet
+                //    stream.
+                if let Some(resumed) = lua.fire_player_event_and_drain(
+                    player_id,
+                    mlua::MultiValue::new(),
+                ) {
+                    let resumed_count = resumed.len();
+                    if !resumed.is_empty() {
+                        crate::runtime::quest_apply::apply_runtime_lua_commands(
+                            resumed,
+                            &self.registry,
+                            &self.db,
+                            &self.world,
+                            self.lua.as_ref(),
+                        )
+                        .await;
+                    }
+                    tracing::info!(
+                        player = player_id,
+                        commands = resumed_count,
+                        "DoZoneChangeContent: resumed parked director coroutine",
+                    );
+                } else {
+                    tracing::debug!(
+                        player = player_id,
+                        "DoZoneChangeContent: no parked director coroutine to resume",
+                    );
+                }
             }
         }
 
@@ -2690,7 +2765,7 @@ impl PacketProcessor {
             x,
             y,
             z,
-            "DoZoneChangeContent applied (B7: warp + zone-in replay + onZoneIn fired)",
+            "DoZoneChangeContent applied (B7: warp + zone-in replay + onZoneIn fired + coroutine resume)",
         );
     }
 
