@@ -1803,6 +1803,12 @@ impl PacketProcessor {
             director_name: director_name.clone(),
             director_actor_id,
             queue: placeholder_queue.clone(),
+            // C2b — onCreate doesn't iterate area rosters; B1 will
+            // populate them on subsequent onUpdate ticks via the
+            // ticker path.
+            players: Vec::new(),
+            allies: Vec::new(),
+            monsters: Vec::new(),
         };
         let director = crate::lua::userdata::LuaDirectorHandle {
             name: director_name.clone(),
@@ -1927,15 +1933,19 @@ impl PacketProcessor {
     /// trio to nearby players via
     /// `runtime::dispatcher::spawn_bundle_fanout`.
     ///
-    /// Phase B1 simplifications:
+    /// Phase B1 simplifications, partially closed by Phase C1 (combat AI
+    /// landing 2026-05-14):
     ///   * No private-area instance isolation — the actor lands in the
     ///     parent zone's actor list. (Phase B5 wires in `PrivateAreaContent`.)
-    ///   * No detection / aggro-type / kindred / mob-mod / drop-list
-    ///     application — those land in subsequent passes once the
-    ///     respective subsystems plumb through.
-    ///   * No respawn timer — the actor sticks until explicit despawn.
+    ///   * ✅ C1: detection_type / neutral / kindred_type / respawn /
+    ///     drop_list applied from the joined DTO; a `Controller`
+    ///     (BattleNpc or Ally kind based on allegiance) is attached to
+    ///     the actor's `AIContainer` so the AI tick loop can drive
+    ///     aggro and target acquisition. Mob-mod summer (pool / genus /
+    ///     spawn rows) still deferred.
     ///   * No `script_name`-driven Lua-side combat AI — the controller
-    ///     stays default.
+    ///     drives detection / engagement, but scripted overrides (e.g.
+    ///     `bloodthirsty_wolf.lua` custom AI hooks) aren't wired yet.
     async fn apply_spawn_battle_npc_by_id(
         &self,
         bnpc_id: u32,
@@ -2030,6 +2040,13 @@ impl PacketProcessor {
             return;
         }
 
+        // 4b. Phase C1 — apply combat metadata from the joined DTO
+        //     (detection / neutral / kindred / pool / genus / drop-list /
+        //     respawn) and attach the AI Controller so the ticker drives
+        //     aggro and engagement. See `BattleNpc::apply_spawn_metadata`
+        //     for the full per-field mapping + the Meteor parity notes.
+        bnpc.apply_spawn_metadata(&spawn, bnpc_id, actor_id);
+
         // 5. Insert the spatial projection into the parent zone's grid.
         let Some(zone_arc) = self.world.zone(parent_zone_id).await else {
             tracing::warn!(
@@ -2060,10 +2077,23 @@ impl PacketProcessor {
 
         // 6. Register the live Character in the ActorRegistry.
         let character = bnpc.npc.character.clone();
+        // Phase C1/C2b — tag ally-allegiance BNpcs as `Ally` in the
+        // registry. C# Meteor instantiates `Ally` as a separate
+        // subclass of `BattleNpc` (`Map Server/Actors/Chara/Npc/Ally.cs`);
+        // garlemald folds it into the same struct + Controller kind,
+        // but downstream classifiers (the content-area `GetAllies`
+        // partition, future ally-only logic) need the tag to read
+        // intent without locking the Character to peek at the
+        // controller.
+        let kind_tag = if spawn.allegiance == 1 {
+            crate::runtime::actor_registry::ActorKindTag::Ally
+        } else {
+            crate::runtime::actor_registry::ActorKindTag::BattleNpc
+        };
         self.registry
             .insert(crate::runtime::actor_registry::ActorHandle::new(
                 actor_id,
-                crate::runtime::actor_registry::ActorKindTag::BattleNpc,
+                kind_tag,
                 parent_zone_id,
                 /* session */ 0,
                 character,
@@ -2352,7 +2382,20 @@ impl PacketProcessor {
                 group_index,
                 members.len() as u32,
             ),
-            crate::packets::send::groups::build_group_members_x08(
+            // Content director groups use the CONTENT_MEMBERS_X08 (0x0183)
+            // wire opcode, NOT the party-side GROUP_MEMBERS_X08 (0x017F).
+            // Mirrors pmeteor `ContentGroup.SendGroupPackets`
+            // (`Map Server/Actors/Group/ContentGroup.cs:136`) which routes
+            // through `ContentMembersX08Packet` for content groups while
+            // `Group.cs:159` uses `GroupMembersX08Packet` for parties.
+            // Confirmed by post-warp byte-diff vs pmeteor capture
+            // `captures/pmeteor-quest/20260426-160210-gridania-manual3/`
+            // (2026-05-15): pmeteor sends 0x0183 once for the SEQ_005
+            // content group; garlemald was sending 0x017F. The 1.x client
+            // dispatches the two opcodes through different group-table
+            // paths, so the content-director's roster never landed in the
+            // content-group slot.
+            crate::packets::send::groups::build_content_members_x08(
                 player_actor_id,
                 location_code,
                 sequence_id,
@@ -2432,16 +2475,50 @@ impl PacketProcessor {
             c.base.zone_id = parent_zone_id;
         }
 
-        // 2. Update the session's destination + zone fields so the
-        //    zone-in bundle pulls the right values.
+        // 2. Run the SAME zone-change migration helper that
+        //    `apply_do_zone_change` (cross-zone) uses. Both wipe-+-
+        //    rebuild flows need it. For a same-zone same-private-area
+        //    warp (no private_area name, parent_zone_id unchanged), the
+        //    helper's branches fall through: `zone_changed = false`,
+        //    `private_area_changed = false`, so neither of the
+        //    remove branches fires; the dest-add re-inserts the actor
+        //    at the new spawn coords with grid=(0,0). The session's
+        //    `is_updates_locked = true / false` pair brackets the
+        //    operation, suppressing any in-flight broadcast paths
+        //    that might race with the warp.
+        //
+        //    Without this step the client never echoes `RX 0x0007
+        //    zone-in-complete` and the loading screen hangs forever
+        //    after the second-Yda-talk warp — the cross-zone path
+        //    works because it goes through this helper.
+        let spawn = Vector3::new(x, y, z);
+        if let Err(e) = self
+            .world
+            .do_zone_change_with_private_area(
+                actor_id,
+                session_id,
+                parent_zone_id,
+                /* private_area_name */ None,
+                /* private_area_level */ 0,
+                spawn,
+                rotation,
+            )
+            .await
+        {
+            tracing::error!(
+                error = %e,
+                player = player_id,
+                zone = parent_zone_id,
+                "DoZoneChangeContent: do_zone_change_with_private_area failed",
+            );
+            return;
+        }
+
+        // 3. Update the session's spawn_type / destination fields. The
+        //    helper above set zone + xyz/rot but not the spawn_type
+        //    arg the bundle uses.
         if let Some(mut snap) = self.world.session(session_id).await {
-            snap.current_zone_id = parent_zone_id;
-            snap.destination_zone_id = parent_zone_id;
             snap.destination_spawn_type = spawn_type;
-            snap.destination_x = x;
-            snap.destination_y = y;
-            snap.destination_z = z;
-            snap.destination_rot = rotation;
             self.world.upsert_session(snap).await;
         }
 
@@ -2503,6 +2580,11 @@ impl PacketProcessor {
                     director_name: active.director_name.clone(),
                     director_actor_id: active.director_actor_id,
                     queue: placeholder_queue.clone(),
+                    // C2b — onZoneIn doesn't iterate area rosters
+                    // (onUpdate does, via the ticker path).
+                    players: Vec::new(),
+                    allies: Vec::new(),
+                    monsters: Vec::new(),
                 };
                 let director = crate::lua::userdata::LuaDirectorHandle {
                     name: active.director_name.clone(),
@@ -7278,7 +7360,7 @@ fn hash_name_to_id(name: &str) -> u64 {
 /// reads: `GetPlayTime` (returns 0 → "new player"), `GetInitialTown`,
 /// `HasQuest`, `GetZoneID`, plus the `playerWork.tribe` field read in
 /// the tutorial branch.
-fn build_player_snapshot_for_login(c: &Character) -> crate::lua::userdata::PlayerSnapshot {
+pub(crate) fn build_player_snapshot_for_login(c: &Character) -> crate::lua::userdata::PlayerSnapshot {
     crate::lua::userdata::PlayerSnapshot {
         actor_id: c.base.actor_id,
         name: c.base.actor_name.clone(),
@@ -7330,6 +7412,11 @@ fn build_player_snapshot_for_login(c: &Character) -> crate::lua::userdata::Playe
         is_trading: false,
         is_trade_accepted: false,
         is_party_leader: false,
+        // Phase C2 — login snapshot is pre-spawn; reading from the
+        // live `Character` would also work but defaults are clearer
+        // because there's no AI state to read yet.
+        speed: c.get_speed(),
+        target_actor_id: 0,
         current_event_owner: 0,
         current_event_name: String::new(),
         current_event_type: 0,
@@ -7358,7 +7445,7 @@ fn build_player_snapshot_for_login(c: &Character) -> crate::lua::userdata::Playe
 /// returns accurate values for `HasQuest` / `IsQuestCompleted` /
 /// `GetFreeQuestSlot` and so `LuaQuestHandle` getters resolve against
 /// real sequence/flags/counters.
-fn build_player_snapshot_from_character(c: &Character) -> crate::lua::userdata::PlayerSnapshot {
+pub(crate) fn build_player_snapshot_from_character(c: &Character) -> crate::lua::userdata::PlayerSnapshot {
     let mut snapshot = build_player_snapshot_for_login(c);
     // Overlay the live EventSession state. The Lua bindings for
     // `player:RunEventFunction(...)` and `player:EndEvent()` read
