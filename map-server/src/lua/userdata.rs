@@ -42,6 +42,33 @@ fn push(queue: &Arc<Mutex<CommandQueue>>, cmd: LuaCommand) {
     CommandQueue::push(queue, cmd);
 }
 
+/// Extract an actor_id from a Lua-side argument. Accepts a
+/// LuaActor / LuaNpc / LuaPlayer userdata (returns `.actorId`) or a
+/// raw integer (returns the integer truncated to u32). Anything else
+/// returns 0, which the apply paths treat as "no target".
+///
+/// Used by Phase C3+ bindings (Engage / AddBaseHate / ...) where the
+/// script-side value's userdata kind isn't known statically — the
+/// same `EngageTarget(ally, target)` callsite can pass any of the
+/// three.
+fn lua_target_to_actor_id(value: &mlua::Value) -> u32 {
+    match value {
+        mlua::Value::UserData(ud) => {
+            if let Ok(p) = ud.borrow::<LuaPlayer>() {
+                p.snapshot.actor_id
+            } else if let Ok(a) = ud.borrow::<LuaActor>() {
+                a.actor_id
+            } else if let Ok(n) = ud.borrow::<LuaNpc>() {
+                n.base.actor_id
+            } else {
+                0
+            }
+        }
+        mlua::Value::Integer(i) => *i as u32,
+        _ => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LuaActor — base type common to Player, Npc, BattleNpc.
 // ---------------------------------------------------------------------------
@@ -59,6 +86,22 @@ pub struct LuaActor {
     pub pos: (f32, f32, f32),
     pub rotation: f32,
     pub queue: Arc<Mutex<CommandQueue>>,
+    /// Phase C2 — engagement state surfaced to scripts via
+    /// `actor:IsEngaged()`. Populated from `Character::is_engaged()`
+    /// (which reads `ai_container.is_engaged()` → "actor is in active
+    /// combat"). Defaulted to `false` for synthetic LuaActors that
+    /// don't have a backing live Character (e.g. quest-hook NPC stubs).
+    pub is_engaged: bool,
+    /// Phase C2 — current move speed. Default 5.0 matches retail
+    /// Meteor (`Character::get_speed`). Returned as i64 (truncated)
+    /// through the `GetSpeed` binding for script compatibility.
+    pub speed: f32,
+    /// Phase C2 — actor id this actor is currently targeting, or 0
+    /// for "no target". `actor.target` Index hook synthesises a stub
+    /// LuaActor carrying just this id + the command queue, which is
+    /// enough for `allyGlobal.EngageTarget`-style consumers to
+    /// re-extract the id and forward it to combat commands.
+    pub target_actor_id: u32,
 }
 
 impl UserData for LuaActor {
@@ -141,18 +184,21 @@ impl UserData for LuaActor {
             Ok(())
         });
 
-        // B6: combat-tutorial onUpdate bindings. Best-effort stubs
-        // so the ally-engagement loop in `SimpleContent30010.lua`
-        // runs without aborting on a nil method lookup. Real
-        // semantics land alongside Phase B6.5+ as combat AI plumbs
-        // through.
-        //
-        // `actor:IsEngaged()` — true iff the actor is in active
-        // combat. Default false (nobody's engaged in the snapshot
-        // we hand the script).
-        methods.add_method("IsEngaged", |_, _this, _: ()| Ok(false));
-        // `actor:GetSpeed()` — current move speed. Default 0.
-        methods.add_method("GetSpeed", |_, _this, _: ()| Ok(0i64));
+        // Phase C2 — combat-tutorial onUpdate bindings (was a B6 stub
+        // pair). Now read from the snapshot fields populated at
+        // LuaActor construction; falls back to safe defaults
+        // (`is_engaged=false`, `speed=5.0`, `target=nil`) for the
+        // synthetic LuaActors built by quest-hook NPC dispatch /
+        // SpawnBattleNpcById Lua binding / event-dispatcher handoff,
+        // none of which need engagement semantics.
+        methods.add_method("IsEngaged", |_, this, _: ()| Ok(this.is_engaged));
+        methods.add_method("GetSpeed", |_, this, _: ()| Ok(this.speed as i64));
+
+        // Phase C3 — `actor.Engage(target)` is dispatched via the
+        // Index meta-method below (closure-bound function). We don't
+        // register an `add_method` here because mlua's add_method
+        // shadows the Index meta and would mis-coerce the script's
+        // dot-syntax call's only-arg (target) as the bound self.
         // `actor:SendAppearance()` — same as the LuaPlayer binding,
         // routed through the same LuaCommand::SendAppearance variant.
         // 1 site (`gm/graphic.lua` after a `appearanceIds[slot]`
@@ -162,6 +208,61 @@ impl UserData for LuaActor {
                 &this.queue,
                 LuaCommand::SendAppearance {
                     actor_id: this.actor_id,
+                },
+            );
+            Ok(())
+        });
+        // `actor:MoveTo(x, y, z, rotation, moveState)` — port of C#
+        // `Actor.SetPos(x, y, z, rot, instant=false, ...)`'s broadcast
+        // branch. Mirrors `MoveActorToPositionPacket.BuildPacket(Id, x,
+        // y, z, rot, moveState)` in pmeteor `Actor.cs:665`. Pushes a
+        // `LuaCommand::MoveActorToPosition`; the dispatcher updates the
+        // actor's stored position AND broadcasts 0x00CF to nearby
+        // players so the client renders smooth locomotion (vs the
+        // teleport-style hard-set that `LuaPlayer`'s `positionX = …`
+        // NewIndex meta does).
+        //
+        // Used by SEQ_005 cinematic NPC choreography (Yda walks over,
+        // Papalymo turns to greet, wolves flank). `move_state` defaults
+        // to 0 if omitted (walk speed); 1 = run, 2 = sprint.
+        methods.add_method(
+            "MoveTo",
+            |_, this, (x, y, z, rotation, move_state): (f32, f32, f32, f32, Option<u16>)| {
+                push(
+                    &this.queue,
+                    LuaCommand::MoveActorToPosition {
+                        actor_id: this.actor_id,
+                        x,
+                        y,
+                        z,
+                        rotation,
+                        move_state: move_state.unwrap_or(0),
+                    },
+                );
+                Ok(())
+            },
+        );
+        // `actor:LookAt(target_actor_id_or_actor)` — broadcasts a
+        // 0x00D3 SetActorTargetAnimatedPacket so the client animates
+        // the actor's head/body turning to face the target. Accepts
+        // either a raw actor id (u32) or a LuaActor / LuaPlayer
+        // userdata (extracted via the same Engage-path coercion).
+        // SEQ_005 cinematics use this between dialogue beats.
+        methods.add_method("LookAt", |_, this, target: mlua::Value| {
+            let target_actor_id = match target {
+                mlua::Value::Integer(i) => i as u32,
+                mlua::Value::UserData(ud) => ud
+                    .borrow_scoped::<LuaActor, _>(|a| a.actor_id)
+                    .or_else(|_| ud.borrow_scoped::<LuaPlayer, _>(|p| p.snapshot.actor_id))
+                    .unwrap_or(0),
+                mlua::Value::Nil => 0,
+                _ => 0,
+            };
+            push(
+                &this.queue,
+                LuaCommand::SetActorTargetAnimated {
+                    source_actor_id: this.actor_id,
+                    target_actor_id,
                 },
             );
             Ok(())
@@ -189,7 +290,82 @@ impl UserData for LuaActor {
         );
 
         // Field-style accessors (scripts do `actor.positionX = ...` too).
-        methods.add_meta_method(mlua::MetaMethod::Index, |_, this, key: String| {
+        methods.add_meta_method(mlua::MetaMethod::Index, |lua, this, key: String| {
+            // Phase C3 — dot-syntax method dispatch. The legacy
+            // Meteor convention used by `scripts/lua/ally.lua` calls
+            // these as `ally.Engage(target)` (no implicit self),
+            // which mlua's `add_method` doesn't support natively.
+            // The Index handler closes over the actor's id + queue
+            // and returns a Lua function the script invokes with
+            // `(target,)` — sidestepping the implicit-self issue.
+            // Variadic args + "last userdata wins" lets both
+            // colon-syntax (`ally:Engage(target)` → `(ally, target)`)
+            // and dot-syntax (`ally.Engage(target)` → `(target,)`)
+            // resolve to the same target id.
+            if key == "Engage" {
+                let queue = this.queue.clone();
+                let owner_actor_id = this.actor_id;
+                return lua
+                    .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                        let target_actor_id = args
+                            .last()
+                            .map(lua_target_to_actor_id)
+                            .unwrap_or(0);
+                        push(
+                            &queue,
+                            LuaCommand::ActorEngage {
+                                actor_id: owner_actor_id,
+                                target_actor_id,
+                            },
+                        );
+                        Ok(())
+                    })
+                    .map(Value::Function);
+            }
+            // Phase C3 — `actor.hateContainer` returns a
+            // `LuaHateContainer` userdata bound to this actor's
+            // `actor_id`. Lets scripts chain
+            // `ally.hateContainer.AddBaseHate(target)` from
+            // `allyGlobal.EngageTarget`. The actual hate-mutation
+            // path goes through `LuaCommand::HateContainerAddBaseHate`
+            // → `apply_hate_container_add_base_hate` →
+            // `HateContainer::add_base_hate`.
+            if key == "hateContainer" {
+                let hc = LuaHateContainer {
+                    owner_actor_id: this.actor_id,
+                    queue: this.queue.clone(),
+                };
+                return lua.create_userdata(hc).map(Value::UserData);
+            }
+            // Phase C2 — `actor.target` returns a stub LuaActor with
+            // the right `actor_id` (and inherited command queue) when
+            // this actor has a target, else nil. Enough for
+            // `allyGlobal.EngageTarget`-style consumers to extract
+            // the id and forward it; the stub doesn't carry name /
+            // class metadata because nothing in the engagement loop
+            // reads those.
+            if key == "target" {
+                if this.target_actor_id == 0 {
+                    return Ok(Value::Nil);
+                }
+                let target = LuaActor {
+                    actor_id: this.target_actor_id,
+                    name: String::new(),
+                    class_name: String::new(),
+                    class_path: String::new(),
+                    unique_id: String::new(),
+                    zone_id: this.zone_id,
+                    zone_name: String::new(),
+                    state: 0,
+                    pos: (0.0, 0.0, 0.0),
+                    rotation: 0.0,
+                    queue: this.queue.clone(),
+                    is_engaged: false,
+                    speed: 0.0,
+                    target_actor_id: 0,
+                };
+                return lua.create_userdata(target).map(Value::UserData);
+            }
             let out: Value = match key.as_str() {
                 "positionX" => Value::Number(this.pos.0 as f64),
                 "positionY" => Value::Number(this.pos.1 as f64),
@@ -197,11 +373,6 @@ impl UserData for LuaActor {
                 "rotation" => Value::Number(this.rotation as f64),
                 "actorId" => Value::Integer(this.actor_id as i64),
                 "zoneId" => Value::Integer(this.zone_id as i64),
-                // B6: combat-tutorial onUpdate field reads — the
-                // engagement loop touches `actor.target` to forward
-                // it to `allyGlobal.EngageTarget`. Default nil; a
-                // future combat-AI phase plumbs the real target.
-                "target" => Value::Nil,
                 "neutral" => Value::Boolean(false),
                 "isAutoAttackEnabled" => Value::Boolean(false),
                 _ => Value::Nil,
@@ -354,6 +525,16 @@ pub struct PlayerSnapshot {
     pub is_trading: bool,
     pub is_trade_accepted: bool,
     pub is_party_leader: bool,
+    /// Phase C2 — `player:GetSpeed()` binding. Default 5.0 to match
+    /// retail Meteor (`Character::get_speed`). Returned as i64
+    /// (truncated) to the script. Populated from `Character::get_speed()`
+    /// at snapshot construction.
+    pub speed: f32,
+    /// Phase C2 — actor id the player is currently targeting, or 0
+    /// for "no target". Read by `player.target` Index hook to
+    /// synthesise a stub LuaActor for the engagement loop. Read from
+    /// the player's `ai_container` current-state target slot.
+    pub target_actor_id: u32,
 
     pub current_event_owner: u32,
     pub current_event_name: String,
@@ -509,6 +690,20 @@ impl From<&crate::actor::Player> for PlayerSnapshot {
             is_trading: p.is_trading(),
             is_trade_accepted: p.is_trade_accepted(),
             is_party_leader: p.is_party_leader(),
+            // Phase C2 — live engagement state for the combat-tutorial
+            // bindings. Speed reads from `Character::get_speed()`
+            // (which honours the `Modifier::MovementSpeed` mod and
+            // defaults to 5.0 retail). Target id reads the
+            // `ai_container`'s current battle-state target slot;
+            // returns 0 when the player has no active target.
+            speed: p.character.get_speed(),
+            target_actor_id: p
+                .character
+                .ai_container
+                .current_state()
+                .map(|s| s.target_actor_id)
+                .filter(|id| *id != 0)
+                .unwrap_or(0),
             current_event_owner: p.player.current_event_owner,
             current_event_name: p.player.current_event_name.clone(),
             current_event_type: p.player.current_event_type,
@@ -2567,12 +2762,16 @@ impl UserData for LuaPlayer {
             Ok(())
         });
 
-        // B6: combat-tutorial onUpdate bindings on LuaPlayer
-        // (matches `LuaActor`'s set above). The engagement loop in
-        // `SimpleContent30010.lua` calls `player:IsEngaged()` to
-        // gate ally engagement.
-        methods.add_method("IsEngaged", |_, _this, _: ()| Ok(false));
-        methods.add_method("GetSpeed", |_, _this, _: ()| Ok(0i64));
+        // Phase C2 — combat-tutorial `player:GetSpeed()` binding.
+        // `player:IsEngaged()` is already defined above (real
+        // implementation reading from `snapshot.is_engaged`). The
+        // previous `(|_, _this, _: ()| Ok(false))` duplicate stub
+        // here silently overrode that — mlua's
+        // `add_method` is last-write-wins per `feedback_meteor_decomp_authoritative_for_engine_bindings.md`,
+        // so the player was *always* reported as not-engaged
+        // regardless of actual combat state. Phase C2 deletes the
+        // stub and adds the matching real GetSpeed.
+        methods.add_method("GetSpeed", |_, this, _: ()| Ok(this.snapshot.speed as i64));
 
         // --- Lua-side table field access (player.positionX etc.) ------------
         methods.add_meta_method(mlua::MetaMethod::Index, |lua, this, key: String| {
@@ -2587,6 +2786,32 @@ impl UserData for LuaPlayer {
                 };
                 return lua.create_userdata(party).map(Value::UserData);
             }
+            // Phase C2 — `player.target` returns a stub LuaActor (or
+            // nil) the engagement loop can forward to
+            // `allyGlobal.EngageTarget`. Same shape as the LuaActor
+            // Index "target" branch.
+            if key == "target" {
+                if this.snapshot.target_actor_id == 0 {
+                    return Ok(Value::Nil);
+                }
+                let target = LuaActor {
+                    actor_id: this.snapshot.target_actor_id,
+                    name: String::new(),
+                    class_name: String::new(),
+                    class_path: String::new(),
+                    unique_id: String::new(),
+                    zone_id: this.snapshot.zone_id,
+                    zone_name: String::new(),
+                    state: 0,
+                    pos: (0.0, 0.0, 0.0),
+                    rotation: 0.0,
+                    queue: this.queue.clone(),
+                    is_engaged: false,
+                    speed: 0.0,
+                    target_actor_id: 0,
+                };
+                return lua.create_userdata(target).map(Value::UserData);
+            }
             let out: Value = match key.as_str() {
                 "positionX" => Value::Number(this.snapshot.pos.0 as f64),
                 "positionY" => Value::Number(this.snapshot.pos.1 as f64),
@@ -2595,11 +2820,6 @@ impl UserData for LuaPlayer {
                 "actorId" => Value::Integer(this.snapshot.actor_id as i64),
                 "actorName" => Value::Nil, // deliberately unchangeable
                 "isGM" => Value::Boolean(this.snapshot.is_gm),
-                // B6: `player.target` for the combat-tutorial
-                // engagement loop. Default nil; future combat-AI
-                // phase plumbs the real target from
-                // `chara.current_target`.
-                "target" => Value::Nil,
                 _ => Value::Nil,
             };
             Ok(out)
@@ -2808,6 +3028,13 @@ impl UserData for LuaZone {
                     director_name: director_name.clone(),
                     director_actor_id,
                     queue: this.queue.clone(),
+                    // C2b — the runtime DoZoneChangeContent path
+                    // (`apply_do_zone_change_content`) re-creates a
+                    // LuaContentArea for the onZoneIn callback; that
+                    // hook doesn't iterate rosters.
+                    players: Vec::new(),
+                    allies: Vec::new(),
+                    monsters: Vec::new(),
                 };
                 lua.create_userdata(handle)
             },
@@ -2849,6 +3076,68 @@ impl UserData for LuaZone {
 // of work routes these stub calls through that subsystem. Until then the
 // stub keeps content-script onCreate from aborting on a nil method lookup.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// LuaHateContainer — exposes per-actor hate state to scripts.
+//
+// Phase C3 of the SEQ_005 unblock plan. Currently only exposes
+// `AddBaseHate(target)` because that's all `allyGlobal.EngageTarget`
+// uses. Future expansion (`GetMostHated`, `Clear`, enmity-level
+// readers) bolts on as scripts demand it.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct LuaHateContainer {
+    pub owner_actor_id: u32,
+    pub queue: Arc<Mutex<CommandQueue>>,
+}
+
+impl UserData for LuaHateContainer {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // Phase C3 — Lua scripts call `ally.hateContainer.AddBaseHate(target)`
+        // with dot syntax (no implicit self), which mlua's `add_method`
+        // doesn't support natively. Both legs of the dispatch chain go
+        // through Index meta-methods returning closure-bound functions
+        // so the dot-syntax call resolves to a function that takes
+        // `(target,)` as its only arg. The colon-syntax form
+        // `hateContainer:AddBaseHate(target)` falls through the same
+        // closure (since Lua's `:` desugars to `hc.AddBaseHate(hc, target)`
+        // — `target` becomes `target_actor_id`, `hc` becomes the first
+        // arg ignored by our extractor; but the colon form's args
+        // would be `(hc, target)` which `lua_target_to_actor_id`
+        // applied to `hc` would return `0`, breaking it. To support
+        // both styles, the closure accepts a variadic and uses the
+        // last userdata-shaped arg as the target).
+        methods.add_meta_method(
+            mlua::MetaMethod::Index,
+            |lua, this, key: String| {
+                if key == "AddBaseHate" {
+                    let queue = this.queue.clone();
+                    let owner_actor_id = this.owner_actor_id;
+                    return lua
+                        .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                            // Last arg is the target — colon-syntax
+                            // shoves self in first, dot-syntax doesn't.
+                            let target_actor_id = args
+                                .last()
+                                .map(lua_target_to_actor_id)
+                                .unwrap_or(0);
+                            push(
+                                &queue,
+                                LuaCommand::HateContainerAddBaseHate {
+                                    actor_id: owner_actor_id,
+                                    target_actor_id,
+                                },
+                            );
+                            Ok(())
+                        })
+                        .map(Value::Function);
+                }
+                Ok(Value::Nil)
+            },
+        );
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct LuaParty {
@@ -2896,6 +3185,15 @@ pub struct LuaContentArea {
     pub director_name: String,
     pub director_actor_id: u32,
     pub queue: Arc<Mutex<CommandQueue>>,
+    /// Phase C2b — pre-built roster snapshots so `area:GetPlayers()`
+    /// / `area:GetAllies()` / `area:GetMonsters()` can yield real
+    /// LuaPlayer / LuaActor userdata to the script's onUpdate loop.
+    /// Populated by the ticker from `session.transient_director_members`
+    /// + the live `ActorRegistry`. Empty for onCreate / quest-hook
+    /// paths that don't need iteration.
+    pub players: Vec<PlayerSnapshot>,
+    pub allies: Vec<LuaActor>,
+    pub monsters: Vec<LuaActor>,
 }
 
 impl UserData for LuaContentArea {
@@ -2956,22 +3254,62 @@ impl UserData for LuaContentArea {
         // phase will plumb the real player/mob/ally rosters in
         // (per-content-area actor lists are Phase B5).
         //
-        // `area:GetPlayers()` returns a Lua iterator function (the
-        // `for ... in ... do` form expects a function that returns
-        // `nil` when exhausted). Returning a stateless function
-        // that always returns nil terminates the loop on first
-        // iteration.
-        methods.add_method("GetPlayers", |lua, _this, _: ()| {
-            lua.create_function(|_lua, _: ()| Ok(mlua::Value::Nil))
+        // Phase C2b — `area:GetPlayers()` returns a stateful Lua
+        // iterator yielding one LuaPlayer userdata per element of
+        // `this.players`. The script uses `for player in players do`
+        // form (`for ... in func do` calls `func()` until it returns
+        // nil). We create a closure with captured `idx` and
+        // `snapshots` table to walk the array.
+        methods.add_method("GetPlayers", |lua, this, _: ()| {
+            // Build a Lua array of LuaPlayer userdata so the closure
+            // captures it via upvalue (mlua's create_function can't
+            // see `this` from outside).
+            let arr = lua.create_table()?;
+            for (i, snap) in this.players.iter().enumerate() {
+                let player = LuaPlayer {
+                    snapshot: snap.clone(),
+                    queue: this.queue.clone(),
+                };
+                arr.set(i as i64 + 1, lua.create_userdata(player)?)?;
+            }
+            let idx_cell = lua.create_table()?;
+            idx_cell.set(1, 0i64)?;
+            let arr_clone = arr.clone();
+            lua.create_function(move |_lua, _: ()| {
+                let idx: i64 = idx_cell.get(1)?;
+                let next: i64 = idx + 1;
+                let len: i64 = arr_clone.len()?;
+                if next > len {
+                    return Ok(mlua::Value::Nil);
+                }
+                idx_cell.set(1, next)?;
+                let v: mlua::Value = arr_clone.get(next)?;
+                Ok(v)
+            })
         });
-        // `area:GetMonsters()` and `area:GetAllies()` return arrays
-        // the script length-indexes via `#allies`. Empty Lua tables
-        // satisfy that convention.
-        methods.add_method("GetMonsters", |lua, _this, _: ()| {
-            lua.create_table()
+        // `area:GetMonsters()` / `area:GetAllies()` — indexed Lua
+        // tables the script reads via `#allies` + `allies[i]`. The
+        // engagement loop iterates `for i = 0, #allies - 1 do` which
+        // is 0-indexed (unusual for Lua but valid — `#t` counts the
+        // 1-indexed contiguous prefix; the script accepts a sparse
+        // table). We populate 1-indexed (Lua-standard) so the
+        // 1-based `#allies` works; the script's `allies[0]` will be
+        // nil and skipped by its `if allies[i] then` guard. The
+        // `allies[1..n]` range covers every real ally. Same shape
+        // for monsters.
+        methods.add_method("GetAllies", |lua, this, _: ()| {
+            let arr = lua.create_table()?;
+            for (i, actor) in this.allies.iter().enumerate() {
+                arr.set(i as i64 + 1, lua.create_userdata(actor.clone())?)?;
+            }
+            Ok(arr)
         });
-        methods.add_method("GetAllies", |lua, _this, _: ()| {
-            lua.create_table()
+        methods.add_method("GetMonsters", |lua, this, _: ()| {
+            let arr = lua.create_table()?;
+            for (i, actor) in this.monsters.iter().enumerate() {
+                arr.set(i as i64 + 1, lua.create_userdata(actor.clone())?)?;
+            }
+            Ok(arr)
         });
 
         // `contentArea:ContentFinished()` — flag the area for cleanup
@@ -3162,6 +3500,15 @@ impl UserData for LuaWorldManager {
                     pos: (0.0, 0.0, 0.0),
                     rotation: 0.0,
                     queue,
+                    // Synthetic LuaActor handed back to the
+                    // SpawnBattleNpcById caller. The real engagement
+                    // state lives on the spawned BNpc in the registry;
+                    // the script just uses this for `.actorId` /
+                    // `:AddMember` / `SetMod` / etc. immediately after
+                    // the spawn, never for combat queries.
+                    is_engaged: false,
+                    speed: 5.0,
+                    target_actor_id: 0,
                 };
                 lua.create_userdata(actor)
             },

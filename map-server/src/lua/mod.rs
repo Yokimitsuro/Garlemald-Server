@@ -129,6 +129,11 @@ impl QuestHookArg {
                         pos: spec.pos,
                         rotation: spec.rotation,
                         queue,
+                        // Quest-hook NPCs are dialogue / quest givers,
+                        // not combat — engagement defaults are correct.
+                        is_engaged: false,
+                        speed: 5.0,
+                        target_actor_id: 0,
                     },
                     actor_class_id: spec.actor_class_id,
                     quest_graphic: spec.quest_graphic,
@@ -791,10 +796,18 @@ impl LuaEngine {
             snapshot: player_snapshot,
             queue: queue.clone(),
         };
-        let content_area = userdata::LuaContentArea {
-            queue: queue.clone(),
-            ..content_area
-        };
+        // Phase C2b/C3 — also re-point every roster snapshot's queue
+        // so `allies[i].Engage(target)` / `players[i]:IsEngaged()` /
+        // etc. push into the script's queue, not the queue the
+        // caller stamped at content-area-build time.
+        let mut content_area = content_area;
+        content_area.queue = queue.clone();
+        for actor in content_area.allies.iter_mut() {
+            actor.queue = queue.clone();
+        }
+        for actor in content_area.monsters.iter_mut() {
+            actor.queue = queue.clone();
+        }
         let director = userdata::LuaDirectorHandle {
             queue: queue.clone(),
             ..director
@@ -899,10 +912,19 @@ impl LuaEngine {
                 };
             }
         };
-        let content_area = userdata::LuaContentArea {
+        // Phase C2b/C3 — re-point every roster snapshot's queue to
+        // the script-bound queue so commands emitted by the iterator
+        // bodies land in the right drain.
+        let mut content_area = userdata::LuaContentArea {
             queue: queue.clone(),
             ..content_area
         };
+        for actor in content_area.allies.iter_mut() {
+            actor.queue = queue.clone();
+        }
+        for actor in content_area.monsters.iter_mut() {
+            actor.queue = queue.clone();
+        }
 
         let globals = lua.globals();
         let f: Function = match globals.get("onUpdate") {
@@ -1299,6 +1321,9 @@ mod tests {
             director_name: "Quest/QuestDirectorMan0g001".to_string(),
             director_actor_id: 0x6608_0001,
             queue,
+            players: Vec::new(),
+            allies: Vec::new(),
+            monsters: Vec::new(),
         }
     }
 
@@ -1523,6 +1548,545 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Phase C2 — guard against the duplicate-`IsEngaged`-stub
+    /// regression. Before this fix, `LuaPlayer` had two
+    /// `add_method("IsEngaged", …)` calls; mlua is last-write-wins
+    /// per `feedback_meteor_decomp_authoritative_for_engine_bindings.md`,
+    /// so the later `(|_, _, _| Ok(false))` stub silently overrode
+    /// the real implementation that reads `snapshot.is_engaged`. The
+    /// player was *always* reported as not-engaged regardless of
+    /// actual combat state, breaking the SEQ_005 ally-engagement
+    /// gating in `SimpleContent30010.lua::onUpdate`.
+    #[test]
+    fn c2_lua_player_is_engaged_reads_snapshot_not_stub() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Probe.lua"),
+            r#"
+            function probe(player)
+                if player:IsEngaged() then
+                    player.positionX = 9999.0
+                else
+                    player.positionX = -1.0
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Probe.lua");
+        let dummy_queue = CommandQueue::new();
+        let mut snap = sample_snapshot();
+        snap.is_engaged = true;
+        snap.speed = 8.0;
+        snap.target_actor_id = 0x1234_5678;
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            snap,
+            sample_content_area(dummy_queue.clone()),
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        // The 9999.0 SetPos proves the IsEngaged branch ran true —
+        // i.e. snapshot.is_engaged actually reached the binding.
+        let saw_engaged_setpos = result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 9999.0).abs() < 0.01));
+        assert!(
+            saw_engaged_setpos,
+            "player:IsEngaged() should reflect snapshot.is_engaged=true; got commands: {:?}",
+            result.commands,
+        );
+    }
+
+    /// Phase C2 — `player:GetSpeed()` reads from `snapshot.speed`
+    /// (not the previous stubbed `0`). Combined with `IsEngaged`
+    /// this is the snapshot-plumbing-correct guard.
+    #[test]
+    fn c2_lua_player_get_speed_reads_snapshot() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Speed.lua"),
+            r#"
+            function probe(player)
+                player.positionX = player:GetSpeed() * 1.0
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Speed.lua");
+        let dummy_queue = CommandQueue::new();
+        let mut snap = sample_snapshot();
+        snap.speed = 8.0;
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            snap,
+            sample_content_area(dummy_queue.clone()),
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let saw_8 = result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 8.0).abs() < 0.01));
+        assert!(saw_8, "GetSpeed should return 8 from snapshot.speed=8.0; got: {:?}", result.commands);
+    }
+
+    /// Phase C2 — `player.target` returns a userdata with the right
+    /// `.actorId` when `snapshot.target_actor_id` is set. Nil when
+    /// it's zero.
+    #[test]
+    fn c2_lua_player_target_returns_userdata_or_nil() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Target.lua"),
+            r#"
+            -- f32 can't represent every u32 actor id losslessly, so
+            -- compare in Lua (i64-backed) and signal pass/fail
+            -- through a small magnitude that survives f32 rounding.
+            function probe(player)
+                if player.target then
+                    if player.target.actorId == 0x40001234 then
+                        player.positionX = 7.0   -- target with right id
+                    else
+                        player.positionX = 8.0   -- target with wrong id (bug)
+                    end
+                else
+                    player.positionX = -1.0      -- nil target
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Target.lua");
+
+        // With a target — SetPos x carries the target id.
+        {
+            let dummy_queue = CommandQueue::new();
+            let mut snap = sample_snapshot();
+            snap.target_actor_id = 0x4000_1234;
+            let result = engine.call_content_hook(
+                &script_path,
+                "probe",
+                snap,
+                sample_content_area(dummy_queue.clone()),
+                sample_director(dummy_queue),
+            );
+            assert!(result.error.is_none());
+            let saw_match = result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 7.0).abs() < 0.01));
+            assert!(
+                saw_match,
+                "player.target.actorId should match 0x40001234; got: {:?}",
+                result.commands,
+            );
+        }
+
+        // Without a target — branch hits the -1.0 fallback.
+        {
+            let dummy_queue = CommandQueue::new();
+            let snap = sample_snapshot(); // target_actor_id = 0
+            let result = engine.call_content_hook(
+                &script_path,
+                "probe",
+                snap,
+                sample_content_area(dummy_queue.clone()),
+                sample_director(dummy_queue),
+            );
+            assert!(result.error.is_none());
+            let saw_neg1 = result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x + 1.0).abs() < 0.01));
+            assert!(
+                saw_neg1,
+                "player.target should be nil when target_actor_id=0; got: {:?}",
+                result.commands,
+            );
+        }
+    }
+
+    /// Phase C2b — `area:GetAllies()` returns an indexed Lua table
+    /// of LuaActor userdata when the LuaContentArea was built with
+    /// real allies. `#allies` reports the right count; `allies[i]`
+    /// has the right `IsEngaged()` / `actorId` for the i-th ally.
+    #[test]
+    fn c2b_content_area_get_allies_yields_real_actors() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Allies.lua"),
+            r#"
+            function probe(_player, area, _director)
+                local allies = area:GetAllies()
+                local count = #allies
+                if count == 2
+                   and allies[1]:IsEngaged() == true
+                   and allies[2]:IsEngaged() == false
+                then
+                    _player.positionX = 42.0  -- pass signal
+                else
+                    _player.positionX = -1.0  -- fail signal
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Allies.lua");
+        let dummy_queue = CommandQueue::new();
+
+        // Build a content area with 2 allies — one engaged, one not.
+        let mut area = sample_content_area(dummy_queue.clone());
+        area.allies.push(userdata::LuaActor {
+            actor_id: 0x4000_0001,
+            name: "yda".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: true,
+            speed: 8.0,
+            target_actor_id: 0,
+        });
+        area.allies.push(userdata::LuaActor {
+            actor_id: 0x4000_0002,
+            name: "papalymo".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            sample_snapshot(),
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let saw_pass = result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 42.0).abs() < 0.01));
+        assert!(
+            saw_pass,
+            "Expected GetAllies() to return 2 LuaActors with right IsEngaged; got: {:?}",
+            result.commands,
+        );
+    }
+
+    /// Phase C2b — `area:GetPlayers()` returns a stateful iterator
+    /// the script consumes via `for player in players do`. Each
+    /// yield is a LuaPlayer userdata.
+    #[test]
+    fn c2b_content_area_get_players_yields_iterator() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Players.lua"),
+            r#"
+            function probe(_player, area, _director)
+                local players = area:GetPlayers()
+                local count = 0
+                local any_engaged = false
+                for p in players do
+                    count = count + 1
+                    if p:IsEngaged() then
+                        any_engaged = true
+                    end
+                end
+                if count == 2 and any_engaged then
+                    _player.positionX = 77.0  -- pass
+                else
+                    _player.positionX = -1.0  -- fail
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Players.lua");
+        let dummy_queue = CommandQueue::new();
+
+        let mut area = sample_content_area(dummy_queue.clone());
+        let mut p1 = userdata::PlayerSnapshot::default();
+        p1.actor_id = 0x0001;
+        p1.is_engaged = true;
+        let mut p2 = userdata::PlayerSnapshot::default();
+        p2.actor_id = 0x0002;
+        p2.is_engaged = false;
+        area.players.push(p1);
+        area.players.push(p2);
+
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            sample_snapshot(),
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let saw_pass = result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 77.0).abs() < 0.01));
+        assert!(
+            saw_pass,
+            "Expected GetPlayers() iterator to yield 2 players (one engaged); got: {:?}",
+            result.commands,
+        );
+    }
+
+    /// Phase C3 — the `ally.lua::allyGlobal.EngageTarget` body calls
+    /// `ally.Engage(target)` (dot syntax, not colon) which mlua's
+    /// `add_method` doesn't natively support. The fix: an Index
+    /// meta-method handler that returns a closure-bound function.
+    /// This test verifies the dot-syntax call lands the expected
+    /// `LuaCommand::ActorEngage` with the right ids.
+    #[test]
+    fn c3_lua_actor_dot_engage_pushes_command() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Engage.lua"),
+            r#"
+            function probe(_player, area, _director)
+                local allies = area:GetAllies()
+                local monsters = area:GetMonsters()
+                if #allies > 0 and #monsters > 0 then
+                    allies[1].Engage(monsters[1])
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Engage.lua");
+        let dummy_queue = CommandQueue::new();
+
+        let mut area = sample_content_area(dummy_queue.clone());
+        area.allies.push(userdata::LuaActor {
+            actor_id: 0x4000_0001,
+            name: "yda".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+        area.monsters.push(userdata::LuaActor {
+            actor_id: 0x4000_0099,
+            name: "wolf".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            sample_snapshot(),
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let saw_engage = result.commands.iter().any(|c| {
+            matches!(
+                c,
+                LuaCommand::ActorEngage {
+                    actor_id: 0x4000_0001,
+                    target_actor_id: 0x4000_0099,
+                }
+            )
+        });
+        assert!(
+            saw_engage,
+            "Expected ActorEngage{{actor:0x40000001, target:0x40000099}}; got: {:?}",
+            result.commands,
+        );
+    }
+
+    /// Phase C3 — `ally.hateContainer.AddBaseHate(target)` is a
+    /// double-dot dispatch: `hateContainer` returns a
+    /// LuaHateContainer userdata via Index, then `AddBaseHate(target)`
+    /// is a dot-syntax call on that userdata. Both legs need
+    /// closure-bound Index handlers to work without mlua's implicit
+    /// self.
+    #[test]
+    fn c3_lua_actor_hate_container_dot_add_base_hate_pushes_command() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Hate.lua"),
+            r#"
+            function probe(_player, area, _director)
+                local allies = area:GetAllies()
+                local monsters = area:GetMonsters()
+                if #allies > 0 and #monsters > 0 then
+                    allies[1].hateContainer.AddBaseHate(monsters[1])
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Hate.lua");
+        let dummy_queue = CommandQueue::new();
+
+        let mut area = sample_content_area(dummy_queue.clone());
+        area.allies.push(userdata::LuaActor {
+            actor_id: 0x4000_0001,
+            name: "yda".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+        area.monsters.push(userdata::LuaActor {
+            actor_id: 0x4000_0099,
+            name: "wolf".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            sample_snapshot(),
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let saw_hate = result.commands.iter().any(|c| {
+            matches!(
+                c,
+                LuaCommand::HateContainerAddBaseHate {
+                    actor_id: 0x4000_0001,
+                    target_actor_id: 0x4000_0099,
+                }
+            )
+        });
+        assert!(
+            saw_hate,
+            "Expected HateContainerAddBaseHate{{actor:0x40000001, target:0x40000099}}; got: {:?}",
+            result.commands,
+        );
+    }
+
+    /// Phase C2b — empty roster vectors keep the existing
+    /// "iterator-yields-nothing" / "#table == 0" behavior so onUpdate
+    /// scripts skip their loop bodies when no content is active.
+    #[test]
+    fn c2b_content_area_empty_rosters_skip_loop() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Empty.lua"),
+            r#"
+            function probe(_player, area, _director)
+                local allies = area:GetAllies()
+                local monsters = area:GetMonsters()
+                local players = area:GetPlayers()
+                local player_count = 0
+                for _ in players do
+                    player_count = player_count + 1
+                end
+                if #allies == 0 and #monsters == 0 and player_count == 0 then
+                    _player.positionX = 1.0  -- pass
+                else
+                    _player.positionX = -1.0  -- fail
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Empty.lua");
+        let dummy_queue = CommandQueue::new();
+        let area = sample_content_area(dummy_queue.clone());
+
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            sample_snapshot(),
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let saw_pass = result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 1.0).abs() < 0.01));
+        assert!(saw_pass, "Empty rosters should keep #t==0; got: {:?}", result.commands);
+    }
+
     #[test]
     fn call_content_hook_missing_oncreate_is_quiet() {
         let root = tmpdir();
@@ -1664,5 +2228,165 @@ mod tests {
         );
         assert!(result.commands.is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Cinematic NPC choreography — `actor:MoveTo(x, y, z, rot, moveState)`
+    /// pushes a `LuaCommand::MoveActorToPosition` carrying the actor id +
+    /// target coords. The dispatcher then updates position + broadcasts
+    /// 0x00CF MoveActorToPositionPacket. Verified end-to-end via
+    /// integration test below; this just asserts the binding shape.
+    #[test]
+    fn lua_actor_move_to_pushes_move_actor_to_position() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/Cinematic.lua"),
+            r#"
+            function probe(_player, area, _director)
+                local allies = area:GetAllies()
+                if #allies > 0 then
+                    -- Move with explicit moveState (1 = run)
+                    allies[1]:MoveTo(365.5, 4.1, -700.0, 1.5, 1)
+                    -- And one with the default moveState (0 = walk).
+                    allies[1]:MoveTo(366.0, 4.1, -699.0, 0.0)
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/Cinematic.lua");
+        let dummy_queue = CommandQueue::new();
+        let mut area = sample_content_area(dummy_queue.clone());
+        area.allies.push(userdata::LuaActor {
+            actor_id: 0x4000_2001,
+            name: "yda".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            sample_snapshot(),
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let moves: Vec<_> = result
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                LuaCommand::MoveActorToPosition {
+                    actor_id,
+                    x,
+                    y,
+                    z,
+                    rotation,
+                    move_state,
+                } => Some((*actor_id, *x, *y, *z, *rotation, *move_state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(moves.len(), 2, "expected 2 MoveActorToPosition cmds; got {:?}", result.commands);
+        assert_eq!(moves[0], (0x4000_2001, 365.5, 4.1, -700.0, 1.5, 1));
+        // Second call omitted move_state — should default to 0.
+        assert_eq!(moves[1], (0x4000_2001, 366.0, 4.1, -699.0, 0.0, 0));
+    }
+
+    /// `actor:LookAt(target)` — accepts both raw u32 actor ids and
+    /// LuaActor / LuaPlayer userdata. Pushes
+    /// `LuaCommand::SetActorTargetAnimated`.
+    #[test]
+    fn lua_actor_look_at_pushes_set_actor_target_animated() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/LookAt.lua"),
+            r#"
+            function probe(_player, area, _director)
+                local allies = area:GetAllies()
+                local monsters = area:GetMonsters()
+                if #allies > 0 and #monsters > 0 then
+                    -- LookAt with a userdata target (pmeteor canonical
+                    -- form: the cinematic passes the other actor object).
+                    allies[1]:LookAt(monsters[1])
+                    -- LookAt with a raw integer id (rare; some scripts
+                    -- pass `target.id` instead of the object).
+                    allies[1]:LookAt(0x40003333)
+                end
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/LookAt.lua");
+        let dummy_queue = CommandQueue::new();
+        let mut area = sample_content_area(dummy_queue.clone());
+        area.allies.push(userdata::LuaActor {
+            actor_id: 0x4000_2001,
+            name: "yda".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+        area.monsters.push(userdata::LuaActor {
+            actor_id: 0x4000_2099,
+            name: "wolf".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            sample_snapshot(),
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let look_ats: Vec<_> = result
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                LuaCommand::SetActorTargetAnimated {
+                    source_actor_id,
+                    target_actor_id,
+                } => Some((*source_actor_id, *target_actor_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(look_ats.len(), 2, "expected 2 LookAt cmds; got {:?}", result.commands);
+        assert_eq!(look_ats[0], (0x4000_2001, 0x4000_2099));
+        assert_eq!(look_ats[1], (0x4000_2001, 0x4000_3333));
     }
 }

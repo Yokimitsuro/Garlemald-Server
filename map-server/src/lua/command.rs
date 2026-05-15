@@ -122,6 +122,63 @@ pub enum LuaCommand {
         modifier_key: u32,
         value: i64,
     },
+    /// Phase C3 — `actor:Engage(target)` (C#
+    /// `Controller::Engage(target)`). Starts combat: pushes a
+    /// `BattleState::Attack` onto the actor's AIContainer with the
+    /// target locked in, arms the swing clock against the actor's
+    /// `attack_delay_ms`, and emits a `BattleEvent::Engage` so the
+    /// dispatcher broadcasts the engage state-change packet to
+    /// nearby players. Used by `allyGlobal.EngageTarget` in
+    /// `scripts/lua/ally.lua` to drive tutorial-ally combat into
+    /// the wolves.
+    ActorEngage {
+        actor_id: u32,
+        target_actor_id: u32,
+    },
+    /// Phase C3 — `actor.hateContainer:AddBaseHate(target)` (C#
+    /// `HateContainer::AddBaseHate(target)`). Inserts a zero-enmity
+    /// hate entry on `actor` for `target_actor_id` so the
+    /// most-hated lookup picks `target` once any damage updates
+    /// enmity. Without it, an `Engage`-driven swing has no hate
+    /// edge to start from and `should_deaggro` (which keys on
+    /// "no hated targets") would fire immediately. Tutorial
+    /// allies seed base hate on the player's target so they
+    /// stick on it.
+    HateContainerAddBaseHate {
+        actor_id: u32,
+        target_actor_id: u32,
+    },
+    /// `actor:MoveTo(x, y, z, rotation, moveState)` — port of C#
+    /// `Actor.SetPos(x, y, z, rot, instant=false, ...)` (the non-instant
+    /// branch). Updates the actor's position state AND broadcasts a
+    /// 0x00CF MoveActorToPositionPacket to nearby players so the client
+    /// renders the actor smoothly walking/running to the new coords
+    /// (vs `SetPos`'s teleport-style hard-set).
+    ///
+    /// Used by SEQ_005-style cinematics that choreograph NPC movement
+    /// (Yda walks to Papalymo, wolves circle the player, etc.). The
+    /// `move_state` arg picks the locomotion type — typical values per
+    /// the wiki: `0` = walk, `1` = run, `2` = sprint.
+    MoveActorToPosition {
+        actor_id: u32,
+        x: f32,
+        y: f32,
+        z: f32,
+        rotation: f32,
+        move_state: u16,
+    },
+    /// `actor:LookAt(target_actor_id)` — broadcasts a 0x00D3
+    /// SetActorTargetAnimatedPacket to nearby players, telling the
+    /// client to animate the actor's head/body turning to face the
+    /// target. Differs from C#'s `Actor.LookAt(...)` math helper (which
+    /// just sets rotation) — this is the wire-level "you should see X
+    /// turn to look at Y" broadcast that pmeteor's PacketProcessor
+    /// auto-fires on inbound SetTarget. Cinematic scripts call it
+    /// explicitly during cutscenes.
+    SetActorTargetAnimated {
+        source_actor_id: u32,
+        target_actor_id: u32,
+    },
     /// `GetWorldManager().SpawnBattleNpcById(id, contentArea)` — port of
     /// C# `WorldManager.SpawnBattleNpcById` (Map Server/WorldManager.cs:514).
     /// Spawns a BattleNpc by joining the four `server_battlenpc_*` seed

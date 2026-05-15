@@ -378,8 +378,250 @@ pub async fn apply_runtime_lua_command(
             apply_set_actor_mod(actor_id, modifier_key, value, registry).await;
             true
         }
+        LC::ActorEngage {
+            actor_id,
+            target_actor_id,
+        } => {
+            apply_actor_engage(actor_id, target_actor_id, registry).await;
+            true
+        }
+        LC::HateContainerAddBaseHate {
+            actor_id,
+            target_actor_id,
+        } => {
+            apply_hate_container_add_base_hate(actor_id, target_actor_id, registry).await;
+            true
+        }
+        LC::MoveActorToPosition {
+            actor_id,
+            x,
+            y,
+            z,
+            rotation,
+            move_state,
+        } => {
+            apply_move_actor_to_position(
+                actor_id, x, y, z, rotation, move_state, registry, world,
+            )
+            .await;
+            true
+        }
+        LC::SetActorTargetAnimated {
+            source_actor_id,
+            target_actor_id,
+        } => {
+            apply_set_actor_target_animated(source_actor_id, target_actor_id, registry, world)
+                .await;
+            true
+        }
         _ => false,
     }
+}
+
+/// Phase C3 — port of C# `Controller::Engage(target)` /
+/// `BattleNpcController::Engage`. Pushes a fresh `BattleState::Attack`
+/// onto the actor's AIContainer (target locked in, swing-clock armed
+/// against `Character::get_attack_delay_ms`). The AIContainer's
+/// per-tick `update` loop emits the `BattleEvent::Engage` /
+/// `BattleEvent::ResolveAutoAttack` events from there.
+///
+/// Quietly no-ops for actors not in the registry or actors already
+/// engaged — re-engaging the same target would clobber the existing
+/// state's swing clock, restarting the swing window. The C# engage
+/// path has the same gate (`if (IsEngaged) return false`).
+async fn apply_actor_engage(
+    actor_id: u32,
+    target_actor_id: u32,
+    registry: &ActorRegistry,
+) {
+    if target_actor_id == 0 {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            "ActorEngage skipped — target_actor_id == 0",
+        );
+        return;
+    }
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            target = format!("0x{target_actor_id:08X}"),
+            "ActorEngage skipped — actor not in registry",
+        );
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut c = handle.character.write().await;
+    let delay = c.get_attack_delay_ms();
+    let started = c
+        .ai_container
+        .internal_engage(target_actor_id, now_ms, delay);
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        target = format!("0x{target_actor_id:08X}"),
+        delay,
+        started,
+        "ActorEngage applied",
+    );
+}
+
+/// Phase C3 — port of C# `HateContainer::AddBaseHate(target)`. Inserts
+/// a zero-enmity hate entry for `target_actor_id` on `actor_id`'s
+/// hate container so `most_hated()` resolves to this target. The
+/// damage path (`update_hate(target, dmg)`) is responsible for
+/// incrementing enmity after each hit; this primes the container.
+async fn apply_hate_container_add_base_hate(
+    actor_id: u32,
+    target_actor_id: u32,
+    registry: &ActorRegistry,
+) {
+    if target_actor_id == 0 {
+        return;
+    }
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            "HateContainerAddBaseHate skipped — actor not in registry",
+        );
+        return;
+    };
+    let mut c = handle.character.write().await;
+    c.hate.add_base_hate(target_actor_id);
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        target = format!("0x{target_actor_id:08X}"),
+        "HateContainerAddBaseHate applied",
+    );
+}
+
+/// `actor:MoveTo(x, y, z, rotation, move_state)` — port of C#
+/// `Actor.SetPos(x, y, z, rot, instant=false, ...)`'s broadcast
+/// branch. Updates the actor's stored position AND fans a 0x00CF
+/// MoveActorToPositionPacket out to nearby players so they see the
+/// actor walk/run/sprint to the new coords. Mirrors pmeteor
+/// `Actor.cs:665`:
+/// ```csharp
+/// CurrentArea.BroadcastPacketAroundActor(this,
+///     MoveActorToPositionPacket.BuildPacket(Id, x, y, z, rot, moveState));
+/// ```
+///
+/// `move_state` values follow pmeteor's wiki notes (0 = walk, 1 =
+/// run, 2 = sprint, 3 = mounted). The dispatch is best-effort: if
+/// the actor isn't in the registry or has no zone we just log and
+/// drop, matching the C# implicit silent-skip when CurrentArea is
+/// null.
+async fn apply_move_actor_to_position(
+    actor_id: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+    rotation: f32,
+    move_state: u16,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            "MoveActorToPosition skipped — actor not in registry",
+        );
+        return;
+    };
+    // 1. Update the character's stored position. This makes
+    //    subsequent position reads (other Lua scripts, neighbour
+    //    spatial-grid resolution) see the new coords even before
+    //    the move animation finishes.
+    {
+        let mut c = handle.character.write().await;
+        c.base.position_x = x;
+        c.base.position_y = y;
+        c.base.position_z = z;
+        c.base.rotation = rotation;
+    }
+    // 2. Broadcast the 0x00CF MoveActorToPositionPacket to nearby
+    //    players. Use the actor's zone (read from the handle) to
+    //    scope the fan-out.
+    let Some(zone_arc) = world.zone(handle.zone_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            zone = handle.zone_id,
+            "MoveActorToPosition skipped — zone not loaded",
+        );
+        return;
+    };
+    let sub = crate::packets::send::actor::build_move_actor_to_position(
+        actor_id, x, y, z, rotation, move_state,
+    );
+    let recipients = crate::runtime::broadcast::broadcast_around_actor(
+        world,
+        registry,
+        &zone_arc,
+        actor_id,
+        sub.to_bytes(),
+    )
+    .await;
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        x,
+        y,
+        z,
+        rotation,
+        move_state,
+        recipients,
+        "MoveActorToPosition applied",
+    );
+}
+
+/// `actor:LookAt(target)` — broadcasts a 0x00D3
+/// SetActorTargetAnimatedPacket so the client animates the actor's
+/// head/body turning to face the target. No position state mutation;
+/// the rotation that follows is computed client-side from the
+/// source actor's position and the target's position.
+///
+/// Auto-fires in pmeteor when a player sends an inbound SetTarget;
+/// here we expose it as an explicit Lua call so cinematic scripts
+/// can choreograph look-at directly between dialogue beats.
+async fn apply_set_actor_target_animated(
+    source_actor_id: u32,
+    target_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(source_actor_id).await else {
+        tracing::debug!(
+            actor = format!("0x{source_actor_id:08X}"),
+            "SetActorTargetAnimated skipped — source actor not in registry",
+        );
+        return;
+    };
+    let Some(zone_arc) = world.zone(handle.zone_id).await else {
+        tracing::debug!(
+            actor = format!("0x{source_actor_id:08X}"),
+            zone = handle.zone_id,
+            "SetActorTargetAnimated skipped — zone not loaded",
+        );
+        return;
+    };
+    let sub = crate::packets::send::actor::build_set_actor_target_animated(
+        source_actor_id,
+        target_actor_id,
+    );
+    let recipients = crate::runtime::broadcast::broadcast_around_actor(
+        world,
+        registry,
+        &zone_arc,
+        source_actor_id,
+        sub.to_bytes(),
+    )
+    .await;
+    tracing::debug!(
+        actor = format!("0x{source_actor_id:08X}"),
+        target = format!("0x{target_actor_id:08X}"),
+        recipients,
+        "SetActorTargetAnimated applied",
+    );
 }
 
 /// B3 of the SEQ_005 unblock plan — port of C# `Chara::SetMod`.
@@ -3589,5 +3831,114 @@ mod tests {
         // 0xDEADBEEF isn't registered — the call should log+return
         // without panicking.
         apply_set_actor_mod(0xDEAD_BEEF, 114, 1, &registry).await;
+    }
+
+    /// Phase C3 — `apply_actor_engage` pushes the actor's AIContainer
+    /// into a `BattleState::Attack` state with the target locked in.
+    /// Subsequent ticks drive auto-attack swings through this state.
+    #[tokio::test]
+    async fn c3_apply_actor_engage_pushes_attack_state() {
+        let registry = ActorRegistry::new();
+        let actor_id = 0x4000_0001u32;
+        let target_id = 0x4000_0099u32;
+        let character = Character::new(actor_id);
+        registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                actor_id,
+                ActorKindTag::Ally,
+                166,
+                0,
+                character,
+            ))
+            .await;
+
+        // Pre-condition: not engaged.
+        {
+            let handle = registry.get(actor_id).await.expect("registered");
+            let c = handle.character.read().await;
+            assert!(!c.ai_container.is_engaged());
+        }
+
+        apply_actor_engage(actor_id, target_id, &registry).await;
+
+        // Post-condition: engaged, current state targets `target_id`.
+        let handle = registry.get(actor_id).await.expect("registered");
+        let c = handle.character.read().await;
+        assert!(c.ai_container.is_engaged(), "ally should be engaged after Engage()");
+        let cs = c
+            .ai_container
+            .current_state()
+            .expect("battle state should exist");
+        assert_eq!(cs.target_actor_id, target_id);
+    }
+
+    /// Phase C3 — re-engaging the same target with `apply_actor_engage`
+    /// is a quiet no-op (matches C# `Controller::Engage`'s `if IsEngaged`
+    /// gate). Re-engaging would clobber the existing swing clock.
+    #[tokio::test]
+    async fn c3_apply_actor_engage_when_already_engaged_is_noop() {
+        let registry = ActorRegistry::new();
+        let actor_id = 0x4000_0001u32;
+        let target_id = 0x4000_0099u32;
+        registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                actor_id,
+                ActorKindTag::Ally,
+                166,
+                0,
+                Character::new(actor_id),
+            ))
+            .await;
+
+        apply_actor_engage(actor_id, target_id, &registry).await;
+        // Second call with a different target should NOT change state
+        // — re-engage is gated on `IsEngaged` (use ChangeTarget for
+        // retargets).
+        apply_actor_engage(actor_id, 0x4000_00AAu32, &registry).await;
+
+        let handle = registry.get(actor_id).await.expect("registered");
+        let c = handle.character.read().await;
+        assert_eq!(
+            c.ai_container.current_state().unwrap().target_actor_id,
+            target_id,
+            "second Engage with different target should not retarget the existing state",
+        );
+    }
+
+    /// Phase C3 — `apply_hate_container_add_base_hate` seeds a base
+    /// hate entry. Without this seed, `most_hated()` returns None and
+    /// `should_deaggro` fires on the very next combat tick.
+    #[tokio::test]
+    async fn c3_apply_hate_container_add_base_hate_seeds_entry() {
+        let registry = ActorRegistry::new();
+        let actor_id = 0x4000_0001u32;
+        let target_id = 0x4000_0099u32;
+        registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                actor_id,
+                ActorKindTag::Ally,
+                166,
+                0,
+                Character::new(actor_id),
+            ))
+            .await;
+
+        apply_hate_container_add_base_hate(actor_id, target_id, &registry).await;
+
+        let handle = registry.get(actor_id).await.expect("registered");
+        let c = handle.character.read().await;
+        assert!(c.hate.has_hate_for(target_id), "base hate entry should exist");
+    }
+
+    /// Phase C3 — apply paths quietly skip when target=0 or actor
+    /// isn't registered. Mirrors `apply_set_actor_mod_unknown_actor_is_quiet`.
+    #[tokio::test]
+    async fn c3_apply_actor_engage_skips_zero_target_and_missing_actor() {
+        let registry = ActorRegistry::new();
+        // No registered actors — both calls should log+return.
+        apply_actor_engage(0xDEAD_BEEF, 0x4000_0099, &registry).await;
+        apply_actor_engage(0xDEAD_BEEF, 0, &registry).await;
+        apply_hate_container_add_base_hate(0xDEAD_BEEF, 0x4000_0099, &registry).await;
+        apply_hate_container_add_base_hate(0xDEAD_BEEF, 0, &registry).await;
     }
 }
