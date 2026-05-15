@@ -59,6 +59,34 @@ After all 5 fixes, the smoke-test state is:
 - ✓ Director spawn lands; `0x0133` reply emitted; client receives it
 - ✗ "Now Loading" persists — director's cinematic body never runs
 
+### Wire-format suspect ruled out by Phase 8 (2026-05-15)
+
+A new round of meteor-decomp work
+(`meteor-decomp/docs/group_system_decomp.md`) decoded the engine's
+`Group::PacketProcessor` (3-slot vtable, 2-subdecoder dispatch) and the
+exact wire format of both opcodes involved on the SynchGroupWorkValues
+path:
+
+- **OUT 0x017A (SynchGroupWorkValues)**: `u64 group_id +
+  runningByteTotal + typed property entries (5 type tags) + target
+  trailer (0x82+len ASCII)`. Garlemald's
+  `build_synch_group_work_values_content_init` matches retail
+  bit-for-bit (verified against `combat_autoattack #1..5` in
+  `ffxiv_traces/`).
+- **OUT 0x0133 (GenericDataPacket)**: LuaParam-encoded variadic args
+  for `player:SendDataPacket(class, ...)` — a SEPARATE path from
+  0x017A despite the wiki conflation.
+- **IN 0x0133 (GROUP_CREATED)**: client-side "I created group via
+  /_init" trigger; garlemald's reply with OUT 0x017A is structurally
+  correct.
+
+This **rules out wire-format gaps** in the group-sync layer as a cause
+of the SEQ_005 hang. The reply garlemald emits matches what the
+engine's `PacketProcessor::OnPacket` expects byte-for-byte.
+
+Confirms the conclusion below: the remaining work is the **director
+coroutine driver subsystem**, NOT a packet-encoding fix.
+
 ## Remaining gap (the deeper subsystem)
 
 After the SynchGroupWorkValues reply lands, the server-side log
@@ -121,10 +149,38 @@ coroutine-driver subsystem itself.
    onZoneIn callback that resumes the director coroutine and
    drives its commands through `EventOutbox` instead of the
    login-scoped dispatcher.
+4. **(2026-05-08 commit `265dc11` follow-up)** That commit landed
+   the EventStart router for content-director `onEventStarted`,
+   but its commit message notes: "post-warp `KickEvent` reaches
+   the bundle but the client never echoes `EventStart`, so this
+   router has nothing to route. Resolving that requires a
+   byte-level diff of the post-warp bundle against
+   `captures/pmeteor-quest/20260426-160210-gridania-manual3/`."
+   That byte diff is the remaining concrete next step. Phase 8's
+   wire-format confirmation (above) eliminates 0x017A and 0x0133
+   from the suspect list, narrowing the diff target.
 
 Estimated scope: multi-hour focused session. The
 `fire_quest_event_hook` pattern can be the model for the
 coroutine driver's command-dispatch translation.
+
+### Phase 8 cross-references (meteor-decomp 2026-05-15)
+
+When investigating the byte-diff in step 4 above, lean on the
+meteor-decomp Phase 8 docs:
+
+- `meteor-decomp/docs/group_system_decomp.md` — full Group system
+  class hierarchy + PacketProcessor 2-subdecoder dispatch +
+  EntryBuilderBase / EntryBuilder / PacketRequestBase /
+  OnlineStatusUpdater / BreakupBuilder slot maps + 0x017A/0x0133
+  wire formats.
+- Memory: `project_meteor_decomp_phase8.md` — Phase 8 summary +
+  cross-binary class hierarchy findings.
+- Memory: `reference_ffxiv_1x_actor_event_flags.md` — the
+  `actor[+0x5c]` (KickEvent gate) + `actor[+0x7d]` (RunEventFunction
+  gate) flags. Both must be set or the packet silently drops.
+  Post-warp respawn must re-emit FULL post-AddActor sequence so
+  these flags re-set on the fresh actor instance.
 
 ## The real bug
 
