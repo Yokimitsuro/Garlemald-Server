@@ -2742,6 +2742,58 @@ impl UserData for LuaPlayer {
                 Ok(())
             },
         );
+        // `player:MoveTo(x, y, z, rotation, moveState)` — mirror of the
+        // LuaActor binding (see comment block there). Same wire effect:
+        // updates the player's stored position AND broadcasts 0x00CF
+        // MoveActorToPositionPacket so nearby players see smooth
+        // locomotion. Differs from `Warp` in that it doesn't change
+        // zone or trigger a Now-Loading screen.
+        //
+        // Used in cinematic player choreography — rare but exists
+        // (e.g. forced movement during certain quest cutscenes).
+        // pmeteor's reference is the same `Actor.SetPos(... instant=false)`
+        // path, called on the Player subclass.
+        methods.add_method(
+            "MoveTo",
+            |_, this, (x, y, z, rotation, move_state): (f32, f32, f32, f32, Option<u16>)| {
+                push(
+                    &this.queue,
+                    LuaCommand::MoveActorToPosition {
+                        actor_id: this.snapshot.actor_id,
+                        x,
+                        y,
+                        z,
+                        rotation,
+                        move_state: move_state.unwrap_or(0),
+                    },
+                );
+                Ok(())
+            },
+        );
+        // `player:LookAt(target)` — mirror of the LuaActor binding.
+        // Broadcasts 0x00D3 SetActorTargetAnimatedPacket so the client
+        // animates the player's body turning to face the target.
+        // Accepts either a LuaActor / LuaPlayer userdata (canonical
+        // pmeteor form) or a raw u32 actor id (rare).
+        methods.add_method("LookAt", |_, this, target: mlua::Value| {
+            let target_actor_id = match target {
+                mlua::Value::Integer(i) => i as u32,
+                mlua::Value::UserData(ud) => ud
+                    .borrow_scoped::<LuaActor, _>(|a| a.actor_id)
+                    .or_else(|_| ud.borrow_scoped::<LuaPlayer, _>(|p| p.snapshot.actor_id))
+                    .unwrap_or(0),
+                mlua::Value::Nil => 0,
+                _ => 0,
+            };
+            push(
+                &this.queue,
+                LuaCommand::SetActorTargetAnimated {
+                    source_actor_id: this.snapshot.actor_id,
+                    target_actor_id,
+                },
+            );
+            Ok(())
+        });
 
         // `player:SetMod(modifier_key, value)` — apply a numeric
         // modifier (HP lock, speed, etc.). B3: queues

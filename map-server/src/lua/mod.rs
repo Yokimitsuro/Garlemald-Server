@@ -2389,4 +2389,93 @@ mod tests {
         assert_eq!(look_ats[0], (0x4000_2001, 0x4000_2099));
         assert_eq!(look_ats[1], (0x4000_2001, 0x4000_3333));
     }
+
+    /// LuaPlayer mirrors of MoveTo / LookAt — same wire effect (0x00CF /
+    /// 0x00D3), routed through the player's snapshot.actor_id rather
+    /// than a sibling actor's id. Verified via the `_player` arg
+    /// passed into the content-hook probe (which is the LuaPlayer
+    /// userdata).
+    #[test]
+    fn lua_player_move_to_and_look_at_mirror_actor_bindings() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(
+            root.join("content/PlayerCinematic.lua"),
+            r#"
+            function probe(player, area, _director)
+                local monsters = area:GetMonsters()
+                player:MoveTo(100.0, 0.0, 200.0, 1.5, 1)
+                player:MoveTo(101.0, 0.0, 201.0, 0.0)  -- default moveState
+                if #monsters > 0 then
+                    player:LookAt(monsters[1])
+                end
+                player:LookAt(0x40004444)
+                return true
+            end
+            "#,
+        )
+        .unwrap();
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("content/PlayerCinematic.lua");
+        let dummy_queue = CommandQueue::new();
+        let mut area = sample_content_area(dummy_queue.clone());
+        area.monsters.push(userdata::LuaActor {
+            actor_id: 0x4000_5099,
+            name: "wolf".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 0,
+            pos: (0.0, 0.0, 0.0),
+            rotation: 0.0,
+            queue: dummy_queue.clone(),
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+        let snap = sample_snapshot();
+        let player_actor_id = snap.actor_id;
+        let result = engine.call_content_hook(
+            &script_path,
+            "probe",
+            snap,
+            area,
+            sample_director(dummy_queue),
+        );
+        assert!(result.error.is_none(), "probe errored: {:?}", result.error);
+        let moves: Vec<_> = result
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                LuaCommand::MoveActorToPosition {
+                    actor_id,
+                    x,
+                    y,
+                    z,
+                    rotation,
+                    move_state,
+                } => Some((*actor_id, *x, *y, *z, *rotation, *move_state)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(moves.len(), 2, "expected 2 MoveActorToPosition cmds; got {:?}", result.commands);
+        assert_eq!(moves[0], (player_actor_id, 100.0, 0.0, 200.0, 1.5, 1));
+        assert_eq!(moves[1], (player_actor_id, 101.0, 0.0, 201.0, 0.0, 0));
+        let look_ats: Vec<_> = result
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                LuaCommand::SetActorTargetAnimated {
+                    source_actor_id,
+                    target_actor_id,
+                } => Some((*source_actor_id, *target_actor_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(look_ats.len(), 2, "expected 2 LookAt cmds; got {:?}", result.commands);
+        assert_eq!(look_ats[0], (player_actor_id, 0x4000_5099));
+        assert_eq!(look_ats[1], (player_actor_id, 0x4000_4444));
+    }
 }
