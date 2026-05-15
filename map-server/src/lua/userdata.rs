@@ -3934,35 +3934,33 @@ impl UserData for LuaDirectorHandle {
         // isn't an actor-like userdata, in which case the apply
         // path skips the broadcast cleanly).
         methods.add_method("AddMember", |_, this, member: mlua::Value| {
+            // CRITICAL: must use `borrow_scoped` (not `borrow`) because
+            // `director:AddMember(director)` (the SimpleContent30010
+            // self-add) means `this` and `member` reference the SAME
+            // userdata. mlua's `borrow` returns Err when there's
+            // already an active borrow on the same userdata — and
+            // mlua's `add_method` outer wrapper holds an active
+            // immutable borrow on `this` for the duration of the
+            // closure. So a `borrow::<LuaDirectorHandle>()` call from
+            // INSIDE the method body fails when the userdata is the
+            // same `this` (the prior 2234f3a fix's chain returned 0
+            // because of this borrow conflict).
+            //
+            // `borrow_scoped` releases its handle as soon as the inner
+            // closure returns, so it composes safely with the method's
+            // outer borrow. Same idiom as `LuaActor:LookAt` (line ~255)
+            // and `LuaPlayer.NewIndex` (line ~2782).
+            //
+            // Per `feedback_meteor_decomp_authoritative_for_engine_bindings`
+            // memory: this is a known mlua pitfall — use `borrow_scoped`
+            // when the method might receive `self` back as an arg.
             let member_actor_id = match &member {
-                mlua::Value::UserData(ud) => {
-                    if let Ok(p) = ud.borrow::<LuaPlayer>() {
-                        p.snapshot.actor_id
-                    } else if let Ok(a) = ud.borrow::<LuaActor>() {
-                        a.actor_id
-                    } else if let Ok(n) = ud.borrow::<LuaNpc>() {
-                        n.base.actor_id
-                    } else if let Ok(d) = ud.borrow::<LuaDirectorHandle>() {
-                        // `director:AddMember(director)` is canonical
-                        // pmeteor (`SimpleContent30010.lua` line `director:AddMember(director)`
-                        // — the director adds itself as a member of its
-                        // own content group). The 1.x client's
-                        // content-group state machine requires the
-                        // director's actor id to be in the roster
-                        // before it'll dispatch any KickEvent targeting
-                        // it. Confirmed by post-warp byte-diff vs
-                        // pmeteor capture (line 31878 of
-                        // captures/pmeteor-quest/.../map-packets.log):
-                        // pmeteor's GroupHeader carries member_count=7
-                        // (player + director + Yda + Papalymo + 3
-                        // wolves), garlemald's was 6 (director
-                        // self-reference dropped because this borrow
-                        // chain didn't recognise LuaDirectorHandle).
-                        d.actor_id
-                    } else {
-                        0
-                    }
-                }
+                mlua::Value::UserData(ud) => ud
+                    .borrow_scoped::<LuaPlayer, _>(|p| p.snapshot.actor_id)
+                    .or_else(|_| ud.borrow_scoped::<LuaActor, _>(|a| a.actor_id))
+                    .or_else(|_| ud.borrow_scoped::<LuaNpc, _>(|n| n.base.actor_id))
+                    .or_else(|_| ud.borrow_scoped::<LuaDirectorHandle, _>(|d| d.actor_id))
+                    .unwrap_or(0),
                 mlua::Value::Integer(i) => *i as u32,
                 _ => 0,
             };
