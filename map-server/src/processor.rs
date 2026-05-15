@@ -2361,8 +2361,28 @@ impl PacketProcessor {
         };
         let session_id = player_handle.session_id;
 
-        // Append to the per-director roster on Session.
-        let roster = {
+        // Append to the per-director roster on Session. NO PER-CALL
+        // GROUP-TRIO BROADCAST — pmeteor's `ContentGroup.AddMember`
+        // (Map Server/Actors/Group/ContentGroup.cs:67-78) only
+        // re-emits the GroupHeader/Begin/X/End trio when
+        // `isStarted == true` (set by `Start()`, called via
+        // `StartContentGroup`). Per the pmeteor pcap byte-diff
+        // (2026-05-15, captures/pmeteor-quest/20260426-160210-
+        // gridania-manual3/), the SEQ_005 onCreate's seven AddMember
+        // calls produce ZERO group trio packets pre-warp; the trio is
+        // only emitted ONCE by the pre-warp `apply_do_zone_change_content`
+        // batch. Garlemald was emitting the trio per AddMember
+        // call (8 trios total), and the 1.x client's content-group
+        // state machine apparently resets on each GroupHeader — so
+        // the rapid-fire trios churned the state machine and the
+        // post-warp KickEvent silently dropped because the client's
+        // group state was never stable.
+        //
+        // The roster update is the only side effect here. The pre-warp
+        // emission in `apply_do_zone_change_content` reads
+        // `transient_director_members[director_actor_id]` to build the
+        // single trio it sends — that's where the wire emission lives.
+        let roster_len = {
             let Some(mut snap) = self.world.session(session_id).await else {
                 tracing::debug!(
                     session = session_id,
@@ -2377,123 +2397,16 @@ impl PacketProcessor {
             if !entry.contains(&member_actor_id) {
                 entry.push(member_actor_id);
             }
-            let cloned = entry.clone();
+            let len = entry.len();
             self.world.upsert_session(snap).await;
-            cloned
+            len
         };
-
-        // Build GroupMember rows from the roster. Resolve names from
-        // the registry; placeholder for entries not yet registered
-        // (rare when B1 spawns and B4 broadcasts in the same drain).
-        let mut members = Vec::with_capacity(roster.len());
-        for &mid in &roster {
-            let name = if let Some(h) = self.registry.get(mid).await {
-                let c = h.character.read().await;
-                c.base.display_name().to_string()
-            } else {
-                format!("bnpc_{mid:08X}")
-            };
-            members.push(crate::packets::send::groups::GroupMember {
-                actor_id: mid,
-                localized_name: -1,
-                unknown2: 0,
-                flag1: false,
-                is_online: true,
-                name,
-            });
-        }
-
-        // Build the trio. Group index uses the director's actor id
-        // directly — the director IS the group key (no synthetic
-        // solo-self flag like the player's party). C# uses the same
-        // convention: `director.GetGroupId()` returns the director's
-        // composite actor id.
-        let group_index: u64 = director_actor_id as u64;
-        let zone_actor_id = player_handle.zone_id;
-        let location_code = zone_actor_id as u64;
-        let sequence_id = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or_default();
-        // Director groups use a different group_type than party.
-        // C# `Director.GetGroupTypeId()` returns 30001 (0x7531) for
-        // ContentGroup directors; tutorials use the same value.
-        // C# Group.cs:49 — `ContentGroup_SimpleContentGroup24B = 30006`,
-        // which is the value `ContentGroup.GetTypeId()` returns and what
-        // pmeteor sends in the GroupHeader's type_id field for the
-        // SEQ_005 director's group (verified vs
-        // captures/pmeteor-quest/20260426-160210-gridania-manual3/ at
-        // line 31878 — bytes [0x50..0x53] = 0x00007536 = 30006).
-        // Garlemald previously used 30001 which is `GuildleveGroup`
-        // (Group.cs:44) — the wrong type — and the 1.x client
-        // dispatched the group through the guildleve path instead of
-        // the content path.
-        const GROUP_TYPE_CONTENT_GROUP: u32 = 30006;
-
-        let mut offset = 0usize;
-        let mut subs = vec![
-            crate::packets::send::groups::build_group_header(
-                player_actor_id,
-                location_code,
-                sequence_id,
-                group_index,
-                GROUP_TYPE_CONTENT_GROUP,
-                -1,
-                "",
-                members.len() as u32,
-            ),
-            crate::packets::send::groups::build_group_members_begin(
-                player_actor_id,
-                location_code,
-                sequence_id,
-                group_index,
-                members.len() as u32,
-            ),
-            // Content director groups use the CONTENT_MEMBERS_X08 (0x0183)
-            // wire opcode, NOT the party-side GROUP_MEMBERS_X08 (0x017F).
-            // Mirrors pmeteor `ContentGroup.SendGroupPackets`
-            // (`Map Server/Actors/Group/ContentGroup.cs:136`) which routes
-            // through `ContentMembersX08Packet` for content groups while
-            // `Group.cs:159` uses `GroupMembersX08Packet` for parties.
-            // Confirmed by post-warp byte-diff vs pmeteor capture
-            // `captures/pmeteor-quest/20260426-160210-gridania-manual3/`
-            // (2026-05-15): pmeteor sends 0x0183 once for the SEQ_005
-            // content group; garlemald was sending 0x017F. The 1.x client
-            // dispatches the two opcodes through different group-table
-            // paths, so the content-director's roster never landed in the
-            // content-group slot.
-            crate::packets::send::groups::build_content_members_x08(
-                player_actor_id,
-                location_code,
-                sequence_id,
-                &members,
-                &mut offset,
-            ),
-            crate::packets::send::groups::build_group_members_end(
-                player_actor_id,
-                location_code,
-                sequence_id,
-                group_index,
-            ),
-        ];
-
-        let Some(client) = self.world.client(session_id).await else {
-            tracing::debug!(
-                session = session_id,
-                "DirectorAddMember skipped — no client handle",
-            );
-            return;
-        };
-        for sub in &mut subs {
-            sub.set_target_id(session_id);
-            client.send_bytes(sub.to_bytes()).await;
-        }
 
         tracing::info!(
             director = format!("0x{director_actor_id:08X}"),
             member = format!("0x{member_actor_id:08X}"),
-            roster = members.len(),
-            "DirectorAddMember applied (B4: roster + group trio rebroadcast)",
+            roster = roster_len,
+            "DirectorAddMember applied (roster updated; trio deferred to pre-warp emission)",
         );
     }
 
