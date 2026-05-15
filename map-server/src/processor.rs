@@ -2418,7 +2418,17 @@ impl PacketProcessor {
         // Director groups use a different group_type than party.
         // C# `Director.GetGroupTypeId()` returns 30001 (0x7531) for
         // ContentGroup directors; tutorials use the same value.
-        const GROUP_TYPE_CONTENT_GROUP: u32 = 30001;
+        // C# Group.cs:49 — `ContentGroup_SimpleContentGroup24B = 30006`,
+        // which is the value `ContentGroup.GetTypeId()` returns and what
+        // pmeteor sends in the GroupHeader's type_id field for the
+        // SEQ_005 director's group (verified vs
+        // captures/pmeteor-quest/20260426-160210-gridania-manual3/ at
+        // line 31878 — bytes [0x50..0x53] = 0x00007536 = 30006).
+        // Garlemald previously used 30001 which is `GuildleveGroup`
+        // (Group.cs:44) — the wrong type — and the 1.x client
+        // dispatched the group through the guildleve path instead of
+        // the content path.
+        const GROUP_TYPE_CONTENT_GROUP: u32 = 30006;
 
         let mut offset = 0usize;
         let mut subs = vec![
@@ -2627,7 +2637,28 @@ impl PacketProcessor {
             // different actor), keep the post-warp ordering — those
             // were already working under the deferred-emission model.
             if kick.owner_actor_id == active.director_actor_id {
-                let group_index: u64 = active.director_actor_id as u64;
+                // Pmeteor's content-group id is `0x3000_0000_0000_0000 |
+                // counter` (WorldManager.cs:1077: `groupIndexId =
+                // groupIndexId | 0x3000000000000000;` followed by
+                // `groupIndexId++` per group). The high nibble 0x3 is
+                // the content-group bitfield marker; the lower 60 bits
+                // are a per-server-process counter starting at 1.
+                //
+                // Garlemald previously used `director_actor_id as u64`
+                // (= 0x65300003 for the SEQ_005 director) which has the
+                // wrong bitfield prefix entirely (0x6 = director, not
+                // 0x3 = content group). The 1.x client uses the high
+                // nibble to dispatch the group via the right index
+                // table — wrong prefix → wrong table → group invisible
+                // to the client's content-group state.
+                //
+                // For the SEQ_005 case we hard-code counter=1 (only
+                // ever one content group active at a time per session
+                // in the tutorial flow). A real registry of per-session
+                // group counters lives elsewhere (transient_director_members
+                // is keyed by director_actor_id, so we don't yet have
+                // a content-group counter).
+                let group_index: u64 = 0x3000_0000_0000_0000u64 | 1u64;
                 let location_code = parent_zone_id as u64;
                 let sequence_id = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -2659,9 +2690,40 @@ impl PacketProcessor {
                         name,
                     });
                 }
-                const GROUP_TYPE_CONTENT_GROUP: u32 = 30001;
+                // C# Group.cs:49 — `ContentGroup_SimpleContentGroup24B = 30006`,
+                // which is the value `ContentGroup.GetTypeId()` returns and what
+                // pmeteor sends in the GroupHeader's type_id field for the
+                // SEQ_005 director's group (verified vs
+                // captures/pmeteor-quest/20260426-160210-gridania-manual3/ at
+                // line 31878 — bytes [0x50..0x53] = 0x00007536 = 30006).
+                // Garlemald previously used 30001 which is `GuildleveGroup`
+                // (Group.cs:44) — the wrong type — and the 1.x client
+                // dispatched the group through the guildleve path instead of
+                // the content path.
+                const GROUP_TYPE_CONTENT_GROUP: u32 = 30006;
                 let mut offset = 0usize;
                 let pre_warp_subs = vec![
+                    // SetActorProperty(charaWork.currentContentGroup =
+                    // group_type_id) — port of pmeteor
+                    // `Character.SetCurrentContentGroup(group)`
+                    // (Map Server/Actors/Chara/Character.cs:207). Tells
+                    // the client "your content group is now type 30006",
+                    // which the kick receiver dispatches against. Without
+                    // this, the client has no content-group context and
+                    // the post-warp KickEvent silently drops at the
+                    // dispatch table. Murmur2 hash of the dotted path
+                    // matches pmeteor's bytes (verified at line 31866 of
+                    // the SEQ_005 reference capture: `89 E1 F9 0D` LE =
+                    // 0x0DF9E189).
+                    crate::packets::send::actor::build_set_actor_property_u32(
+                        actor_id,
+                        "charaWork/currentContentGroup",
+                        common::utils::murmur_hash2(
+                            "charaWork.currentContentGroup",
+                            0,
+                        ),
+                        GROUP_TYPE_CONTENT_GROUP,
+                    ),
                     crate::packets::send::groups::build_group_header(
                         actor_id,
                         location_code,
