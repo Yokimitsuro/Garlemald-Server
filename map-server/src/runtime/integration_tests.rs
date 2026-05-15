@@ -10491,3 +10491,96 @@ async fn lua_action_try_status_emits_command() {
 
     let _ = std::fs::remove_file(&probe);
 }
+
+/// `apply_login_lua_command` should bridge `RunEventFunction` + `EndEvent`
+/// through the EventOutbox so cinematic-body packets reach the wire.
+/// Before commit `<this commit>`, both fell through the silent
+/// "login lua cmd (unhandled)" branch and the SEQ_005 director coroutine's
+/// `callClientFunction(player, "delegateEvent", ...)` + `player:EndEvent()`
+/// pair never produced 0x0130/0x0131 packets post-warp.
+///
+/// Setup: one Player actor with a client handle + an active EventSession
+/// (so the translator has owner / event_name / event_type to inherit).
+/// Drive a `RunEventFunction` and an `EndEvent` through
+/// `apply_login_lua_command`, then assert two packets land on the
+/// owner's mpsc.
+#[tokio::test]
+async fn apply_login_lua_command_routes_run_event_function_through_outbox() {
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::event::EventOutbox;
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(crate::runtime::actor_registry::ActorRegistry::new());
+
+    // One player actor with a session-bound EventSession.
+    let mut chara = Character::new(1);
+    {
+        let mut ob = EventOutbox::new();
+        chara.event_session.start_event(
+            1,
+            99,
+            "quest_man0g0_seq005",
+            5,
+            vec![],
+            &mut ob,
+        );
+    }
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 0, 42, chara))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: None,
+        cmd: None,
+    };
+    let handle = registry.get(1).await.expect("player handle");
+
+    // 1. RunEventFunction — should emit 0x0130 to the client.
+    processor
+        .apply_login_lua_command(
+            &handle,
+            LuaCommand::RunEventFunction {
+                player_id: 1,
+                event_name: String::new(),
+                function_name: "delegateEvent".to_string(),
+                args: vec![],
+            },
+        )
+        .await;
+
+    // 2. EndEvent — should emit 0x0131 to the client.
+    processor
+        .apply_login_lua_command(
+            &handle,
+            LuaCommand::EndEvent {
+                player_id: 1,
+                event_owner: 0,
+                event_name: String::new(),
+            },
+        )
+        .await;
+
+    // Both packets should have landed.
+    let first = rx
+        .try_recv()
+        .expect("RunEventFunction must reach the client");
+    assert!(!first.is_empty(), "RunEventFunction packet must be non-empty");
+    let second = rx
+        .try_recv()
+        .expect("EndEvent must reach the client");
+    assert!(!second.is_empty(), "EndEvent packet must be non-empty");
+    assert_ne!(first, second, "the two packets carry different opcodes");
+}

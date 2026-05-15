@@ -1691,6 +1691,63 @@ impl PacketProcessor {
                     "ContentFinished applied (stub: cleanup not yet wired)",
                 );
             }
+            // Event-flavoured commands (`RunEventFunction`, `EndEvent`)
+            // emitted via the login-scoped pipeline get bridged through
+            // the EventOutbox + dispatch_event_event. Mirrors
+            // `fire_quest_event_hook` (processor.rs:5996+) so the SEQ_005
+            // director-coroutine cinematic body actually reaches the wire
+            // instead of dropping at this catch-all. (KickEvent has its
+            // own arm above — captures onto session for post-warp
+            // emission, so we don't include it here.)
+            //
+            // Why this exists: the man0g0 SEQ_005 cinematic (see pmeteor
+            // `directors/Quest/QuestDirectorMan0g001.lua::onEventStarted`)
+            // calls `callClientFunction(player, "delegateEvent", ...)`
+            // followed by `player:EndEvent()` repeatedly to advance
+            // through tutorial stages. Both translate to LuaCommand::
+            // RunEventFunction / EndEvent on the server side. Before
+            // this arm landed, they fell through to the silent
+            // `tracing::debug!(?other, "login lua cmd (unhandled)")`
+            // branch and the cinematic body never ran (post-warp byte-
+            // diff vs pmeteor capture confirmed: pmeteor sends
+            // 0x0130 RunEventFunction + 0x0131 EndEvent post-warp,
+            // garlemald sent zero of either).
+            //
+            // The translator + dispatcher are already known-good — they
+            // serve `fire_quest_event_hook` and `apply_quest_on_notice`.
+            // This arm just plumbs the login-scoped path into the same
+            // bridge.
+            cmd @ (LC::RunEventFunction { .. } | LC::EndEvent { .. }) => {
+                let player_id = handle.actor_id;
+                let event_session_snapshot = {
+                    let c = handle.character.read().await;
+                    c.event_session.clone()
+                };
+                let mut outbox = crate::event::outbox::EventOutbox::new();
+                crate::event::lua_bridge::translate_lua_commands_into_outbox(
+                    std::slice::from_ref(&cmd),
+                    &event_session_snapshot,
+                    &mut outbox,
+                );
+                let drained: Vec<_> = outbox.drain();
+                let event_count = drained.len();
+                for e in drained {
+                    Box::pin(crate::event::dispatcher::dispatch_event_event(
+                        &e,
+                        &self.registry,
+                        &self.world,
+                        &self.db,
+                        self.lua.as_ref(),
+                    ))
+                    .await;
+                }
+                tracing::debug!(
+                    player = player_id,
+                    events = event_count,
+                    cmd = ?cmd,
+                    "login lua cmd routed via EventOutbox bridge",
+                );
+            }
             other => {
                 tracing::debug!(?other, "login lua cmd (unhandled)");
             }
