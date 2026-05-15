@@ -87,6 +87,44 @@ engine's `PacketProcessor::OnPacket` expects byte-for-byte.
 Confirms the conclusion below: the remaining work is the **director
 coroutine driver subsystem**, NOT a packet-encoding fix.
 
+### Post-warp byte-diff vs pmeteor (2026-05-15)
+
+Counted OUT opcodes in the 4 sec post-`0xE2(code=0x10)` window:
+
+| Opcode | pmeteor | garlemald | Constant | Status |
+|---|---:|---:|---|---|
+| `0x0130` | 1 | 0 | `OP_RUN_EVENT_FUNCTION` | Builder exists; never fires post-warp (the cinematic body) |
+| `0x0131` | 1 | 0 | `OP_END_EVENT` | Same — fires after each cinematic stage |
+| `0x0133` | 1 | 0 | `OP_GENERIC_DATA` | `attentionMessage` / SendDataPacket; cinematic-driven |
+| `0x0183` | 1 | 0 → 1 | `OP_CONTENT_MEMBERS_X08` | **Fixed in commit `dbcc19a`** — `apply_director_add_member` now uses content variant instead of party variant |
+| `0x00cf` | 8 | 0 | `OP_MOVE_ACTOR_TO_POSITION` | Builder exists, **zero callers**; cinematic moves NPCs (Yda, Papalymo, wolves) |
+| `0x00d3` | 2 | 0 | `OP_SET_ACTOR_TARGET_ANIMATED` | Builder exists, **zero callers**; cinematic look-at |
+| `0x013c` | 4 | 0 | `OP_COMMAND_RESULT_X00` | Builder exists, 1 caller in `dispatcher.rs` (zero-action result); cinematic battle commands |
+| `0x0139` | 4 | 0 | `OP_COMMAND_RESULT_X01` | Single-action battle command result |
+| `0x0149` | 1 | 0 | `OP_INVENTORY_LIST_X08` | Inventory bundle for the cinematic |
+| `0x017c/d/e` | 2 each | 1 each | GroupHeader/Begin/End | Garlemald sends only the party trio; missing the content-group trio (companion to the 0x0183 fix) |
+
+**No "unknown" opcodes** — all post-warp gaps are named in
+`map-server/src/packets/opcodes.rs`. The gap is purely
+**emission paths not firing** (cinematic body never runs because the
+director coroutine never resumes). Once the coroutine driver wakes,
+the existing builders should be exercised by the Lua engine via:
+
+- `actor:MoveTo(x, y, z)` → `build_move_actor_to_position` (0x00CF)
+- `actor:LookAt(target)` → `build_set_actor_target_animated` (0x00D3)
+- `callClientFunction(player, "delegateEvent", ...)` →
+  `RunEventFunction` (0x0130) ← THE one
+- `player:EndEvent()` → `EndEvent` (0x0131)
+
+The `callClientFunction(player, "delegateEvent", ...)` chain in
+`directors/Quest/QuestDirectorMan0g001.lua::onEventStarted` is the
+direct emitter of 0x0130. Per
+`map-server/src/processor.rs:1694`, when this command lands at the
+login-lua-command catch-all it falls through to the silent
+`tracing::debug!(?other, "login lua cmd (unhandled)")` branch — the
+fire_quest_event_hook pattern at processor.rs:5996+ shows the
+correct EventOutbox translation.
+
 ## Remaining gap (the deeper subsystem)
 
 After the SynchGroupWorkValues reply lands, the server-side log
