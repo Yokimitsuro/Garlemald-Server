@@ -93,40 +93,28 @@ pub fn translate_lua_commands_into_outbox(
                     event_type: session.current_event_type,
                 });
             }
-            LuaCommand::KickEvent {
-                player_id,
-                actor_id,
-                trigger,
-                args,
-            } => {
-                // The wire-format `trigger_actor_id` (body[0..3]) is the
-                // PLAYER who is kicking the event — pmeteor's reference
-                // capture (`captures/pmeteor-quest/20260426-160210-
-                // gridania-manual3/`) confirms: KickEvent body[0..3] = 1
-                // (player) and body[4..7] = 0x65300003 (director). The
-                // event_type is `5` (Player.KickEvent's hard-coded value
-                // per `Map Server/Actors/Chara/Player/Player.cs:2188`),
-                // NOT 0 (which is reserved for KickEventSpecial).
-                //
-                // Previous version routed `*actor_id` (the director) as
-                // target_actor_id AND owner_actor_id, with event_type=0.
-                // The result was a malformed kick that the 1.x client
-                // silently dropped at the receiver gate (`+0x5c` check
-                // failed because the receiver thought a director was
-                // kicking itself, and the actor lookup for the
-                // self-referential trigger landed on the director's
-                // half-spawned state). Confirmed via post-warp byte-diff
-                // showing trigger=0x65300003 + event_type=0 vs pmeteor's
-                // trigger=1 + event_type=5.
-                outbox.push(EventEvent::KickEvent {
-                    player_actor_id: *player_id,
-                    target_actor_id: *player_id,
-                    owner_actor_id: *actor_id,
-                    event_name: trigger.clone(),
-                    event_type: 5,
-                    lua_params: args.iter().map(arg_to_lua_param).collect(),
-                });
-            }
+            // KickEvent is INTENTIONALLY excluded — it flows through
+            // `apply_login_lua_command`'s `LC::KickEvent` arm
+            // (processor.rs:1003) which captures into
+            // `session.pending_kick_event` for emission either at the
+            // end of the next zone-in bundle (OpeningDirector path) OR
+            // pre-warp by `apply_do_zone_change_content` (SEQ_005
+            // content-director path).
+            //
+            // Translating KickEvent here AS WELL produced a duplicate
+            // wire emission per quest-hook-driven kick: one fires
+            // here via dispatch_event_event, then the same LuaCommand
+            // is also drained through apply_login_lua_command which
+            // captures it AGAIN. Both then emit the same kick bytes
+            // (after the f4e2422 field-correction fix). Two
+            // back-to-back kicks confused the 1.x client's content-
+            // group state machine — pmeteor's reference capture
+            // sends only ONE kick per warp.
+            //
+            // For the OpeningDirector at session start, the kick
+            // never goes through this translator (apply_login_lua_command
+            // is called directly), so the deduplication only changes
+            // the quest-hook-driven path.
             _ => {}
         }
     }
@@ -215,7 +203,12 @@ mod tests {
     }
 
     #[test]
-    fn kick_event_routes_to_target() {
+    fn kick_event_is_suppressed_from_outbox() {
+        // KickEvent flows through apply_login_lua_command's KickEvent
+        // arm (which captures into session.pending_kick_event) — NOT
+        // through the EventOutbox. Translating it here AS WELL would
+        // produce a duplicate wire emission. The translator
+        // intentionally drops KickEvent into the catch-all `_ => {}`.
         let cmd = LuaCommand::KickEvent {
             player_id: 1,
             actor_id: 99,
@@ -225,28 +218,11 @@ mod tests {
         let session = session_with_event();
         let mut outbox = EventOutbox::new();
         translate_lua_commands_into_outbox(&[cmd], &session, &mut outbox);
-        match &outbox.events[0] {
-            EventEvent::KickEvent {
-                player_actor_id,
-                target_actor_id,
-                owner_actor_id,
-                event_name,
-                event_type,
-                ..
-            } => {
-                // The wire-format `trigger_actor_id` (= target_actor_id
-                // here) is the PLAYER who's kicking, NOT the kicked
-                // event's target actor. Owner is the kicked actor
-                // (e.g. director). event_type=5 is C# `Player.KickEvent`'s
-                // canonical value (Map Server/Actors/Chara/Player/Player.cs:2188).
-                assert_eq!(*player_actor_id, 1);
-                assert_eq!(*target_actor_id, 1, "target = player (the trigger)");
-                assert_eq!(*owner_actor_id, 99, "owner = kicked actor (e.g. director)");
-                assert_eq!(event_name, "teleport");
-                assert_eq!(*event_type, 5, "event_type=5 (Player.KickEvent), not 0 (KickEventSpecial)");
-            }
-            _ => panic!("expected KickEvent"),
-        }
+        assert!(
+            outbox.events.is_empty(),
+            "KickEvent must NOT be pushed to the EventOutbox; got {:?}",
+            outbox.events,
+        );
     }
 
     #[test]
