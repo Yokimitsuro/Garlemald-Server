@@ -3100,6 +3100,65 @@ impl PacketProcessor {
             }
         }
 
+        // Server-side cinematic kickoff fallback.
+        //
+        // In pmeteor's reference capture, the client autonomously sends
+        // IN 0x012D EventStart for the content director ~2 seconds
+        // post-warp (target=director_actor_id, event_name="noticeEvent",
+        // event_type=5), which the server routes through
+        // `dispatch_event_start_to_content_director` → fires
+        // `onEventStarted` → emits OUT 0x0130 `callClientFunction
+        // "delegateEvent processTtrBtl001"` = the cinematic body.
+        //
+        // Across 9+ smoke runs even after fixing the kick wire format
+        // (f4e2422), content-trio opcode (dbcc19a), pre-warp packet
+        // count, IN 0x0133 dispatcher (d9896de), 0x017A property-entry
+        // type (bf6e836), and contentArea:SpawnActor + actor-id
+        // mismatch (f411c05 + 53d8b58), garlemald's client STILL never
+        // fires that autonomous IN 0x012D for director. The exact
+        // client-side gate is some receiver-state primer that the
+        // Phase 9 #8a investigation couldn't fully pin down without
+        // runtime decompiler tracing.
+        //
+        // Workaround: explicitly run the director's `onEventStarted`
+        // here after the warp completes. This mirrors what pmeteor's
+        // engine produces implicitly when the client's autonomous
+        // EventStart arrives. The `dispatch_event_start_to_content_
+        // director` function already exists for the
+        // handle_event_start path; call it directly with the SEQ_005
+        // kick params (event_name=noticeEvent, event_type=5,
+        // lua_params=[True] matching the kick body).
+        //
+        // The director's onEventStarted body:
+        //   - callClientFunction("delegateEvent processTtrBtl001") →
+        //     OUT 0x0130 RunEventFunction (the cinematic body)
+        //   - player:EndEvent() → OUT 0x0131 EndEvent
+        //   - waitForSignal("playerActive") — parks the coroutine here;
+        //     resumed when the player triggers the active signal post-
+        //     cinematic (player active mode)
+        if let Some(active) = self
+            .world
+            .session(session_id)
+            .await
+            .and_then(|s| s.active_content_script)
+        {
+            let director_actor_id = active.director_actor_id;
+            self.dispatch_event_start_to_content_director(
+                &handle,
+                session_id,
+                director_actor_id,
+                /* event_name  */ "noticeEvent".to_string(),
+                /* event_type  */ 5,
+                /* lua_params  */ vec![common::luaparam::LuaParam::True],
+            )
+            .await;
+            tracing::info!(
+                player = player_id,
+                director = format!("0x{:08X}", director_actor_id),
+                "DoZoneChangeContent: server-side cinematic kickoff (synthetic noticeEvent EventStart)",
+            );
+        }
+
         tracing::info!(
             player = player_id,
             parent_zone = parent_zone_id,
@@ -3107,7 +3166,7 @@ impl PacketProcessor {
             x,
             y,
             z,
-            "DoZoneChangeContent applied (B7: warp + zone-in replay + onZoneIn fired + coroutine resume)",
+            "DoZoneChangeContent applied (B7: warp + zone-in replay + onZoneIn fired + coroutine resume + cinematic kickoff)",
         );
     }
 
