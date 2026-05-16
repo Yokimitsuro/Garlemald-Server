@@ -6610,9 +6610,19 @@ impl PacketProcessor {
                 //
                 // Discriminator: the high u32 of group_id distinguishes
                 // group classes:
-                //   - 0x00000000__XXXXXXXX → content director (low u32 IS the
+                //   - 0x00000000__XXXXXXXX → content director (LEGACY format,
+                //                            pre-0x3000 prefix; low u32 IS the
                 //                            director actor id; e.g. man0g0
                 //                            QuestDirectorMan0g001 = 0x65300003)
+                //   - 0x30000000__XXXXXXXX → content group (post-93eb62b
+                //                            format; low u32 is a per-session
+                //                            group counter starting at 1; the
+                //                            director_actor_id must be looked
+                //                            up via session.active_content_script.
+                //                            This is what apply_do_zone_change_
+                //                            content emits in 3a; the client
+                //                            echoes the same group_id back in
+                //                            its IN 0x0133)
                 //   - 0x80000000__XXXXXXXX → player-work group (low u32 is the
                 //                            player actor id, high bit flags
                 //                            it as a player-side group)
@@ -6620,28 +6630,56 @@ impl PacketProcessor {
                 //                            id with 0x2680 prefix per the
                 //                            captured-bytes comment above)
                 //
+                // The 0x3000-prefix branch is the SEQ_005-blocking case
+                // (Phase 9 #8c follow-up): until 2026-05-15 the dispatcher
+                // filtered `high == 0` only, silently dropped the client's
+                // 0x3000_0000_0000_0001 echo, and the missing OUT 0x017A
+                // SynchGroupWorkValues reply stalled the client's
+                // WorkSyncUpdater — the director never got marked
+                // event-ready, IN 0x012D for director never fired, the
+                // cinematic body never started.
+                //
                 // Earlier iteration responded to ALL 0x0133 with event="/_init"
                 // and crashed Wine when the OpeningDirector path's player-work
                 // group sent group_id=0x8000000000000001 (player actor id 1
-                // misinterpreted as a director). Now restricted to content-
-                // director inits only.
+                // misinterpreted as a director). Hence the explicit branch
+                // gating below.
                 let high = (group_id >> 32) as u32;
-                if event_name == "/_init" && high == 0 {
-                    let director_actor_id = (group_id & 0xFFFF_FFFF) as u32;
-                    let mut sub = crate::packets::send::groups
-                        ::build_synch_group_work_values_content_init(
-                            source,
-                            group_id,
-                            director_actor_id,
+                if event_name == "/_init" {
+                    let director_actor_id: Option<u32> = if high == 0 {
+                        // Legacy format: low u32 IS the director id
+                        Some((group_id & 0xFFFF_FFFF) as u32)
+                    } else if (high & 0xF000_0000) == 0x3000_0000 {
+                        // Content-group format: look up the active
+                        // content script's director from the session.
+                        // The low u32 is a per-session counter, NOT the
+                        // director id, so we can't derive it from the
+                        // group_id alone.
+                        self.world
+                            .session(source)
+                            .await
+                            .and_then(|s| s.active_content_script)
+                            .map(|a| a.director_actor_id)
+                    } else {
+                        // Player-work, mob, etc — not for us to reply to.
+                        None
+                    };
+                    if let Some(director_actor_id) = director_actor_id {
+                        let mut sub = crate::packets::send::groups
+                            ::build_synch_group_work_values_content_init(
+                                source,
+                                group_id,
+                                director_actor_id,
+                            );
+                        sub.set_target_id(source);
+                        client.send_bytes(sub.to_bytes()).await;
+                        tracing::info!(
+                            source = source,
+                            group_id = format!("0x{:016X}", group_id),
+                            director = format!("0x{:08X}", director_actor_id),
+                            "RX 0x0133 → emitted SynchGroupWorkValues /_init reply",
                         );
-                    sub.set_target_id(source);
-                    client.send_bytes(sub.to_bytes()).await;
-                    tracing::info!(
-                        source = source,
-                        group_id = format!("0x{:016X}", group_id),
-                        director = format!("0x{:08X}", director_actor_id),
-                        "RX 0x0133 → emitted SynchGroupWorkValues /_init reply",
-                    );
+                    }
                 }
             }
             _ => {
