@@ -99,12 +99,31 @@ pub fn translate_lua_commands_into_outbox(
                 trigger,
                 args,
             } => {
+                // The wire-format `trigger_actor_id` (body[0..3]) is the
+                // PLAYER who is kicking the event — pmeteor's reference
+                // capture (`captures/pmeteor-quest/20260426-160210-
+                // gridania-manual3/`) confirms: KickEvent body[0..3] = 1
+                // (player) and body[4..7] = 0x65300003 (director). The
+                // event_type is `5` (Player.KickEvent's hard-coded value
+                // per `Map Server/Actors/Chara/Player/Player.cs:2188`),
+                // NOT 0 (which is reserved for KickEventSpecial).
+                //
+                // Previous version routed `*actor_id` (the director) as
+                // target_actor_id AND owner_actor_id, with event_type=0.
+                // The result was a malformed kick that the 1.x client
+                // silently dropped at the receiver gate (`+0x5c` check
+                // failed because the receiver thought a director was
+                // kicking itself, and the actor lookup for the
+                // self-referential trigger landed on the director's
+                // half-spawned state). Confirmed via post-warp byte-diff
+                // showing trigger=0x65300003 + event_type=0 vs pmeteor's
+                // trigger=1 + event_type=5.
                 outbox.push(EventEvent::KickEvent {
                     player_actor_id: *player_id,
-                    target_actor_id: *actor_id,
+                    target_actor_id: *player_id,
                     owner_actor_id: *actor_id,
                     event_name: trigger.clone(),
-                    event_type: 0,
+                    event_type: 5,
                     lua_params: args.iter().map(arg_to_lua_param).collect(),
                 });
             }
@@ -208,12 +227,23 @@ mod tests {
         translate_lua_commands_into_outbox(&[cmd], &session, &mut outbox);
         match &outbox.events[0] {
             EventEvent::KickEvent {
+                player_actor_id,
                 target_actor_id,
+                owner_actor_id,
                 event_name,
+                event_type,
                 ..
             } => {
-                assert_eq!(*target_actor_id, 99);
+                // The wire-format `trigger_actor_id` (= target_actor_id
+                // here) is the PLAYER who's kicking, NOT the kicked
+                // event's target actor. Owner is the kicked actor
+                // (e.g. director). event_type=5 is C# `Player.KickEvent`'s
+                // canonical value (Map Server/Actors/Chara/Player/Player.cs:2188).
+                assert_eq!(*player_actor_id, 1);
+                assert_eq!(*target_actor_id, 1, "target = player (the trigger)");
+                assert_eq!(*owner_actor_id, 99, "owner = kicked actor (e.g. director)");
                 assert_eq!(event_name, "teleport");
+                assert_eq!(*event_type, 5, "event_type=5 (Player.KickEvent), not 0 (KickEventSpecial)");
             }
             _ => panic!("expected KickEvent"),
         }
