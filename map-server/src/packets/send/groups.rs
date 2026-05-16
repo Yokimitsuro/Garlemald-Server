@@ -451,15 +451,37 @@ pub fn build_synch_group_work_values_content_init(
     // Reserve offset 8 for runningByteTotal (written at end).
     let mut running: u8 = 0;
     c.set_position(9);
-    // Property entry 1: int contentGroupWork._globalTemp.director
-    c.write_u8(4).unwrap(); // type=int
+    // Property entry 1: long contentGroupWork._globalTemp.director.
+    //
+    // Pmeteor `ContentGroup.cs:55` stores the director-id field as
+    // `(ulong)director.Id << 32` — a 64-bit value with the
+    // director_actor_id in the HIGH 32 bits and zero in the LOW.
+    // `addProperty` then dispatches through the property-type table
+    // and selects `addLong` (Long-typed property entry), which
+    // writes `byte(8) + u32(hash) + u64(value)` = 13 bytes total.
+    //
+    // Earlier garlemald iteration (commit 93eb62b) used `addInt`
+    // shape (`byte(4) + u32(hash) + u32(value)` = 9 bytes), which
+    // made the value's u32 overlap the next entry's type byte and
+    // the client rejected the SyncWriter buffer mid-parse — the
+    // WorkSyncUpdater never marked the director event-ready, IN
+    // 0x012D for director never fired, and the SEQ_005 cinematic
+    // never started. Verified vs pmeteor's reference capture
+    // (captures/pmeteor-quest/20260426-160210-gridania-manual3/
+    // map-packets.log line 33943) which writes type=8 with body
+    // bytes `00 00 00 00 03 00 30 65` for director_actor_id
+    // 0x65300003. Garlemald's d9896de capture (line 10686) wrote
+    // type=4 with body bytes `03 00 30 65` — confirming the
+    // mismatch.
+    c.write_u8(8).unwrap(); // type=long
     c.write_u32::<LittleEndian>(common::utils::murmur_hash2(
         "contentGroupWork._globalTemp.director",
         0,
     ))
     .unwrap();
-    c.write_u32::<LittleEndian>(director_actor_id).unwrap();
-    running += 9;
+    c.write_u64::<LittleEndian>((director_actor_id as u64) << 32)
+        .unwrap();
+    running += 13;
     // Property entry 2: byte contentGroupWork.property[0] = 1
     c.write_u8(1).unwrap(); // type=byte
     c.write_u32::<LittleEndian>(common::utils::murmur_hash2(
