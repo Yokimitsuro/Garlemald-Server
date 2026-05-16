@@ -2297,13 +2297,21 @@ impl PacketProcessor {
 
         // 2. Round-trip the actor_number out of the Lua-side composite
         //    formula `(4 << 28) | (zone << 19) | ((actor_number + 5) & 0x7FFFF)`.
-        //    The `+ 5` is pmeteor's stateful-Npc ctor quirk
-        //    (`Actors/Chara/Npc/Npc.cs:61`): the constructor adds 5 to
-        //    the actor_number so spawned content actors don't collide
-        //    with the system-reserved low ids (0..=4). We subtract 5
-        //    back here so `Npc::new`'s formula re-arrives at the same
-        //    composite id the Lua side handed back.
-        let raw_actor_number = (expected_actor_id & 0x7FFFF).wrapping_sub(5);
+        //
+        //    Garlemald's `Npc::new(actor_number, ...)` (npc/npc.rs)
+        //    composes the actor id as `(4 << 28) | (zone << 19) |
+        //    (actor_number & 0x7FFFF)` with NO `+ 5` ctor quirk —
+        //    pmeteor's `+5` is folded into the Lua-side formula
+        //    instead. So the actor_number we hand to Npc::new is the
+        //    raw bottom 19 bits of the composite id, no subtraction.
+        //
+        //    Pre-fix this subtracted 5 on the apply side as well,
+        //    producing `actor_id mismatch — Lua side computed
+        //    differently expected="0x4536049C" actual="0x45360497"`
+        //    in the SpawnActor log and the openingstoper actor was
+        //    never registered (early-return on the mismatch check
+        //    below).
+        let raw_actor_number = expected_actor_id & 0x7FFFF;
 
         // 3. Build the Npc.
         let mut npc = crate::npc::npc::Npc::new(
