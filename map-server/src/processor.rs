@@ -2157,28 +2157,59 @@ impl PacketProcessor {
             ))
             .await;
 
-        // 7. Fan the spawn bundle (AddActor + position + appearance +
-        //    name + state + sub_state + status_all + icon + is_zoning)
-        //    to every player within broadcast radius. Uses the same
-        //    helper the runtime dispatcher uses for normal mob spawns.
-        crate::runtime::dispatcher::spawn_bundle_fanout(
-            &self.world,
-            &self.registry,
-            &zone_arc,
-            parent_zone_id,
-            actor_id,
-        )
-        .await;
+        // 7. SKIP the immediate spawn_bundle_fanout for content-area
+        //    spawns. The 5 NPCs (yda/papalymo/3 mobs) spawn during
+        //    SimpleContent30010.lua's onCreate, which fires BEFORE
+        //    the player warps. Broadcasting AddActor + 9 follow-up
+        //    state packets per NPC into the player's CURRENT zone
+        //    view (50 packets total) leaks the content-area NPCs
+        //    into the public Gridania area where the player still
+        //    is.
+        //
+        //    Pmeteor's reference capture
+        //    (`captures/pmeteor-quest/20260426-160210-gridania-manual3/`,
+        //    line 31753..31928 = the SEQ_005 warp window) shows
+        //    ZERO actor-spawn packets pre-kick: pmeteor's
+        //    `contentArea:SpawnActor` only adds the actor to the
+        //    content-area's data structure, deferring wire emission
+        //    until the player warps in. Garlemald previously fanned
+        //    out 6 spawn bursts pre-kick (5 NPCs + a director) on
+        //    top of the kick — the pre-kick burst diff vs pmeteor
+        //    is the ONE remaining structural delta after fixing the
+        //    duplicate-kick + content-trio + KickEvent-field bugs.
+        //
+        //    Hypothesis under test: those leaked spawns are why the
+        //    post-warp kick (`OUT 0x012F` at the right bytes)
+        //    silently no-ops in the client and never echoes
+        //    `IN 0x012D EventStart`. Skip the broadcast — keep the
+        //    actor in the registry (so AI / engagement / combat
+        //    work) but stop polluting the client's content-area
+        //    state machine.
+        //
+        //    Trade-off: until a deferred-emit-on-zone-in path is
+        //    wired, the client won't render the NPCs visually
+        //    post-warp. Acceptable for the kick-test; the cinematic
+        //    body fires from `delegateEvent processTtrBtl001` which
+        //    is purely client-side rendering.
+        let _ = zone_arc; // keep handle so registry insert works
+        let _ = spawn.script_name.clone(); // suppress unused warning
+        // crate::runtime::dispatcher::spawn_bundle_fanout(
+        //     &self.world,
+        //     &self.registry,
+        //     &zone_arc,
+        //     parent_zone_id,
+        //     actor_id,
+        // )
+        // .await;
 
         tracing::info!(
             bnpc_id,
             parent_zone = parent_zone_id,
             actor_id = format!("0x{:08X}", actor_id),
             actor_class_id = spawn.actor_class_id,
-            script = %spawn.script_name,
             allegiance = spawn.allegiance,
-            pos = ?(spawn.position_x, spawn.position_y, spawn.position_z),
-            "SpawnBattleNpcById applied (B1: actor materialised + spawn bundle fanned out)",
+            "SpawnBattleNpcById applied — wire fan-out SKIPPED to keep \
+             content-area NPCs out of the player's pre-warp view",
         );
     }
 
