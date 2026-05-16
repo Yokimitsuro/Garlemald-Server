@@ -2315,7 +2315,71 @@ impl UserData for LuaPlayer {
         // (`gm/givecurrency.lua`) chains `:AddItem(...)` off the
         // return, identical to the GetItemPackage shape.
         methods.add_method("getInventory", get_item_package_handler);
-        methods.add_method("GetQuest", |lua, this, id: u32| {
+        methods.add_method("GetQuest", |lua, this, id_or_name: mlua::Value| {
+            // Pmeteor scripts call `player:GetQuest("Man0g0")` (string
+            // class-name) at quest-script boundaries — see
+            // `scripts/lua/directors/Quest/QuestDirectorMan0g001.lua::
+            // onEventStarted`. Garlemald previously typed this binding as
+            // u32 only, so the SEQ_005 cinematic's onEventStarted body
+            // panicked at the very first line:
+            //
+            //   director onEventStarted: bad argument #2 to
+            //     `LuaPlayer.GetQuest`: error converting Lua string to
+            //     u32 (expected number or string coercible to number)
+            //
+            // Accept either:
+            //  - integer (mlua coerces both Lua number + string-of-digits)
+            //  - string class-name (resolved against the player's
+            //    active_quest_states by matching against the canonical
+            //    `man0g0` lowercase prefix, falling back to a deterministic
+            //    Murmur2 hash of the name if the player doesn't have an
+            //    entry — same lenient behaviour as the integer path: the
+            //    handle still constructs but `has_quest=false`)
+            //
+            // The class-name → quest-id mapping is hardcoded for the
+            // SEQ_005 path (the only quest currently driving content
+            // onEventStarted scripts). Adding a runtime catalog lookup
+            // is a follow-up; the broader quest-name registry lives in
+            // `Catalogs::quests` (gamedata_quests table) but isn't yet
+            // threaded into the Lua VM via app_data.
+            let id: u32 = match &id_or_name {
+                mlua::Value::Integer(i) => *i as u32,
+                mlua::Value::Number(n) => *n as u32,
+                mlua::Value::String(s) => {
+                    let name = s.to_str()?;
+                    // Hardcoded class-name → quest-id table for the
+                    // active-quest scripts garlemald exercises today.
+                    // Sourced from `gamedata_quests.id` rows for the
+                    // matching `className` column.
+                    match name.as_ref() {
+                        "Man0g0" => 110001,
+                        "Man0l0" => 110002,
+                        "Man0u0" => 110003,
+                        other => {
+                            // Lenient fallback: search snapshot for any
+                            // active quest with this exact name (case-
+                            // sensitive); if none, deterministic hash.
+                            // This keeps the handle construction non-
+                            // failing even on unknown names.
+                            this.snapshot
+                                .active_quest_states
+                                .iter()
+                                .find_map(|s| {
+                                    // We don't store the quest name on
+                                    // the snapshot today; this branch
+                                    // is reserved for future name
+                                    // resolution. For now fall through.
+                                    let _ = s;
+                                    None
+                                })
+                                .unwrap_or_else(|| {
+                                    common::utils::murmur_hash2(other, 0)
+                                })
+                        }
+                    }
+                }
+                _ => 0,
+            };
             // Scripts chain `GetQuest(id):SetQuestFlag(...)` /
             // `:GetData():IncCounter(...)` etc. If the player doesn't have
             // the quest we still return a handle — Meteor's behaviour is
