@@ -6673,27 +6673,6 @@ impl PacketProcessor {
             }
         };
 
-        // Empirical settle delay (user's 2026-05-15 hypothesis test).
-        // Pmeteor's reference capture has a 55ms gap between receiving
-        // IN 0x012D EventStart at 15:54:31.053 and emitting its OUT
-        // burst at 15:54:31.108. During that window the CLIENT sends
-        // ~15 IN packets (IN 0x012F kick echo, IN 0x00CC×2, IN 0x0131
-        // EndEvent, IN 0x00CD/CA/0x0001) — i.e., the client autonomously
-        // settles its event state BEFORE the server emits new commands.
-        // Garlemald's mlua handler runs in ~1ms; the OUT burst (kick +
-        // warp) lands while the client is still mid-EventStart
-        // processing, and the kick silently no-ops because the client
-        // hasn't yet completed the state transition the kick depends on.
-        //
-        // 100ms is a generous bound on pmeteor's observed 55ms.
-        // Targeted to the doContentArea trigger condition only —
-        // event_name=="talkDefault" with event_type==1 (onTalk) is the
-        // narrow shape SEQ_005 actually fires; everything else is
-        // unaffected.
-        if pkt.event_name == "talkDefault" && pkt.event_type == 1 {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-
         // Client Lua error tunnel — the 1.x client re-purposes EventStart
         // with `unknown == 0x39800010` to ship a Lua stack trace up to
         // the server (Meteor `EventStartPacket.cs` has the commented-out
