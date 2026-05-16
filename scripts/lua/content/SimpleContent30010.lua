@@ -14,8 +14,16 @@ function onCreate(starterPlayer, contentArea, director)
 	mob1 = GetWorldManager().SpawnBattleNpcById(3, contentArea);
 	mob2 = GetWorldManager().SpawnBattleNpcById(4, contentArea);
     mob3 = GetWorldManager().SpawnBattleNpcById(5, contentArea);
-	starterPlayer.currentParty:AddMember(papalymo.actorId);
-    starterPlayer.currentParty:AddMember(yda.actorId);
+	-- Pmeteor's SimpleContent30010.lua does NOT add NPCs to the player's
+	-- party (only to the content director group via director:AddMember
+	-- below). Garlemald's variant previously called
+	-- `starterPlayer.currentParty:AddMember(papalymo.actorId)` +
+	-- `starterPlayer.currentParty:AddMember(yda.actorId)`, which fired
+	-- TWO extra OUT 0x017F GroupHeader/Begin/X08/End party trios pre-
+	-- kick (visible in the seq005-no-prewarp-spawns capture at lines
+	-- 6905..6953 + 6959..7007). Pmeteor's wire trace shows ZERO 0x017F
+	-- broadcasts in the SEQ_005 warp window — only the single 0x0183
+	-- content trio.
 	starterPlayer:SetMod(modifiersGlobal.MinimumHpLock, 1);
 	
 	
