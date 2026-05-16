@@ -1753,6 +1753,14 @@ impl WorldManager {
                 .map(|a| (a.actor_id, a.kind))
                 .collect()
         };
+        tracing::info!(
+            session = session_id,
+            actor = format!("0x{actor_id:08X}"),
+            zone = zone_actor_id,
+            count = neighbours.len(),
+            ids = ?neighbours.iter().map(|(id, k)| format!("0x{id:08X}:{k:?}")).collect::<Vec<_>>(),
+            "send_zone_in_bundle: neighbours found via actors_around(50.0)",
+        );
         // Send the main bundle (masters + player packets + inventory +
         // achievements + ActorInstantiate + property_init) FIRST, then
         // the per-neighbour NPC spawns, then the empty group sync.

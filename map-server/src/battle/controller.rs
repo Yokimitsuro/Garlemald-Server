@@ -51,12 +51,19 @@ pub enum ControllerKind {
 pub struct DetectionType(pub u32);
 
 impl DetectionType {
-    pub const NONE: Self = Self(0);
-    pub const SIGHT: Self = Self(1 << 0);
-    pub const SOUND: Self = Self(1 << 1);
-    pub const MAGIC: Self = Self(1 << 2);
-    pub const LOW_HP: Self = Self(1 << 3);
-    pub const IGNORE_LEVEL_DIFFERENCE: Self = Self(1 << 4);
+    // Bit layout MUST match the canonical Meteor C# `DetectionType` enum
+    // (`Map Server/Actors/Chara/Npc/BattleNpc.cs:39`) byte-for-byte —
+    // it's the wire encoding for `server_battlenpc_genus.detection` and
+    // crosses through `BattleNpcSpawn.detection: u32` from the DB into
+    // the controller's tick path. Off-by-one bits silently mis-read
+    // aggro rules in the genus table.
+    pub const NONE: Self = Self(0x00);
+    pub const SIGHT: Self = Self(0x01);
+    pub const SCENT: Self = Self(0x02);
+    pub const SOUND: Self = Self(0x04);
+    pub const LOW_HP: Self = Self(0x08);
+    pub const IGNORE_LEVEL_DIFFERENCE: Self = Self(0x10);
+    pub const MAGIC: Self = Self(0x20);
 
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0

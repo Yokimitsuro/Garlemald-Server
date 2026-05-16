@@ -78,13 +78,33 @@ pub enum LuaCommand {
         slot: u8,
         graphic_id: u32,
     },
+    /// `contentArea:SpawnActor(classId, name, x, y, z, rot)` or the
+    /// zone-level `area:SpawnActor(classId, x, y, z, rot)` — port of C#
+    /// `Area::SpawnActor(classId, uniqueId, x, y, z, rot)`
+    /// (`Map Server/Actors/Area/Area.cs:528`). Materialises a populace
+    /// `Npc` from `gamedata_actor_class` + `gamedata_actor_appearance`,
+    /// inserts it into the parent zone's actor list at a deterministic
+    /// composite id (`(4 << 28) | (zone << 19) | (actor_number + 5)`),
+    /// and lets the next `send_zone_in_bundle` (post-warp) fan its
+    /// 10-packet spawn bundle to nearby players via the standard NPC
+    /// neighbour loop. Used by content-area `onCreate` scripts (e.g.
+    /// `SimpleContent30010.lua` spawning the SEQ_005 "openingstoper"
+    /// event-trigger actor).
     SpawnActor {
         zone_id: u32,
         actor_class_id: u32,
+        unique_id: String,
         x: f32,
         y: f32,
         z: f32,
         rotation: f32,
+        /// Caller-pre-computed composite actor id (matches what the
+        /// Lua binding handed back as `actor.actorId`). The applier
+        /// re-derives the same id from `actor_number` and bails on
+        /// mismatch so any subsequent `director:AddMember(actor)` /
+        /// `actor:SetMod(...)` calls in the same drain target the
+        /// right actor.
+        expected_actor_id: u32,
     },
     /// `director:AddMember(actor)` — port of C#
     /// `Director::AddMember`. Appends `member_actor_id` to the

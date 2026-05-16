@@ -251,6 +251,67 @@ impl BattleNpc {
         self.detection_type = DetectionType(v);
     }
 
+    /// Phase C1 — apply combat metadata from the joined
+    /// `server_battlenpc_*` DTO and attach the appropriate AI
+    /// `Controller` to the AIContainer. Called by
+    /// `processor::apply_spawn_battle_npc_by_id` after the DTO is
+    /// resolved and the actor_id has been verified.
+    ///
+    /// Mirrors C# `WorldManager.cs::SpawnBattleNpcById` lines 444–452
+    /// (`battleNpc.neutral = …`, `battleNpc.SetDetectionType(…)`,
+    /// `battleNpc.respawnTime = …`, drop-list, kindred) and the
+    /// `BattleNpcController` / `AllyController` registration that
+    /// Meteor handles in the C# base-class ctor.
+    ///
+    /// Pool / genus / spawn modifier-layer merging (the
+    /// `server_battlenpc_pool_mods` / `genus_mods` / `spawn_mods`
+    /// rows) is intentionally NOT done here — it's a separate
+    /// follow-up (`merge_modifier_layers` already exists; the loader
+    /// just isn't wired). Without it, BattleNpcs spawn with baseline
+    /// stats; combat math works but harder mobs are under-leveled.
+    pub fn apply_spawn_metadata(
+        &mut self,
+        spawn: &crate::database::BattleNpcSpawn,
+        bnpc_id: u32,
+        actor_id: u32,
+    ) {
+        self.bnpc_id = bnpc_id;
+        self.pool_id = spawn.pool_id;
+        self.genus_id = spawn.genus_id;
+        self.drop_list_id = spawn.drop_list_id;
+        self.respawn_time_seconds = spawn.respawn_time;
+        self.detection_type = DetectionType(spawn.detection);
+        // Meteor parity (`WorldManager.cs:449`): aggroType == 0 → neutral.
+        // Plus allegiance == 1 ally NPCs (Yda, Papalymo) stay neutral
+        // toward the player regardless of how their genus row reads —
+        // a non-neutral ally would aggro the player on the very first
+        // detection tick.
+        self.neutral = spawn.aggro_type == 0 || spawn.allegiance == 1;
+        self.kindred_type = KindredType::from_u8(spawn.kindred_id);
+
+        // Attach the AI Controller. Choice of kind comes from allegiance:
+        //  - allegiance == 1 → Ally (player-side; AllyController only
+        //    aggroes into the active content-group fight).
+        //  - any other      → BattleNpc (hostile-to-player default).
+        let controller_kind = if spawn.allegiance == 1 {
+            crate::battle::controller::ControllerKind::Ally
+        } else {
+            crate::battle::controller::ControllerKind::BattleNpc
+        };
+        let mut ctrl =
+            crate::battle::controller::Controller::new(controller_kind, actor_id);
+        // The two `DetectionType` definitions (this module + controller)
+        // share canonical Meteor C# bit layouts (Sight=0x01, Scent=0x02,
+        // Sound=0x04, …) — bridging via the raw u32 round-trips.
+        ctrl.battle.detection_type =
+            crate::battle::controller::DetectionType(self.detection_type.0);
+        ctrl.battle.neutral = self.neutral;
+        ctrl.battle.level = self.npc.character.chara.level;
+        ctrl.battle.spawn_position =
+            common::Vector3::new(spawn.position_x, spawn.position_y, spawn.position_z);
+        self.npc.character.ai_container.controller = Some(ctrl);
+    }
+
     pub fn get_mob_mod(&self, m: MobModifier) -> i64 {
         self.mob_modifiers.get(m)
     }
@@ -418,5 +479,123 @@ mod tests {
         bnpc.set_mob_mod(MobModifier::SightRange, 30);
         assert_eq!(bnpc.get_mob_mod(MobModifier::SightRange), 30);
         assert_eq!(bnpc.get_mob_mod(MobModifier::SoundRange), 0);
+    }
+
+    fn make_spawn(allegiance: u8, aggro_type: u8, detection: u32) -> crate::database::BattleNpcSpawn {
+        crate::database::BattleNpcSpawn {
+            bnpc_id: 3,
+            group_id: 2,
+            position_x: 365.0,
+            position_y: 4.0,
+            position_z: -700.0,
+            rotation: 1.5,
+            pool_id: 2,
+            script_name: "bloodthirsty_wolf".to_string(),
+            min_level: 4,
+            max_level: 4,
+            respawn_time: 30,
+            hp: 200,
+            mp: 0,
+            drop_list_id: 17,
+            allegiance,
+            spawn_type: 0,
+            animation_id: 0,
+            actor_state: 0,
+            private_area_name: String::new(),
+            private_area_level: 0,
+            zone_id: 166,
+            genus_id: 58,
+            actor_class_id: 2_201_407,
+            current_job: 0,
+            combat_skill: 0,
+            combat_delay: 0,
+            aggro_type,
+            speed: 8,
+            detection,
+            kindred_id: 1,
+            kindred_name: "Beast".to_string(),
+        }
+    }
+
+    #[test]
+    fn c1_apply_spawn_metadata_populates_bnpc_fields() {
+        let mut bnpc = BattleNpc::new(99, &class(), "wolf_99", 166, 0.0, 0.0, 0.0, 0.0, 0, 0, None);
+        bnpc.npc.character.chara.level = 4;
+        let spawn = make_spawn(/*allegiance=*/ 2, /*aggro_type=*/ 1, /*detection=*/ 0x01);
+        bnpc.apply_spawn_metadata(&spawn, 3, bnpc.actor_id());
+
+        assert_eq!(bnpc.bnpc_id, 3);
+        assert_eq!(bnpc.pool_id, 2);
+        assert_eq!(bnpc.genus_id, 58);
+        assert_eq!(bnpc.drop_list_id, 17);
+        assert_eq!(bnpc.respawn_time_seconds, 30);
+        assert_eq!(bnpc.detection_type, DetectionType::SIGHT);
+        assert_eq!(bnpc.kindred_type, KindredType::Beast);
+        assert!(!bnpc.neutral, "wolf with aggro_type=1 + hostile allegiance should not be neutral");
+    }
+
+    #[test]
+    fn c1_apply_spawn_metadata_attaches_battlenpc_controller_for_mob() {
+        use crate::battle::controller::ControllerKind;
+        let mut bnpc = BattleNpc::new(99, &class(), "wolf_99", 166, 0.0, 0.0, 0.0, 0.0, 0, 0, None);
+        let actor_id = bnpc.actor_id();
+        bnpc.npc.character.chara.level = 4;
+        let spawn = make_spawn(/*allegiance=*/ 2, /*aggro_type=*/ 1, /*detection=*/ 0x01);
+        bnpc.apply_spawn_metadata(&spawn, 3, actor_id);
+
+        let ctrl = bnpc
+            .npc
+            .character
+            .ai_container
+            .controller
+            .as_ref()
+            .expect("C1 should attach a Controller to the AIContainer");
+        assert_eq!(ctrl.kind, ControllerKind::BattleNpc);
+        assert_eq!(ctrl.owner_actor_id, actor_id);
+        assert_eq!(ctrl.battle.detection_type.0, 0x01);
+        assert!(!ctrl.battle.neutral);
+        assert_eq!(ctrl.battle.level, 4);
+    }
+
+    #[test]
+    fn c1_apply_spawn_metadata_attaches_ally_controller_for_player_allegiance() {
+        use crate::battle::controller::ControllerKind;
+        let mut bnpc = BattleNpc::new(99, &class(), "yda_99", 166, 0.0, 0.0, 0.0, 0.0, 0, 0, None);
+        let actor_id = bnpc.actor_id();
+        // Ally with aggro_type==1 still ends up neutral because
+        // allegiance==1 forces neutrality (else Yda aggros the player).
+        let spawn = make_spawn(/*allegiance=*/ 1, /*aggro_type=*/ 1, /*detection=*/ 0x01);
+        bnpc.apply_spawn_metadata(&spawn, 6, actor_id);
+
+        let ctrl = bnpc
+            .npc
+            .character
+            .ai_container
+            .controller
+            .as_ref()
+            .expect("C1 should attach a Controller for ally NPCs too");
+        assert_eq!(ctrl.kind, ControllerKind::Ally);
+        assert!(
+            ctrl.battle.neutral,
+            "ally NPCs (allegiance=1) must stay neutral toward the player",
+        );
+        assert!(
+            bnpc.neutral,
+            "BattleNpc.neutral must match the controller's neutral flag",
+        );
+    }
+
+    #[test]
+    fn c1_apply_spawn_metadata_zero_aggro_type_forces_neutral_mob() {
+        // A hostile-allegiance mob with aggro_type=0 still ends up
+        // neutral, matching Meteor `WorldManager.cs:449`.
+        let mut bnpc = BattleNpc::new(99, &class(), "passive_99", 166, 0.0, 0.0, 0.0, 0.0, 0, 0, None);
+        let spawn = make_spawn(/*allegiance=*/ 2, /*aggro_type=*/ 0, /*detection=*/ 0x01);
+        bnpc.apply_spawn_metadata(&spawn, 100, bnpc.actor_id());
+        assert!(bnpc.neutral);
+        assert!(
+            bnpc.npc.character.ai_container.controller.as_ref().unwrap().battle.neutral,
+            "Controller.battle.neutral must mirror BattleNpc.neutral",
+        );
     }
 }

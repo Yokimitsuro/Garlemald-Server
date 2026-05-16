@@ -2989,21 +2989,66 @@ impl UserData for LuaZone {
                 lua.create_userdata(handle)
             },
         );
+        // `area:SpawnActor(classId, uniqueId, x, y, z, rot)` — port of
+        // C# `Area::SpawnActor(classId, uniqueId, x, y, z, rot)`. Pre-
+        // computes the composite actor id deterministically and returns
+        // a `LuaActor` so callers can read `.actorId` immediately. The
+        // applier in `processor::apply_spawn_actor` materialises the
+        // `Npc` from the actor-class row + appearance row, inserts into
+        // the parent zone's grid + registry, and lets the next
+        // `send_zone_in_bundle` fan the 10-packet spawn bundle via the
+        // standard NPC neighbour loop.
         methods.add_method(
             "SpawnActor",
-            |_, this, (class_id, x, y, z, rotation): (u32, f32, f32, f32, Option<f32>)| {
+            |lua, this, (class_id, unique_id, x, y, z, rotation): (
+                u32,
+                String,
+                f32,
+                f32,
+                f32,
+                Option<f32>,
+            )| {
+                let zone_id = this.snapshot.zone_id;
+                // High-band actor_number so SpawnActor's spawns don't
+                // collide with sequential populace/BattleNpc spawns
+                // (which start at 1 and 0x40000|id respectively). We
+                // hash the unique_id into a 12-bit suffix so repeated
+                // calls with different names get different ids; the
+                // pmeteor +5 quirk lives in `apply_spawn_actor`.
+                let suffix = (common::utils::murmur_hash2(&unique_id, 0) & 0xFFF) as u32;
+                let actor_number = 0x60000u32 | suffix;
+                let expected_actor_id =
+                    (4u32 << 28) | (zone_id << 19) | ((actor_number + 5) & 0x7FFFF);
                 push(
                     &this.queue,
                     LuaCommand::SpawnActor {
-                        zone_id: this.snapshot.zone_id,
+                        zone_id,
                         actor_class_id: class_id,
+                        unique_id: unique_id.clone(),
                         x,
                         y,
                         z,
                         rotation: rotation.unwrap_or(0.0),
+                        expected_actor_id,
                     },
                 );
-                Ok(())
+                let actor = LuaActor {
+                    actor_id: expected_actor_id,
+                    name: unique_id.clone(),
+                    class_name: String::new(),
+                    class_path: String::new(),
+                    unique_id,
+                    zone_id,
+                    zone_name: String::new(),
+                    state: 0,
+                    pos: (x, y, z),
+                    rotation: rotation.unwrap_or(0.0),
+                    queue: this.queue.clone(),
+                    is_engaged: false,
+                    speed: 0.0,
+                    target_actor_id: 0,
+                };
+                lua.create_userdata(actor)
             },
         );
         methods.add_method("DespawnActor", |_, this, actor_id: u32| {
@@ -3267,13 +3312,18 @@ impl UserData for LuaContentArea {
         });
 
         // `contentArea:SpawnActor(classId, name, x, y, z, rot)` — fired
-        // from `QuestDirectorMan0g001.lua::onCreateContentArea` to drop
-        // Yda/Papalymo/mobs into the instance. Reuse the zone-level
-        // SpawnActor command for now; the proper content-area variant
-        // ships with the full PrivateAreaContent runtime.
+        // from `SimpleContent30010.lua::onCreate` (SEQ_005's
+        // openingstoper trigger) and `QuestDirectorMan0g001.lua::
+        // onCreateContentArea`. Port of C# `Area::SpawnActor` (Area.cs:
+        // 528) routed through the same `LuaCommand::SpawnActor` queue
+        // entry as the zone-level binding. Returns a `LuaActor` so the
+        // calling chain can capture the actor id for subsequent
+        // `director:AddMember(actor)` / `actor:SetMod(...)` calls in
+        // the same drain (matches pmeteor's `npc = contentArea:SpawnActor(...)`
+        // assignment idiom).
         methods.add_method(
             "SpawnActor",
-            |_, this, (class_id, _name, x, y, z, rotation): (
+            |lua, this, (class_id, unique_id, x, y, z, rotation): (
                 u32,
                 String,
                 f32,
@@ -3281,18 +3331,46 @@ impl UserData for LuaContentArea {
                 f32,
                 Option<f32>,
             )| {
+                let zone_id = this.parent_zone_id;
+                // Same actor-id formula as the zone-level binding —
+                // hashes the unique_id into a 12-bit suffix so each
+                // named SpawnActor call gets a distinct deterministic
+                // id. The pmeteor `+5` quirk is reproduced inside
+                // `apply_spawn_actor` to keep the id formula one-place.
+                let suffix = (common::utils::murmur_hash2(&unique_id, 0) & 0xFFF) as u32;
+                let actor_number = 0x60000u32 | suffix;
+                let expected_actor_id =
+                    (4u32 << 28) | (zone_id << 19) | ((actor_number + 5) & 0x7FFFF);
                 push(
                     &this.queue,
                     LuaCommand::SpawnActor {
-                        zone_id: this.parent_zone_id,
+                        zone_id,
                         actor_class_id: class_id,
+                        unique_id: unique_id.clone(),
                         x,
                         y,
                         z,
                         rotation: rotation.unwrap_or(0.0),
+                        expected_actor_id,
                     },
                 );
-                Ok(())
+                let actor = LuaActor {
+                    actor_id: expected_actor_id,
+                    name: unique_id.clone(),
+                    class_name: String::new(),
+                    class_path: String::new(),
+                    unique_id,
+                    zone_id,
+                    zone_name: String::new(),
+                    state: 0,
+                    pos: (x, y, z),
+                    rotation: rotation.unwrap_or(0.0),
+                    queue: this.queue.clone(),
+                    is_engaged: false,
+                    speed: 0.0,
+                    target_actor_id: 0,
+                };
+                lua.create_userdata(actor)
             },
         );
 

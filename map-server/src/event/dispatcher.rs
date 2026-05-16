@@ -450,6 +450,11 @@ async fn dispatch_npc_event_started(
                 pos: npc_pos,
                 rotation: npc_rot,
                 queue: queue.clone(),
+                // Event-dispatched NPCs are conversational, not
+                // combat — engagement defaults are correct.
+                is_engaged: false,
+                speed: 5.0,
+                target_actor_id: 0,
             },
             actor_class_id,
             quest_graphic: 0,

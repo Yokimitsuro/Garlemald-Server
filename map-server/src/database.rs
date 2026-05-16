@@ -210,6 +210,12 @@ pub struct BattleNpcSpawn {
     pub combat_delay: u32,
     pub aggro_type: u8,
     pub speed: u8,
+    /// `genus.detection` — bitfield of `DetectionType` flags (Sight=1,
+    /// Sound=2, Magic=4, LowHp=8, IgnoreLevelDifference=16). Zero means
+    /// the actor will never aggro a player, regardless of `aggro_type`.
+    pub detection: u32,
+    pub kindred_id: u8,
+    pub kindred_name: String,
 }
 
 /// One row of `server_zones_privateareas`.
@@ -441,6 +447,82 @@ impl Database {
     /// needs to render NPC avatars. Without this data every populace NPC
     /// gets a 0x00D6 with model_id=0 and the client derefs nil during
     /// model load, which on Wine crashes the whole process.
+    /// Single-row variant of [`load_npc_appearances`] — used by
+    /// runtime spawn paths (e.g. `apply_spawn_actor`) that need one
+    /// row on demand without paying the full-table-load cost.
+    pub async fn load_npc_appearance(
+        &self,
+        actor_class_id: u32,
+    ) -> Result<Option<NpcAppearance>> {
+        let row = self
+            .conn
+            .call_db(move |c| {
+                let mut stmt = c.prepare(
+                    r"SELECT id, base, size, hairStyle, hairHighlightColor, hairVariation,
+                             faceType, characteristics, characteristicsColor,
+                             faceEyebrows, faceIrisSize, faceEyeShape, faceNose,
+                             faceFeatures, faceMouth, ears,
+                             hairColor, skinColor, eyeColor, voice,
+                             mainHand, offHand, spMainHand, spOffHand, throwing,
+                             pack, pouch,
+                             head, body, legs, hands, feet, waist, neck,
+                             leftEar, rightEar, leftIndex, rightIndex,
+                             leftFinger, rightFinger
+                      FROM gamedata_actor_appearance
+                      WHERE id = ?1
+                      LIMIT 1",
+                )?;
+                let row = stmt
+                    .query_row([actor_class_id], |r| {
+                        Ok(NpcAppearance {
+                            base:                   r.get(1).unwrap_or(0),
+                            size:                   r.get(2).unwrap_or(0),
+                            hair_style:             r.get(3).unwrap_or(0),
+                            hair_highlight_color:   r.get(4).unwrap_or(0),
+                            hair_variation:         r.get(5).unwrap_or(0),
+                            face_type:              r.get(6).unwrap_or(0),
+                            characteristics:        r.get(7).unwrap_or(0),
+                            characteristics_color:  r.get(8).unwrap_or(0),
+                            face_eyebrows:          r.get(9).unwrap_or(0),
+                            face_iris_size:         r.get(10).unwrap_or(0),
+                            face_eye_shape:         r.get(11).unwrap_or(0),
+                            face_nose:              r.get(12).unwrap_or(0),
+                            face_cheek:             r.get(13).unwrap_or(0),
+                            face_mouth:             r.get(14).unwrap_or(0),
+                            face_jaw:               r.get(15).unwrap_or(0),
+                            hair_color:             r.get(16).unwrap_or(0),
+                            skin_color:             r.get(17).unwrap_or(0),
+                            eye_color:              r.get(18).unwrap_or(0),
+                            voice:                  r.get(19).unwrap_or(0),
+                            main_hand:              r.get(20).unwrap_or(0),
+                            off_hand:               r.get(21).unwrap_or(0),
+                            sp_main_hand:           r.get(22).unwrap_or(0),
+                            sp_off_hand:            r.get(23).unwrap_or(0),
+                            throwing:               r.get(24).unwrap_or(0),
+                            pack:                   r.get(25).unwrap_or(0),
+                            pouch:                  r.get(26).unwrap_or(0),
+                            head:                   r.get(27).unwrap_or(0),
+                            body:                   r.get(28).unwrap_or(0),
+                            legs:                   r.get(29).unwrap_or(0),
+                            hands:                  r.get(30).unwrap_or(0),
+                            feet:                   r.get(31).unwrap_or(0),
+                            waist:                  r.get(32).unwrap_or(0),
+                            neck:                   r.get(33).unwrap_or(0),
+                            left_ear:               r.get(34).unwrap_or(0),
+                            right_ear:              r.get(35).unwrap_or(0),
+                            left_index:             r.get(36).unwrap_or(0),
+                            right_index:            r.get(37).unwrap_or(0),
+                            left_finger:            r.get(38).unwrap_or(0),
+                            right_finger:           r.get(39).unwrap_or(0),
+                        })
+                    })
+                    .optional()?;
+                Ok(row)
+            })
+            .await?;
+        Ok(row)
+    }
+
     pub async fn load_npc_appearances(&self) -> Result<HashMap<u32, NpcAppearance>> {
         let rows = self
             .conn
@@ -564,7 +646,7 @@ impl Database {
                         bgr.zoneId,
                         bpo.genusId, bpo.actorClassId, bpo.currentJob,
                         bpo.combatSkill, bpo.combatDelay, bpo.aggroType,
-                        bge.speed
+                        bge.speed, bge.detection, bge.kindredId, bge.kindredName
                       FROM server_battlenpc_spawn_locations bsl
                       INNER JOIN server_battlenpc_groups bgr ON bsl.groupId = bgr.groupId
                       INNER JOIN server_battlenpc_pools  bpo ON bgr.poolId  = bpo.poolId
@@ -603,6 +685,9 @@ impl Database {
                             combat_delay: r.get(25)?,
                             aggro_type: r.get::<_, u8>(26)?,
                             speed: r.get::<_, u8>(27)?,
+                            detection: r.get::<_, u32>(28)?,
+                            kindred_id: r.get::<_, u8>(29)?,
+                            kindred_name: r.get::<_, String>(30).unwrap_or_default(),
                         })
                     })
                     .optional()?;
@@ -4346,6 +4431,20 @@ mod battle_npc_spawn_tests {
         assert!((row.position_x - 365.266).abs() < 0.01);
         assert!((row.position_y - 4.122).abs() < 0.01);
         assert!((row.position_z - (-700.73)).abs() < 0.01);
+        // Phase C1 — detection / kindred fields land from the genus
+        // join. Spoken (kindredId=4) is the only Spoken-class kindred
+        // in the seed; yda's pool maps to a Hyur Midlander genus.
+        // detection is whatever the seed sets — we just guard against
+        // a regression to "field missing from SELECT" by accepting any
+        // u32 value (asserting `_` would defeat that).
+        let _ = row.detection;
+        let _ = row.kindred_id;
+        // kindredName comes back as a non-empty string for every
+        // genus row in the seed (default `'Unknown'`).
+        assert!(
+            !row.kindred_name.is_empty(),
+            "kindred_name should land from the genus join"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

@@ -1930,6 +1930,32 @@ impl PacketProcessor {
                         self.apply_spawn_battle_npc_by_id(bnpc_id, pz, expected_actor_id)
                             .await;
                     }
+                    crate::lua::command::LuaCommand::SpawnActor {
+                        zone_id: sz,
+                        actor_class_id,
+                        unique_id,
+                        x,
+                        y,
+                        z,
+                        rotation,
+                        expected_actor_id,
+                    } => {
+                        // Content-area SpawnActor — needs db lookups
+                        // (actor_class + appearance) that the runtime
+                        // applier can't reach. Same partition rationale
+                        // as SpawnBattleNpcById above.
+                        self.apply_spawn_actor(
+                            sz,
+                            actor_class_id,
+                            unique_id,
+                            x,
+                            y,
+                            z,
+                            rotation,
+                            expected_actor_id,
+                        )
+                        .await;
+                    }
                     crate::lua::command::LuaCommand::PartyAddMember {
                         leader_actor_id,
                         member_actor_id,
@@ -2210,6 +2236,168 @@ impl PacketProcessor {
             allegiance = spawn.allegiance,
             "SpawnBattleNpcById applied — wire fan-out SKIPPED to keep \
              content-area NPCs out of the player's pre-warp view",
+        );
+    }
+
+    /// Port of C# `Area::SpawnActor(classId, uniqueId, x, y, z, rot)`
+    /// (`Map Server/Actors/Area/Area.cs:528`). Loads the actor class +
+    /// appearance from the gamedata tables, constructs a populace
+    /// `Npc` at `expected_actor_id` (deterministic from the Lua side),
+    /// inserts into the parent zone's spatial grid + actor registry,
+    /// and lets the next `send_zone_in_bundle` fan its 10-packet spawn
+    /// bundle to the post-warp player via the standard NPC neighbour
+    /// loop.
+    ///
+    /// Used by content-area `onCreate` scripts (e.g.
+    /// `scripts/lua/content/SimpleContent30010.lua:30` spawning the
+    /// SEQ_005 "openingstoper" event-trigger actor at actor_id
+    /// `0x40080006` — verified against pmeteor's reference capture
+    /// `captures/pmeteor-quest/20260426-160210-gridania-manual3/`).
+    ///
+    /// Like `apply_spawn_battle_npc_by_id`, this SKIPS the immediate
+    /// `spawn_bundle_fanout` for content-area spawns — those NPCs are
+    /// spawned pre-warp during `onCreate` but the player hasn't warped
+    /// into the content area yet, so fanning their spawn bundle into
+    /// the player's current (public) view would leak the content-area
+    /// NPCs. The post-warp `send_zone_in_bundle` picks them up via
+    /// `actors_around(50.0)` and emits the bundle then.
+    async fn apply_spawn_actor(
+        &self,
+        zone_id: u32,
+        actor_class_id: u32,
+        unique_id: String,
+        x: f32,
+        y: f32,
+        z: f32,
+        rotation: f32,
+        expected_actor_id: u32,
+    ) {
+        // 1. Resolve the actor class row — required for the
+        //    AddActor + ScriptBind bundle.
+        let actor_class = match self.db.load_actor_class(actor_class_id).await {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                tracing::warn!(
+                    actor_class_id,
+                    zone = zone_id,
+                    unique_id = %unique_id,
+                    "SpawnActor: actor_class not in gamedata_actor_class",
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    actor_class_id,
+                    error = %e,
+                    "SpawnActor: actor_class load failed",
+                );
+                return;
+            }
+        };
+
+        // 2. Round-trip the actor_number out of the Lua-side composite
+        //    formula `(4 << 28) | (zone << 19) | ((actor_number + 5) & 0x7FFFF)`.
+        //    The `+ 5` is pmeteor's stateful-Npc ctor quirk
+        //    (`Actors/Chara/Npc/Npc.cs:61`): the constructor adds 5 to
+        //    the actor_number so spawned content actors don't collide
+        //    with the system-reserved low ids (0..=4). We subtract 5
+        //    back here so `Npc::new`'s formula re-arrives at the same
+        //    composite id the Lua side handed back.
+        let raw_actor_number = (expected_actor_id & 0x7FFFF).wrapping_sub(5);
+
+        // 3. Build the Npc.
+        let mut npc = crate::npc::npc::Npc::new(
+            raw_actor_number,
+            &actor_class,
+            unique_id.clone(),
+            zone_id,
+            x,
+            y,
+            z,
+            rotation,
+            0,
+            0,
+            None,
+        );
+
+        // 4. Stamp model + appearance from gamedata_actor_appearance,
+        //    matching the bulk spawner's behaviour. Missing rows leave
+        //    the all-zero defaults; `SetActorAppearancePacket` will
+        //    fire but with model_id=0 — fine for invisible event
+        //    triggers like openingstoper.
+        if let Ok(Some(app)) = self.db.load_npc_appearance(actor_class_id).await {
+            let (model_id, slots) = app.pack();
+            npc.character.chara.model_id = model_id;
+            npc.character.chara.appearance_ids = slots;
+        }
+
+        let actor_id = npc.actor_id();
+        if actor_id != expected_actor_id {
+            tracing::warn!(
+                expected = format!("0x{:08X}", expected_actor_id),
+                actual = format!("0x{:08X}", actor_id),
+                unique_id = %unique_id,
+                "SpawnActor: actor_id mismatch — Lua side computed differently",
+            );
+            return;
+        }
+        npc.generate_actor_name(raw_actor_number);
+
+        // 5. Insert spatial projection into the parent zone grid.
+        let Some(zone_arc) = self.world.zone(zone_id).await else {
+            tracing::warn!(
+                zone = zone_id,
+                actor_id = format!("0x{actor_id:08X}"),
+                "SpawnActor: parent zone not loaded",
+            );
+            return;
+        };
+        {
+            let mut zone = zone_arc.write().await;
+            let mut ob = crate::zone::outbox::AreaOutbox::new();
+            zone.core.add_actor(
+                crate::zone::area::StoredActor {
+                    actor_id,
+                    kind: crate::zone::area::ActorKind::Npc,
+                    position: common::Vector3::new(x, y, z),
+                    grid: (0, 0),
+                    is_alive: true,
+                },
+                &mut ob,
+            );
+        }
+
+        // 6. Register the live Character in the ActorRegistry.
+        let character = npc.character.clone();
+        self.registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                actor_id,
+                crate::runtime::actor_registry::ActorKindTag::Npc,
+                zone_id,
+                /* session */ 0,
+                character,
+            ))
+            .await;
+
+        // 7. SKIP immediate spawn_bundle_fanout. Same reasoning as
+        //    apply_spawn_battle_npc_by_id: the content-area spawns
+        //    happen pre-warp during onCreate. The player still sits in
+        //    the public-area view at this point; fanning AddActor +
+        //    follow-ups would leak the trigger into the wrong view.
+        //    Post-warp `send_zone_in_bundle` picks the actor up via
+        //    `actors_around(50.0)` and emits the standard NPC spawn
+        //    bundle (including event-condition packets if the class
+        //    has parsed `eventConditions`).
+        let _ = zone_arc;
+
+        tracing::info!(
+            zone = zone_id,
+            actor_id = format!("0x{:08X}", actor_id),
+            actor_class_id,
+            unique_id = %unique_id,
+            pos = ?(x, y, z),
+            "SpawnActor applied — actor inserted into zone + registry, \
+             spawn bundle deferred to post-warp send_zone_in_bundle",
         );
     }
 

@@ -224,7 +224,105 @@ impl GameTicker {
                 if !script_path.exists() {
                     continue;
                 }
+                // Phase C2b — build real roster snapshots so the
+                // script's `area:GetPlayers()` / `:GetAllies()` /
+                // `:GetMonsters()` iterators yield real userdata
+                // instead of empty tables. Source the roster from
+                // `session.transient_director_members[director_id]`
+                // (Phase B4 records the director's member list there)
+                // + the live `ActorRegistry`. Classify members by
+                // their `ActorKindTag` so the script's separate
+                // `allies` / `monsters` loops see the right
+                // partition. The session-owning player is always in
+                // `players`.
                 let placeholder_queue = crate::lua::command::CommandQueue::new();
+                let mut players_vec = Vec::new();
+                let mut allies_vec = Vec::new();
+                let mut monsters_vec = Vec::new();
+
+                // Resolve the owning player → PlayerSnapshot.
+                if let Some(player_handle) = self.registry.by_session(session.id).await {
+                    let snap = {
+                        let c = player_handle.character.read().await;
+                        crate::processor::build_player_snapshot_from_character(&c)
+                    };
+                    players_vec.push(snap);
+                }
+
+                // Resolve every director member → LuaActor /
+                // PlayerSnapshot, classified by ActorKindTag.
+                let member_ids = active
+                    .director_actor_id
+                    .ne(&0)
+                    .then(|| {
+                        session
+                            .transient_director_members
+                            .get(&active.director_actor_id)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                for mid in member_ids {
+                    let Some(handle) = self.registry.get(mid).await else {
+                        continue;
+                    };
+                    let c = handle.character.read().await;
+                    match handle.kind {
+                        crate::runtime::actor_registry::ActorKindTag::Player => {
+                            // Skip the session-owner — already in
+                            // players_vec from the by_session branch.
+                            if mid
+                                != players_vec.first().map(|p| p.actor_id).unwrap_or(0)
+                            {
+                                players_vec.push(
+                                    crate::processor::build_player_snapshot_from_character(&c),
+                                );
+                            }
+                        }
+                        kind @ (crate::runtime::actor_registry::ActorKindTag::Ally
+                            | crate::runtime::actor_registry::ActorKindTag::BattleNpc
+                            | crate::runtime::actor_registry::ActorKindTag::Npc
+                            | crate::runtime::actor_registry::ActorKindTag::Pet) => {
+                            let actor = crate::lua::userdata::LuaActor {
+                                actor_id: mid,
+                                name: c.base.actor_name.clone(),
+                                class_name: String::new(),
+                                class_path: String::new(),
+                                unique_id: String::new(),
+                                zone_id: handle.zone_id,
+                                zone_name: String::new(),
+                                state: c.base.current_main_state,
+                                pos: (
+                                    c.base.position_x,
+                                    c.base.position_y,
+                                    c.base.position_z,
+                                ),
+                                rotation: c.base.rotation,
+                                queue: placeholder_queue.clone(),
+                                is_engaged: c.is_engaged(),
+                                speed: c.get_speed(),
+                                target_actor_id: c
+                                    .ai_container
+                                    .current_state()
+                                    .map(|s| s.target_actor_id)
+                                    .filter(|id| *id != 0)
+                                    .unwrap_or(0),
+                            };
+                            // Ally if the registered kind says so
+                            // OR the BattleNpc was spawned with
+                            // allegiance==1 (we can't read that from
+                            // ActorKindTag::BattleNpc alone, but B1
+                            // tags ally BNpcs as `Ally`).
+                            match kind {
+                                crate::runtime::actor_registry::ActorKindTag::Ally => {
+                                    allies_vec.push(actor)
+                                }
+                                _ => monsters_vec.push(actor),
+                            }
+                        }
+                    }
+                }
+
                 let area = crate::lua::userdata::LuaContentArea {
                     parent_zone_id: active.parent_zone_id,
                     area_name: active.area_name.clone(),
@@ -232,6 +330,9 @@ impl GameTicker {
                     director_name: active.director_name.clone(),
                     director_actor_id: active.director_actor_id,
                     queue: placeholder_queue,
+                    players: players_vec,
+                    allies: allies_vec,
+                    monsters: monsters_vec,
                 };
                 let lua_clone = lua.clone();
                 let tick = now_ms / CONTENT_UPDATE_PERIOD_MS;
