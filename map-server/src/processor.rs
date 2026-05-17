@@ -3143,6 +3143,40 @@ impl PacketProcessor {
             .and_then(|s| s.active_content_script)
         {
             let director_actor_id = active.director_actor_id;
+
+            // Synchronise the player's `EventSession` to the synthetic
+            // EventStart we're about to dispatch. The normal
+            // `handle_event_start` path (processor.rs:7000) calls
+            // `chara.event_session.start_event(...)` before dispatching,
+            // which populates `current_event_owner` / `current_event_name`
+            // / `current_event_type`. Those fields are what
+            // `dispatch_event_start_to_content_director` snapshots
+            // (line ~7235) and threads through
+            // `translate_lua_commands_into_outbox` to fill in the
+            // `RunEventFunction` packet's target+event_name+event_type
+            // bytes.
+            //
+            // Without this update, the session still reflects the
+            // player's PREVIOUS EventStart (typically `talkDefault` on
+            // the Yda zone NPC — target=0x45300001, event_type=1), and
+            // the cinematic OUT 0x0130 lands on the wire addressed to
+            // the wrong event. The 1.x client silently drops the
+            // function call and the cinematic never plays.
+            //
+            // We assign the fields directly rather than calling
+            // `start_event` because `start_event` would push an
+            // `EventStarted` event into the outbox; dispatching that
+            // would re-run the director's `onEventStarted` hook (the
+            // exact thing `dispatch_event_start_to_content_director` is
+            // about to do). The hook would run twice and emit two
+            // cinematic bodies.
+            {
+                let mut chara = handle.character.write().await;
+                chara.event_session.current_event_owner = director_actor_id;
+                chara.event_session.current_event_name = "noticeEvent".to_string();
+                chara.event_session.current_event_type = 5;
+            }
+
             self.dispatch_event_start_to_content_director(
                 &handle,
                 session_id,
