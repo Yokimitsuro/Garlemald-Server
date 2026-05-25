@@ -29,7 +29,7 @@ function onEventStarted(player, actor, triggerName, isGoobbue)
 		
 		worldMaster = GetWorldMaster();
 		
-		if (player.rentalExpireTime != 0) then
+		if (player.rentalExpireTime ~= 0) then
 			player:SendGameMessage(player, worldMaster, 26004, 0x20); --You dismount.
 		else
 			if (player:GetMountState() == 1) then

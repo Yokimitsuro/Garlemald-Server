@@ -43,7 +43,7 @@ function onEventStarted(player, actor, triggerName, commandValue, category, unk1
     
     player:SetWorkValue(player, workName, uiFunc, markerIndex);
     
-    if iconIndex != 0 then
+    if iconIndex ~= 0 then
         if categoryKind == 1 then
             player:SendGameMessage(player, worldMaster, 30422, 0x20, player, iconIndex);
         elseif categoryKind == 2 then

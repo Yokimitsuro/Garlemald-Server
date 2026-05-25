@@ -14,7 +14,7 @@ function onTrigger(player, argc, target, workName, uiFunc, value)
 	local messageID = MESSAGE_TYPE_SYSTEM_ERROR;
     local sender = "[workvalue] ";
 
-	if (argc != 4) then
+	if (argc ~= 4) then
 		player:SendMessage(messageID, sender, "Invalid args");
 		return;
 	end

@@ -16,7 +16,7 @@ function onCombo(caster, target, skill)
     local berserk = caster.statusEffects.GetStatusEffectById(223160);
 
     --if it isn't nil, remove the AP and Defense mods and reset extra to 0, increase potency
-    if berserk != nil then
+    if berserk ~= nil then
         local apPerHit = 20;
         local defPerHit = 20;
 

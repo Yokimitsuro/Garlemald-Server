@@ -127,7 +127,7 @@ local weaponskillHandlers = {
 function onEventStarted(player, command, triggerName)			
 	
 	--Are they in active mode?
-	if (player:GetState() != 2) then
+	if (player:GetState() ~= 2) then
 		player:SendGameMessage(GetWorldMaster(), 32503, 0x20);
 		player:EndEvent();
 		return;

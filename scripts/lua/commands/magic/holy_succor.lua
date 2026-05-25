@@ -21,7 +21,7 @@ function onSkillFinish(caster, target, skill, action, actionContainer)
     action.DoAction(caster, target, skill, actionContainer);
 
     --When cast on another player you also heal 50% of the amount restored.
-    if caster != target then
+    if caster ~= target then
         caster.AddHP(action.amount / 2)
         --33012: You recover [amount] HP.
         actionContainer.AddHPAbsorbAction(caster.actorId, 33012, (action.amount / 2));

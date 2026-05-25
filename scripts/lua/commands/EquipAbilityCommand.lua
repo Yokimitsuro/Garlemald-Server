@@ -76,7 +76,7 @@ function onEventStarted(player, equipAbilityWidget, triggername, slot, commandid
         if(ability.job == classId or ability.job == jobId) then
             --"Actions of your current class or job cannot be removed."
             player:SendGameMessage(GetWorldMaster(), 30745, 0x20, 0, 0);
-        elseif (commandid != 0) then
+        elseif (commandid ~= 0) then
             player:UnequipAbility(slot);
         end
     end

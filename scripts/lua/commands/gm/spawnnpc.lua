@@ -94,7 +94,7 @@ function onTrigger(player, argc, name,  width, height, blockCount)
     local messageID = MESSAGE_TYPE_SYSTEM_ERROR;
     local sender = "spawnnpc";
 	
-	if player and (modelIds[name] != nil) then
+	if player and (modelIds[name] ~= nil) then
         local pos = player:GetPos();
         local x = tonumber(pos[0]);
         local y = tonumber(pos[1]);

@@ -12,7 +12,7 @@ function onSkillStart(caster, target, skill)
     local rampage = caster.statusEffects.GetStatusEffectById(223208);
 
     --if it isn't nil, remove the AP and Defense mods and reset extra to 0, increase potency
-    if rampage != nil then
+    if rampage ~= nil then
         local parryPerDT = 20;
         local delayMsPerDT = 100;
 

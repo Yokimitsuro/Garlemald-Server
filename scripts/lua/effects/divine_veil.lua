@@ -12,7 +12,7 @@ end
 --Applys Divine Regen to party in range when healed by cure or cura
 function onHealed(effect, caster, target, skill, action, actionContainer)
     --             cure                  cura
-    if (skill.id == 27346 or skill.id == 27347) and (caster != target) then
+    if (skill.id == 27346 or skill.id == 27347) and (caster ~= target) then
         local regenDuration = 30;
         --Apparently heals for 85 without AF, 113 with. Unsure if these can be improved with stats
         local magnitude = 85
