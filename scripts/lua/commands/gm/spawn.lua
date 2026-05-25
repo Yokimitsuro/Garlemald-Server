@@ -31,7 +31,13 @@ function onTrigger(player, argc, actorClassId, width, height)
         for i = 0, w do
             for j = 0, h do
 				actor = zone:SpawnActor(actorClassId, "test", pos[0] + (i - (w / 2) * 3), pos[1], pos[2] + (j - (h / 2) * 3), pos[3]);
-				actor.SetAppearance(1001149)
+				-- SetAppearance is not bound on LuaActor (a nil-call under mlua),
+				-- and this dot-syntax call couldn't be satisfied by a plain
+				-- add_method stub anyway (mlua would coerce the arg as self —
+				-- see the Engage Index-meta note in lua/userdata.rs). Appearance
+				-- on GM-spawned test actors is non-essential; commented out to
+				-- match MeteorReborn rather than wire a debug-only binding.
+				-- actor.SetAppearance(1001149)
 			end
 		end
 	end

@@ -2,7 +2,19 @@ require("modifiers")
 require("battleutils")
 
 --Cure, Cura, Regen, Esuna, Enhancing spells (Hardcoded as Stoneskin and Sanguine since we dont have a good way to check what's an enhancing spell)
-supportedSpells = [27346, 27347, 27358, 27357, 27350, 27307]
+-- NOTE: `[...]` is not valid Lua (a C#/JS array literal carried over from
+-- Project Meteor — a hard parse error under mlua, so this whole file
+-- failed to load). Use a set keyed by spell id so the
+-- `supportedSpells[skill.id]` membership tests below work (the original
+-- positional list was also semantically wrong for an id-keyed lookup).
+-- Matches MeteorReborn's fix.
+supportedSpells = {}
+supportedSpells[27346] = true  -- Cure
+supportedSpells[27347] = true  -- Cura
+supportedSpells[27358] = true  -- Regen
+supportedSpells[27357] = true  -- Esuna
+supportedSpells[27350] = true  -- Stoneskin
+supportedSpells[27307] = true  -- Sanguine
 
 function onMagicCast(effect, caster, skill)
     if supportedSpells[skill.id] then
