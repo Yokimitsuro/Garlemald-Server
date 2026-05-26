@@ -2537,6 +2537,12 @@ pub async fn apply_quest_on_notice(
         return;
     };
     if !matches!(handle.kind, ActorKindTag::Player) {
+        tracing::debug!(
+            player = player_id,
+            quest = quest_id,
+            kind = ?handle.kind,
+            "quest:OnNotice skipped — actor handle is not a Player",
+        );
         return;
     }
     let Some(script_name) = lua.catalogs().quest_script_name(quest_id) else {
@@ -2547,6 +2553,12 @@ pub async fn apply_quest_on_notice(
         );
         return;
     };
+    tracing::debug!(
+        player = player_id,
+        quest = quest_id,
+        script = %script_name,
+        "quest:OnNotice — passed guards, running hook",
+    );
     let script_path = lua.resolver().quest(&script_name);
     if !script_path.exists() {
         tracing::debug!(

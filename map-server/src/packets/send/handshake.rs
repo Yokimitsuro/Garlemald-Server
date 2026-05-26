@@ -101,8 +101,24 @@ pub fn build_0xe2(actor_id: u32, val: i32) -> SubPacket {
 /// wipes everything, but it can also close a Mass-Delete sequence
 /// opened by `build_mass_delete_actor_start` with intervening Body
 /// packets that exempt specific actors.
+///
+/// MUST be a GameMessage subpacket (`type=0x03`, opcode 0x0007 in the
+/// body) — NOT a raw `type=0x0007` subpacket. The retail client (and
+/// project-meteor) sends/expects 0x0007 as `ty=03 sz=0x28`; the
+/// client's own zone-in-complete 0x0007 is also `ty=03`. Sending it
+/// raw (the prior `new_with_flag(false, …)`, `ty=0x0007 sz=0x18`) made
+/// the client silently ignore it. That was harmless on the cross-zone
+/// `DoZoneChange` path (the client wipes its scene on any zone change
+/// regardless), but on the same-zone `DoZoneChangeContent` path the
+/// client relies on this wipe to reset the scene for the private
+/// content area — without it the content transition never completed
+/// and "Now Loading" hung forever (the SEQ_005 combat-tutorial
+/// blocker). Confirmed via packet-diff against
+/// `captures/pmeteor-quest/20260426-160210-gridania-manual3` (pmeteor
+/// emits OUT 0x0007 `ty=03` at every content-director kick; garlemald
+/// emitted none).
 pub fn build_delete_all_actors(actor_id: u32) -> SubPacket {
-    SubPacket::new_with_flag(false, OP_DELETE_ALL_ACTORS, actor_id, vec![0u8; 8])
+    SubPacket::new(OP_DELETE_ALL_ACTORS, actor_id, vec![0u8; 8])
 }
 
 /// OP_MASS_DELETE_ACTOR_START (0x0006) — opens a Mass Delete Actor

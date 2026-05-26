@@ -3203,6 +3203,18 @@ impl PacketProcessor {
                 director = format!("0x{:08X}", director_actor_id),
                 "DoZoneChangeContent: server-side cinematic kickoff (synthetic noticeEvent EventStart)",
             );
+
+            // NOTE: the quest's `onNotice` (the `processTtrNomal001withHQ`
+            // cinematic + notice `EndEvent`) is NOT fired here. Packet-diff
+            // against captures/pmeteor-quest/20260426-160210-gridania-manual3
+            // shows the 1.x client does not post EventStart(type=5) for the
+            // content director post-warp — it posts EventStart(type=101,
+            // "talkDefault") on the content NPC, and pmeteor fires onNotice in
+            // RESPONSE to that (OUT RunEventFunction event_name="noticeEvent"
+            // ~2s later). Firing onNotice here (during the warp, before the
+            // client opens the event) sent the cinematic too early and the
+            // client dropped it. The real fire-point is the type-101 arm in
+            // `handle_event_start`.
         }
 
         tracing::info!(
@@ -7173,6 +7185,31 @@ impl PacketProcessor {
         } {
             self.fire_quest_hook_for_active_quests(&handle, owner_actor_id, hook_name).await;
         }
+
+        // SEQ-005 content-tutorial handshake (UNRESOLVED — breadcrumb for
+        // the next attempt). Packet-diff against the working pmeteor capture
+        // captures/pmeteor-quest/20260426-160210-gridania-manual3 shows the
+        // real post-warp sequence is:
+        //   IN  EventStart type=101 "talkDefault"  @15:54:31.414  (precursor)
+        //   IN  EventStart type=5   "noticeEvent"  @15:54:33.388  (for the
+        //                                           CONTENT director 0x653000xx)
+        //   OUT RunEventFunction event_name="noticeEvent" @15:54:33.388
+        //                                           (onNotice → processTtrNomal001withHQ)
+        //   ... tutorial fight runs with the noticeEvent left OPEN ...
+        //   OUT EndEvent "noticeEvent" @15:56:16    (~2 min later, post-fight)
+        // i.e. onNotice fires on the type-5 noticeEvent, NOT type-101, and
+        // the notice EndEvent must NOT be sent until the fight ends.
+        //
+        // The blocker: garlemald's client posts the type-101 precursor but
+        // NEVER posts the type-5 noticeEvent for the content director (it
+        // does post type-5 for the OPENING director, which works). This is
+        // the documented client-side kick-priming gap — the content
+        // director's receiver isn't primed, so its `noticeEvent` kick is
+        // silently dropped. Firing onNotice on the type-101 here (a previous
+        // attempt) is WRONG: it sends the cinematic + a premature notice
+        // EndEvent the retail client never sees at that point, and still
+        // doesn't unblock. See meteor-decomp/docs/seq005_kick_gate_analysis.md
+        // and the reference_ffxiv_1x_kick_priming_lua_binding memory.
 
         // RequestQuestJournalCommand handler — when the client opens a
         // quest's journal entry it sends EventStart targeting the
