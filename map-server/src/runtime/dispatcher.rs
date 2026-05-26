@@ -216,7 +216,7 @@ pub async fn dispatch_battle_event(
             // `!die` paths don't need one). `die_if_defender_fell` is
             // where real combat deaths route through with an attacker
             // id for `onKillBNpc` dispatch.
-            apply_die(*owner_actor_id, registry, world, zone).await;
+            apply_die(*owner_actor_id, registry, world, zone, lua, db).await;
         }
         BattleEvent::Revive { owner_actor_id } => {
             apply_revive(*owner_actor_id, registry, world, zone).await;
@@ -1412,7 +1412,7 @@ pub(crate) async fn die_if_defender_fell(
         (0, 1)
     };
 
-    apply_die(defender_actor_id, registry, world, zone).await;
+    apply_die(defender_actor_id, registry, world, zone, lua, db).await;
 
     if !is_bnpc {
         return;
@@ -1609,17 +1609,26 @@ pub async fn award_leve_completion_seals(
 
 /// Port of Meteor's `DeathState.OnStart` tail: disengage the AI, flip
 /// `current_main_state` to DEAD, broadcast `SetActorState` around the
-/// owner. Status-effect cleanup (`LoseOnDeath` flag) is deferred — the
-/// status table lacks the flag surfacing today.
+/// owner, then purge every status effect tagged `LoseOnDeath` and drain
+/// the resulting wire/save/recalc events so the client-side icon strip
+/// clears in lock-step with the death animation. The `lua` / `db` args
+/// are optional so synthetic test paths can still call apply_die
+/// without standing up the full engine; when either is absent the
+/// status removal still mutates the in-memory container but the wire
+/// emission and DbSave events are dropped (matching the existing test
+/// posture for the rest of the dispatcher).
 pub(crate) async fn apply_die(
     owner_actor_id: u32,
     registry: &ActorRegistry,
     world: &WorldManager,
     zone: &Arc<RwLock<Zone>>,
+    lua: Option<&Arc<crate::lua::LuaEngine>>,
+    db: Option<&Arc<crate::database::Database>>,
 ) {
     let Some(handle) = registry.get(owner_actor_id).await else {
         return;
     };
+    let mut status_outbox = crate::status::StatusOutbox::new();
     {
         let mut c = handle.character.write().await;
         if c.base.current_main_state == crate::actor::MAIN_STATE_DEAD {
@@ -1644,11 +1653,25 @@ pub(crate) async fn apply_die(
         // next tick, which short-circuits Attack/Cast states without us
         // needing an explicit Disengage broadcast.
         c.ai_container.clear_states();
+        // Purge status effects flagged LoseOnDeath. Mirrors Meteor's
+        // `Character.cs` death tail (the `RemoveStatusEffectsByFlags`
+        // call that lives in `DeathState.OnStart`). The outbox is drained
+        // after the lock is released so dispatch_status_event can
+        // re-acquire the registry handle for packet emission.
+        c.status_effects.remove_by_flag(
+            crate::status::StatusEffectFlags::LOSE_ON_DEATH,
+            &mut status_outbox,
+        );
     }
     let sub = tx::build_set_actor_state(owner_actor_id, crate::actor::MAIN_STATE_DEAD as u8, 0);
     let bytes = sub.to_bytes();
     send_to_self_if_player(registry, world, owner_actor_id, bytes.clone()).await;
     broadcast_around_actor(world, registry, zone, owner_actor_id, bytes).await;
+    if let (Some(lua_ref), Some(db_ref)) = (lua, db) {
+        for evt in status_outbox.drain() {
+            dispatch_status_event(&evt, registry, world, db_ref, lua_ref.catalogs()).await;
+        }
+    }
 }
 
 /// Bring an actor back from the DEAD state. For Players this is the

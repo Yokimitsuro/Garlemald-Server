@@ -1296,6 +1296,8 @@ impl PacketProcessor {
                     &self.registry,
                     &self.world,
                     &zone,
+                    self.lua.as_ref(),
+                    Some(&self.db),
                 )
                 .await;
             }
@@ -2673,6 +2675,11 @@ impl PacketProcessor {
 
         // 1. Update character position so subsequent reads + the zone-in
         //    bundle's `CreateSpawnPositionPacket` see the new coords.
+        //    Also purge LOSE_ON_ZONING status effects — content-area
+        //    transitions are loading-screen warps from the client's
+        //    perspective and lose the same buff set retail's regular
+        //    zone changes drop.
+        let mut status_outbox = crate::status::StatusOutbox::new();
         {
             let mut c = handle.character.write().await;
             c.base.position_x = x;
@@ -2680,7 +2687,12 @@ impl PacketProcessor {
             c.base.position_z = z;
             c.base.rotation = rotation;
             c.base.zone_id = parent_zone_id;
+            c.status_effects.remove_by_flag(
+                crate::status::StatusEffectFlags::LOSE_ON_ZONING,
+                &mut status_outbox,
+            );
         }
+        self.drain_status_outbox(status_outbox).await;
 
         // 2. Run the SAME zone-change migration helper that
         //    `apply_do_zone_change` (cross-zone) uses. Both wipe-+-
@@ -3284,7 +3296,13 @@ impl PacketProcessor {
         // 2. Update the character's persistent zone_id + position
         //    (the registry move above only touches the spatial grid;
         //    the Character row's `base.zone_id` is what `send_zone_in_bundle`
-        //    reads on the next login + what persists to disk).
+        //    reads on the next login + what persists to disk). Also
+        //    purge any status effects tagged LOSE_ON_ZONING — mirrors
+        //    Meteor's `Player.CleanupAndSave`
+        //    (`Map Server/Actors/Chara/Player/Player.cs:844`) which
+        //    drops these effects unconditionally as the player crosses
+        //    the zone boundary.
+        let mut status_outbox = crate::status::StatusOutbox::new();
         {
             let mut c = handle.character.write().await;
             c.base.zone_id = zone_id;
@@ -3292,7 +3310,12 @@ impl PacketProcessor {
             c.base.position_y = y;
             c.base.position_z = z;
             c.base.rotation = rotation;
+            c.status_effects.remove_by_flag(
+                crate::status::StatusEffectFlags::LOSE_ON_ZONING,
+                &mut status_outbox,
+            );
         }
+        self.drain_status_outbox(status_outbox).await;
 
         // 3. Carry the requested spawn_type through to the zone-in
         //    bundle so the client plays the right "you arrived" anim.
@@ -3835,15 +3858,14 @@ impl PacketProcessor {
         tracing::info!(player = player_id, dream_id, inn_code, "StartDream applied");
     }
 
-    /// `player:Logout()` — emit `LogoutPacket` (0x000E) to the owner's
-    /// session. The client responds by closing the world connection
-    /// and returning to character select. Mirrors C# `Player.Logout`
-    /// (`Map Server/Actors/Chara/Player/Player.cs:861`); the
-    /// `RemoveStatusEffectsByFlags(LoseOnLogout)` + `CleanupAndSave()`
-    /// tail it does is deferred — the same status-cleanup gap is
-    /// already noted in the post-roadmap follow-ups list, and persistent
-    /// player save is currently driven by the regular DB upsert path
-    /// rather than a logout-specific flush.
+    /// `player:Logout()` — purge status effects flagged `LoseOnLogout`,
+    /// then emit `LogoutPacket` (0x000E) to the owner's session. The
+    /// client responds by closing the world connection and returning
+    /// to character select. Mirrors C# `Player.Logout`
+    /// (`Map Server/Actors/Chara/Player/Player.cs:861`). The
+    /// `CleanupAndSave()` tail Meteor does is still deferred — persistent
+    /// player save is driven by the regular DB upsert path rather than
+    /// a logout-specific flush.
     async fn apply_logout(&self, player_id: u32) {
         let Some(handle) = self.registry.get(player_id).await else {
             tracing::debug!(player = player_id, "Logout: player not in registry");
@@ -3854,6 +3876,7 @@ impl PacketProcessor {
             tracing::debug!(player = player_id, "Logout: no session (NPC?)");
             return;
         }
+        self.purge_status_effects_on_disconnect(&handle).await;
         let Some(client) = self.world.client(session_id).await else {
             tracing::debug!(
                 player = player_id,
@@ -3869,11 +3892,14 @@ impl PacketProcessor {
         tracing::info!(player = player_id, session = session_id, "Logout applied");
     }
 
-    /// `player:QuitGame()` — emit `QuitPacket` (0x0011) to the owner's
-    /// session. The client responds by terminating its process (back
-    /// to launcher / desktop). Mirrors C# `Player.QuitGame`
-    /// (`Map Server/Actors/Chara/Player/Player.cs:869`); same status-
-    /// cleanup deferral as [`apply_logout`].
+    /// `player:QuitGame()` — purge status effects flagged `LoseOnLogout`,
+    /// then emit `QuitPacket` (0x0011) to the owner's session. The
+    /// client responds by terminating its process (back to launcher /
+    /// desktop). Mirrors C# `Player.QuitGame`
+    /// (`Map Server/Actors/Chara/Player/Player.cs:869`); same
+    /// `CleanupAndSave()` deferral as [`apply_logout`]. Retail treats
+    /// QuitGame as a stronger Logout for cleanup purposes, so both
+    /// fire the LoseOnLogout purge identically.
     async fn apply_quit_game(&self, player_id: u32) {
         let Some(handle) = self.registry.get(player_id).await else {
             tracing::debug!(player = player_id, "QuitGame: player not in registry");
@@ -3884,6 +3910,7 @@ impl PacketProcessor {
             tracing::debug!(player = player_id, "QuitGame: no session (NPC?)");
             return;
         }
+        self.purge_status_effects_on_disconnect(&handle).await;
         let Some(client) = self.world.client(session_id).await else {
             tracing::debug!(
                 player = player_id,
@@ -3897,6 +3924,50 @@ impl PacketProcessor {
             client.send_bytes(base.to_bytes()).await;
         }
         tracing::info!(player = player_id, session = session_id, "QuitGame applied");
+    }
+
+    /// Shared `RemoveStatusEffectsByFlags(LoseOnLogout)` tail used by
+    /// both Logout and QuitGame. Mirrors Meteor's `Player.Cleanup` —
+    /// drops every effect tagged for logout removal and drains the
+    /// resulting status events (slot-clear packets + `onLose` Lua
+    /// hooks + recalc) before the client connection drops.
+    async fn purge_status_effects_on_disconnect(
+        &self,
+        handle: &crate::runtime::ActorHandle,
+    ) {
+        let mut outbox = crate::status::StatusOutbox::new();
+        {
+            let mut c = handle.character.write().await;
+            c.status_effects.remove_by_flag(
+                crate::status::StatusEffectFlags::LOSE_ON_LOGOUT,
+                &mut outbox,
+            );
+        }
+        self.drain_status_outbox(outbox).await;
+    }
+
+    /// Drain a status outbox through `dispatch_status_event` against
+    /// the processor's registry / world / db / catalogs. Common tail
+    /// for any caller (disconnect, zone change, …) that purges effects
+    /// in-memory and needs the wire/save/recalc events to fan out.
+    /// When the Lua engine isn't attached the drain is dropped — the
+    /// in-memory mutation has already landed, which is the
+    /// load-bearing half for the common disconnect case where the
+    /// client is about to lose its socket anyway.
+    async fn drain_status_outbox(&self, mut outbox: crate::status::StatusOutbox) {
+        let Some(lua_ref) = self.lua.as_ref() else {
+            return;
+        };
+        for evt in outbox.drain() {
+            crate::runtime::dispatcher::dispatch_status_event(
+                &evt,
+                &self.registry,
+                &self.world,
+                &self.db,
+                lua_ref.catalogs(),
+            )
+            .await;
+        }
     }
 
     async fn apply_end_dream(&self, player_id: u32) {

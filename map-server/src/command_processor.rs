@@ -244,6 +244,8 @@ impl CommandProcessor {
                     &self.registry,
                     &self.world,
                     &zone,
+                    Some(&self.lua),
+                    Some(&self.db),
                 )
                 .await;
                 format!("killed {name} (actor {actor_id})")

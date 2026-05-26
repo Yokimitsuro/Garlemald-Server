@@ -71,10 +71,17 @@ mod tests {
     fn every_migration_decompresses_to_sqlite_sql() {
         for mig in iter() {
             assert!(!mig.sql.is_empty(), "{} decompressed empty", mig.name);
-            // Every bundled file should contain a sanity-check token.
+            // Every bundled file should contain a sanity-check DDL/DML
+            // token — guards against accidentally shipping an empty
+            // (or wholly-commented-out) migration. `ALTER TABLE`
+            // migrations are a legitimate column-add path (see
+            // `050_characters_quest_scenario_npc_ls.sql` for the first
+            // landed example), so the check is the union of all three.
             assert!(
-                mig.sql.contains("CREATE TABLE") || mig.sql.contains("INSERT"),
-                "{} has neither CREATE TABLE nor INSERT",
+                mig.sql.contains("CREATE TABLE")
+                    || mig.sql.contains("INSERT")
+                    || mig.sql.contains("ALTER TABLE"),
+                "{} has none of CREATE TABLE / INSERT / ALTER TABLE",
                 mig.name,
             );
         }

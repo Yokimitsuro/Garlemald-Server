@@ -1208,6 +1208,161 @@ async fn revive_restores_hp_and_flips_state_back_to_passive() {
 }
 
 #[tokio::test]
+async fn die_purges_lose_on_death_status_effects_and_broadcasts_clears() {
+    use crate::battle::outbox::BattleEvent;
+    use crate::lua::LuaEngine;
+    use crate::runtime::dispatcher::dispatch_battle_event;
+    use crate::status::ids::{STATUS_POISON, STATUS_RAMPART};
+    use crate::status::{
+        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
+    };
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let lua = Arc::new(LuaEngine::new("/nonexistent"));
+
+    let mut zone = Zone::new(
+        100,
+        "test",
+        1,
+        "/Area/Zone/Test",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    // Owner (Player session) + an observer nearby so the SetActorStatus
+    // broadcast has a recipient.
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 5,
+            kind: ActorKind::Player,
+            position: Vector3::ZERO,
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 12,
+            kind: ActorKind::Player,
+            position: Vector3::new(2.0, 0.0, 0.0),
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    world.register_zone(zone).await;
+
+    // Owner with one LOSE_ON_DEATH effect (Poison) and one that should
+    // persist through death (Rampart, flags=NONE). HP at 0 so the
+    // existing apply_die early-returns are bypassed.
+    let mut owner = Character::new(5);
+    owner.chara.hp = 0;
+    owner.chara.max_hp = 1000;
+    {
+        let mut outbox = StatusOutbox::new();
+        let mut poison = StatusEffect::new(5, STATUS_POISON, 1.0, 0, 30, 0, 0);
+        poison.flags = StatusEffectFlags::LOSE_ON_DEATH;
+        owner
+            .status_effects
+            .add_status_effect(poison, 5, 0, DEFAULT_GAIN_TEXT_ID, &mut outbox);
+        let rampart = StatusEffect::new(5, STATUS_RAMPART, 1.0, 0, 30, 0, 0);
+        // rampart.flags defaults to NONE — not flagged for death cleanup.
+        owner
+            .status_effects
+            .add_status_effect(rampart, 5, 0, DEFAULT_GAIN_TEXT_ID, &mut outbox);
+    }
+    registry
+        .insert(ActorHandle::new(
+            5,
+            ActorKindTag::Player,
+            100,
+            55,
+            owner,
+        ))
+        .await;
+    registry
+        .insert(ActorHandle::new(
+            12,
+            ActorKindTag::Player,
+            100,
+            66,
+            Character::new(12),
+        ))
+        .await;
+    let (tx_observer, mut rx_observer) = mpsc::channel::<Vec<u8>>(16);
+    world
+        .register_client(66, ClientHandle::new(66, tx_observer))
+        .await;
+    let (tx_owner, _rx_owner) = mpsc::channel::<Vec<u8>>(16);
+    world
+        .register_client(55, ClientHandle::new(55, tx_owner))
+        .await;
+
+    let zone_arc = world.zone(100).await.unwrap();
+    dispatch_battle_event(
+        &BattleEvent::Die { owner_actor_id: 5 },
+        &registry,
+        &world,
+        &zone_arc,
+        Some(&lua),
+        Some(&db),
+    )
+    .await;
+
+    // Status container: Poison purged, Rampart still present.
+    let c = registry.get(5).await.unwrap().character.read().await.clone();
+    assert!(
+        !c.status_effects.has(STATUS_POISON),
+        "Poison (LOSE_ON_DEATH) should be purged on death",
+    );
+    assert!(
+        c.status_effects.has(STATUS_RAMPART),
+        "Rampart (no LOSE_ON_DEATH flag) should survive death",
+    );
+    assert_eq!(
+        c.base.current_main_state,
+        crate::actor::MAIN_STATE_DEAD,
+        "owner should be DEAD",
+    );
+
+    // Wire: observer should see at least the SetActorState broadcast
+    // (0x0134) plus a SetActorStatus (0x0177) clearing the Poison slot.
+    use crate::packets::opcodes::{OP_SET_ACTOR_STATUS, OP_SET_ACTOR_STATE};
+    let mut saw_state_change = false;
+    let mut saw_status_clear = false;
+    while let Ok(bytes) = rx_observer.try_recv() {
+        // Subpacket opcode lives at offset 0x12 in our wire layout.
+        if bytes.len() >= 0x14 {
+            let op = u16::from_le_bytes([bytes[0x12], bytes[0x13]]);
+            if op == OP_SET_ACTOR_STATE {
+                saw_state_change = true;
+            } else if op == OP_SET_ACTOR_STATUS {
+                saw_status_clear = true;
+            }
+        }
+    }
+    assert!(saw_state_change, "observer should receive SetActorState broadcast");
+    assert!(
+        saw_status_clear,
+        "observer should receive SetActorStatus clear for the purged Poison slot",
+    );
+}
+
+#[tokio::test]
 async fn auto_attack_that_kills_flips_defender_to_dead() {
     use crate::runtime::{GameTicker, TickerConfig};
 
@@ -3862,6 +4017,273 @@ async fn logout_command_emits_logout_packet_to_owner_session() {
         subs[0].header.r#type,
         crate::packets::opcodes::OP_LOGOUT,
         "subpacket type should be OP_LOGOUT (0x000E)",
+    );
+}
+
+#[tokio::test]
+async fn logout_purges_lose_on_logout_status_effects() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::status::ids::{STATUS_POISON, STATUS_RAMPART};
+    use crate::status::{
+        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
+    };
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let lua = Arc::new(crate::lua::LuaEngine::new("/nonexistent"));
+
+    let mut chara = Character::new(35);
+    {
+        let mut outbox = StatusOutbox::new();
+        let mut soulbinding = StatusEffect::new(35, STATUS_POISON, 1.0, 0, 0, 0, 0);
+        soulbinding.flags = StatusEffectFlags::LOSE_ON_LOGOUT;
+        chara.status_effects.add_status_effect(
+            soulbinding,
+            35,
+            0,
+            DEFAULT_GAIN_TEXT_ID,
+            &mut outbox,
+        );
+        // A second effect with no LOSE_ON_LOGOUT flag — should survive
+        // the disconnect. Models a persistent buff like a food/medicine
+        // timer that retail let you log out with.
+        let food = StatusEffect::new(35, STATUS_RAMPART, 1.0, 0, 0, 0, 0);
+        chara.status_effects.add_status_effect(
+            food,
+            35,
+            0,
+            DEFAULT_GAIN_TEXT_ID,
+            &mut outbox,
+        );
+    }
+    registry
+        .insert(ActorHandle::new(35, ActorKindTag::Player, 200, 35, chara))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: 35,
+            current_zone_id: 200,
+            ..MapSession::default()
+        })
+        .await;
+    let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+    world.register_client(35, ClientHandle::new(35, tx)).await;
+
+    let processor = crate::processor::PacketProcessor {
+        db,
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: Some(lua),
+        cmd: None,
+    };
+    let handle = registry.get(35).await.unwrap();
+
+    processor
+        .apply_login_lua_command(&handle, LuaCommand::Logout { player_id: 35 })
+        .await;
+
+    let c = registry.get(35).await.unwrap().character.read().await.clone();
+    assert!(
+        !c.status_effects.has(STATUS_POISON),
+        "LOSE_ON_LOGOUT effect should be purged",
+    );
+    assert!(
+        c.status_effects.has(STATUS_RAMPART),
+        "non-LOSE_ON_LOGOUT effect should survive disconnect",
+    );
+}
+
+#[tokio::test]
+async fn do_zone_change_purges_lose_on_zoning_status_effects() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::status::ids::{STATUS_POISON, STATUS_RAMPART};
+    use crate::status::{
+        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
+    };
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let lua = Arc::new(crate::lua::LuaEngine::new("/nonexistent"));
+
+    // Two zones: source (200) + destination (210). Both must be
+    // registered with the WorldManager so do_zone_change_with_private_area
+    // can move the actor between them.
+    let zone_src = Zone::new(
+        200, "src", 1, "/Area/Zone/Src", 0, 0, 0,
+        false, false, false, false, false,
+        Some(&StubNavmeshLoader),
+    );
+    let zone_dst = Zone::new(
+        210, "dst", 1, "/Area/Zone/Dst", 0, 0, 0,
+        false, false, false, false, false,
+        Some(&StubNavmeshLoader),
+    );
+    world.register_zone(zone_src).await;
+    world.register_zone(zone_dst).await;
+
+    let mut chara = Character::new(37);
+    chara.base.zone_id = 200;
+    {
+        let mut outbox = StatusOutbox::new();
+        let mut zoned = StatusEffect::new(37, STATUS_POISON, 1.0, 0, 0, 0, 0);
+        zoned.flags = StatusEffectFlags::LOSE_ON_ZONING;
+        chara.status_effects.add_status_effect(
+            zoned,
+            37,
+            0,
+            DEFAULT_GAIN_TEXT_ID,
+            &mut outbox,
+        );
+        let persistent = StatusEffect::new(37, STATUS_RAMPART, 1.0, 0, 0, 0, 0);
+        chara.status_effects.add_status_effect(
+            persistent,
+            37,
+            0,
+            DEFAULT_GAIN_TEXT_ID,
+            &mut outbox,
+        );
+    }
+    registry
+        .insert(ActorHandle::new(37, ActorKindTag::Player, 200, 37, chara))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: 37,
+            current_zone_id: 200,
+            ..MapSession::default()
+        })
+        .await;
+    let (tx, _rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(37, ClientHandle::new(37, tx)).await;
+
+    let processor = crate::processor::PacketProcessor {
+        db,
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: Some(lua),
+        cmd: None,
+    };
+    let handle = registry.get(37).await.unwrap();
+
+    // apply_login_lua_command(DoZoneChange) goes all the way through
+    // send_zone_in_bundle which depends on extensive zone/session/db
+    // fixtures we don't seed here — bound it with a short timeout so
+    // the test exits regardless. The LOSE_ON_ZONING purge happens early
+    // in apply_do_zone_change (right after the migration), so the
+    // post-state assertions are valid even if send_zone_in_bundle
+    // never returns under the test fixture.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        processor.apply_login_lua_command(
+            &handle,
+            LuaCommand::DoZoneChange {
+                player_id: 37,
+                zone_id: 210,
+                private_area: None,
+                private_area_type: 0,
+                spawn_type: 2,
+                x: 100.0,
+                y: 0.0,
+                z: 100.0,
+                rotation: 0.0,
+            },
+        ),
+    )
+    .await;
+
+    let c = registry.get(37).await.unwrap().character.read().await.clone();
+    assert!(
+        !c.status_effects.has(STATUS_POISON),
+        "LOSE_ON_ZONING effect should be purged on zone change",
+    );
+    assert!(
+        c.status_effects.has(STATUS_RAMPART),
+        "non-LOSE_ON_ZONING effect should survive zone change",
+    );
+    assert_eq!(c.base.zone_id, 210, "zone id should reflect the destination");
+}
+
+#[tokio::test]
+async fn quitgame_purges_lose_on_logout_status_effects() {
+    use crate::actor::Character;
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaCommandKind as LuaCommand;
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
+    use crate::status::ids::STATUS_POISON;
+    use crate::status::{
+        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
+    };
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let lua = Arc::new(crate::lua::LuaEngine::new("/nonexistent"));
+
+    let mut chara = Character::new(36);
+    {
+        let mut outbox = StatusOutbox::new();
+        let mut eff = StatusEffect::new(36, STATUS_POISON, 1.0, 0, 0, 0, 0);
+        eff.flags = StatusEffectFlags::LOSE_ON_LOGOUT;
+        chara
+            .status_effects
+            .add_status_effect(eff, 36, 0, DEFAULT_GAIN_TEXT_ID, &mut outbox);
+    }
+    registry
+        .insert(ActorHandle::new(36, ActorKindTag::Player, 200, 36, chara))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: 36,
+            current_zone_id: 200,
+            ..MapSession::default()
+        })
+        .await;
+    let (tx, _rx) = mpsc::channel::<Vec<u8>>(8);
+    world.register_client(36, ClientHandle::new(36, tx)).await;
+
+    let processor = crate::processor::PacketProcessor {
+        db,
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: Some(lua),
+        cmd: None,
+    };
+    let handle = registry.get(36).await.unwrap();
+
+    processor
+        .apply_login_lua_command(&handle, LuaCommand::QuitGame { player_id: 36 })
+        .await;
+
+    let c = registry.get(36).await.unwrap().character.read().await.clone();
+    assert!(
+        !c.status_effects.has(STATUS_POISON),
+        "QuitGame mirrors Logout for LOSE_ON_LOGOUT cleanup",
     );
 }
 
