@@ -11,3 +11,5 @@ Cargo.lock
 *.sqlite
 *.sqlite3
 /data-backups/
+.claude/
+/config/
