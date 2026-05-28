@@ -2352,9 +2352,26 @@ impl UserData for LuaPlayer {
                     // Sourced from `gamedata_quests.id` rows for the
                     // matching `className` column.
                     match name.as_ref() {
-                        "Man0g0" => 110001,
-                        "Man0l0" => 110002,
-                        "Man0u0" => 110003,
+                        // Quest ids are the `Id:` headers in
+                        // scripts/lua/quests/man/man0X0.lua and match
+                        // OpeningDirector.lua's HasQuest() gates:
+                        //   man0l0 (Limsa)    = 110001
+                        //   man0g0 (Gridania) = 110005
+                        //   man0u0 (Ul'dah)   = 110009
+                        // The previous 110001/110002/110003 table was
+                        // wrong on all three: `GetQuest("Man0g0")`
+                        // returned 110001, so QuestDirectorMan0g001's
+                        // onEventStarted delegated processTtrBtl001 with
+                        // quest actor 0xA0F1ADB1 (man0l0) instead of
+                        // 0xA0F1ADB5 (man0g0). The Gridania player doesn't
+                        // hold 110001, so the client couldn't resolve the
+                        // quest, the combat-tutorial cinematic never ran,
+                        // and the SEQ_005 content warp hung at "Now
+                        // Loading" (packetlogs/map-packets.log 2026-05-28,
+                        // RunEventFunction at the content-director kick).
+                        "Man0l0" => 110001,
+                        "Man0g0" => 110005,
+                        "Man0u0" => 110009,
                         other => {
                             // Lenient fallback: search snapshot for any
                             // active quest with this exact name (case-
