@@ -1845,6 +1845,7 @@ impl PacketProcessor {
                     area_class_path: area_class_path.clone(),
                     director_name: director_name.clone(),
                     director_actor_id,
+                    content_area_actor_id,
                     content_script: content_script.clone(),
                 });
             self.world.upsert_session(snap).await;

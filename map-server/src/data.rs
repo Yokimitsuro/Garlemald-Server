@@ -142,6 +142,13 @@ pub struct ActiveContentScript {
     pub area_class_path: String,
     pub director_name: String,
     pub director_actor_id: u32,
+    /// Actor id of the private-area `AreaMaster` (distinct from the
+    /// content director). `send_zone_in_bundle` presents this as the
+    /// zone-in area master + SetMap target so the 1.x client sees a
+    /// NEW area on the content warp and re-runs its zone-in bootstrap.
+    /// Without it the same-zone warp keeps zone 166's area master and
+    /// the client never completes loading (SEQ_005 "Now Loading" hang).
+    pub content_area_actor_id: u32,
     /// Script name (e.g. `"SimpleContent30010"`); resolves to
     /// `scripts/lua/content/<name>.lua`.
     pub content_script: String,

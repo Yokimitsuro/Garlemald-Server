@@ -1268,7 +1268,7 @@ impl WorldManager {
                 c.chara.gc_rank_uldah,
             )
         };
-        let (zone_actor_id, region_id, bgm_day, zone_name, zone_class_path, zone_class_name) = {
+        let (mut zone_actor_id, region_id, bgm_day, mut zone_name, mut zone_class_path, mut zone_class_name) = {
             let z = zone_arc.read().await;
             (
                 z.core.actor_id,
@@ -1279,6 +1279,47 @@ impl WorldManager {
                 z.core.class_name.clone(),
             )
         };
+
+        // SEQ-005 content-warp fix: when the player is being zoned into
+        // a scripted content area (the combat-tutorial private instance),
+        // present the PRIVATE AREA's master + SetMap target instead of
+        // the parent zone's. A `DoZoneChangeContent` keeps the player in
+        // the parent zone (`current_zone_id == parent_zone_id`, same map
+        // geometry — `region_id` is left untouched), so without this the
+        // bundle re-emits zone 166's area master with the SAME
+        // `zone_actor_id`. The 1.x client compares the SetMap area id
+        // against the one it already has, sees no change, and never
+        // re-runs its zone-in bootstrap — so it never echoes the
+        // `RX 0x0007` zone-in-complete and hangs forever on "Now
+        // Loading" (the cross-zone `DoZoneChange` path works precisely
+        // because it changes `zone_actor_id`). Overriding the area
+        // master to the private area's distinct actor id + class
+        // (`/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent`)
+        // makes the client treat it as a new area instance, re-bootstrap
+        // the AreaBase, and complete the warp. The guard
+        // `current_zone_id == parent_zone_id` scopes this to the in-zone
+        // content warp; the content-exit `DoZoneChange` (to a different
+        // zone) falls through to the normal path.
+        if let Some(active) = session.active_content_script.as_ref()
+            && session.current_zone_id == active.parent_zone_id
+        {
+            zone_actor_id = active.content_area_actor_id;
+            zone_name = active.area_name.clone();
+            zone_class_path = active.area_class_path.clone();
+            zone_class_name = active
+                .area_class_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&active.area_class_path)
+                .to_string();
+            tracing::info!(
+                session = session_id,
+                area = %active.area_name,
+                area_master = format!("0x{:08X}", active.content_area_actor_id),
+                class = %active.area_class_path,
+                "send_zone_in_bundle: presenting content private-area master (SEQ-005 content warp)",
+            );
+        }
 
         // The "script-bind" for the player — mirrors
         // `Map Server/Actors/Chara/Player/Player.cs` `CreateScriptBindPacket`

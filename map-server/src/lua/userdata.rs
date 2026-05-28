@@ -3166,12 +3166,19 @@ impl UserData for LuaZone {
                     /* director_local_id */ 1,
                 );
                 // Content area gets its own actor id sharing the
-                // director's encoding. `+ 0x80000` pushes it into a
-                // high local-id band so it doesn't collide with normal
-                // directors. Synthetic but stable across calls.
+                // director's encoding. The encoded local-id field is
+                // 19 bits (`& 0x7FFFF`), so the director's local-id 1
+                // and a `0x80000 | 1` would both collapse to the same
+                // wire id — they MUST differ because the private-area
+                // AreaMaster (this id) and the content director
+                // (director_actor_id) are spawned as separate actors on
+                // the same client. Use a high in-range local-id band
+                // (0x40000) that survives the mask and won't collide
+                // with normal sequential directors. Synthetic but
+                // stable across calls.
                 let content_area_actor_id = crate::director::director::encode_director_actor_id(
                     parent_zone_id,
-                    0x80000 | 1,
+                    0x40000,
                 );
                 // Extract the player's actor id from the first arg so
                 // the runtime handler can look up the player snapshot
