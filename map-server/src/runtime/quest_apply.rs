@@ -2734,36 +2734,47 @@ pub async fn apply_quest_on_notice(
         // post-`callClientFunction` lines in the hook (the EndEvent
         // and UpdateENPCs calls) run in the same drain pass. Re-drain
         // anything those produce.
-        if let Some(after) =
-            lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
-        {
-            if !after.is_empty() {
-                let session_after = {
-                    let c = handle.character.read().await;
-                    c.event_session.clone()
-                };
-                let mut outbox = crate::event::outbox::EventOutbox::new();
-                crate::event::lua_bridge::translate_lua_commands_into_outbox(
-                    &after,
-                    &session_after,
-                    &mut outbox,
-                );
-                for e in outbox.drain() {
-                    Box::pin(crate::event::dispatcher::dispatch_event_event(
-                        &e,
-                        registry,
-                        world,
-                        db,
-                        Some(lua),
-                    ))
-                    .await;
-                }
-                Box::pin(apply_runtime_lua_commands(
-                    after, registry, db, world, Some(lua),
-                ))
-                .await;
-            }
-        }
+        // Do NOT auto-resume the parked `_WAIT_EVENT` coroutine here.
+        //
+        // The opening hook (`man0g0.lua::onNotice` and siblings) is:
+        //   callClientFunction(... "processTtrNomal001withHQ")  -- RunEventFunction (already sent above)
+        //   player:EndEvent()                                   -- 0x0131
+        //   quest:UpdateENPCs()
+        // `callClientFunction` yields on `_WAIT_EVENT`, so only the
+        // RunEventFunction was produced in the first drain (already
+        // dispatched). The `EndEvent` + `UpdateENPCs` are still parked
+        // behind the yield.
+        //
+        // A previous version force-resumed the coroutine right here, which
+        // pushed the `EndEvent` onto the wire ~0ms after the
+        // RunEventFunction — *while the cinematic is still playing*.
+        // Packet-log evidence (packetlogs/map-packets.log, 2026-05-28
+        // Gridania repro):
+        //   07:13:03.874 OUT RunEventFunction processTtrNomal001withHQ owner=0x65300002
+        //   07:13:03.874 OUT EndEvent          "noticeEvent"           owner=0x00000000
+        // That premature EndEvent (also with owner=0, since
+        // current_event_owner was already cleared) tears down the
+        // client's event session mid-cutscene; when the cinematic then
+        // marshals its own outbound EventUpdate (0x012E) the event owner
+        // resolves to NULL. Native Windows faults
+        // (c0000005 @ ffxivgame+0x492550); Wine tolerates the NULL read,
+        // which is why macOS plays the cinematic through and Windows
+        // crashed at the journal-tutorial step.
+        //
+        // The correct flow: leave the coroutine PARKED. The 1.x client
+        // sends a `0x012E EventUpdate` when the cinematic reaches its
+        // server-sync point (confirmed in the working macOS capture
+        // packetlogs/map-packets_mac.log — first client EventUpdate
+        // ~64s after the kickoff). `handle_event_update` →
+        // `EventSession::update_event` → `dispatch_event_updated_drain`
+        // then resumes this coroutine and emits the `EndEvent` +
+        // `UpdateENPCs` at the right time — after the cinematic, so the
+        // EventUpdate was built against an OPEN event (no NULL owner, no
+        // crash), and the deferred EndEvent closes the event so the
+        // player leaves event-mode and can move (WASD) again.
+        //
+        // (The earlier "client never sends EventUpdate, must force-resume"
+        // assumption was wrong — the macOS capture shows it does.)
     }
 }
 
