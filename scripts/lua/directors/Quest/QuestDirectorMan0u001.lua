@@ -11,7 +11,35 @@ function init()
 	return "/Director/Quest/QuestDirectorMan0u001";
 end
 
-function onEventStarted(player, actor, triggerName)	
+-- Ported from pmeteor quest_system/QuestDirectorMan0u001.lua lines 15-33.
+-- Spawns the Ul'dah opener's tutorial NPCs (Niellefresne ally, Thancred
+-- ally — Thancred starts in MainState 2 / engaged so he renders standing
+-- like Yda does in the Gridania flow — and the lone training mob) plus
+-- the openingStoper event-trigger actor, then registers all of them in
+-- the content group so they appear in the client's content-group panel.
+-- Without this hook the Ul'dah opener's content area is empty: the
+-- player warps in to an arena with no allies / no enemy and the
+-- tutorial event has nothing to drive.
+function onCreateContentArea(players, director, contentArea, contentGroup)
+	niellefresne = contentArea:SpawnActor(2290003, "niellefresne", -11.86, 192, 35.06, -0.8);
+	thancred = contentArea:SpawnActor(2290004, "thancred", -26.41, 192, 39.52, 1.2);
+	thancred:ChangeState(2);
+
+	mob1 = contentArea:SpawnActor(2203301, "mob1", -6.193, 192, 47.658, -2.224);
+
+	openingStoper = contentArea:SpawnActor(1090385, "openingstoper", -24.34, 192, 34.22, 0);
+
+	for _, player in pairs(players) do
+		contentGroup:AddMember(player);
+	end;
+
+	contentGroup:AddMember(director);
+	contentGroup:AddMember(niellefresne);
+	contentGroup:AddMember(thancred);
+	contentGroup:AddMember(mob1);
+end
+
+function onEventStarted(player, actor, triggerName)
 
 	man0u0Quest = player:GetQuest("Man0u0");
 	startTutorialMode(player);
@@ -56,9 +84,9 @@ function onEventStarted(player, actor, triggerName)
 		OpenWidget (DEFEAT ENEMY)			
 	]]
 	
-	man0u0Quest:NextPhase(10);	
-	player:EndEvent();	
-	
+	man0u0Quest:StartSequence(10); -- aligned with pmeteor (was NextPhase)
+	player:EndEvent();
+
 	player:GetZone():ContentFinished();
 	GetWorldManager():DoZoneChange(player, 175, "PrivateAreaMasterPast", 3, 15, -22.81, 196, 87.82, 2.98);
 end

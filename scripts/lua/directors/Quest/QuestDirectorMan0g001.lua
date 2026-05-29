@@ -11,108 +11,83 @@ function init()
 end
 
 function onCreateContentArea(players, director, contentArea, contentGroup)
+	-- Per pmeteor quest_system QuestDirectorMan0g001.lua: register the
+	-- player + director + content NPCs into the CONTENT GROUP so they
+	-- appear in the client's content-group / party panel (Yda + Papalymo
+	-- visible as group members in the retail screenshot). The actors
+	-- themselves are spawned by SimpleContent30010.onCreate before this
+	-- hook runs.
+	for _, player in pairs(players) do
+		contentGroup:AddMember(player);
+	end;
+	contentGroup:AddMember(director);
+	if yda       ~= nil then contentGroup:AddMember(yda); end
+	if papalymo  ~= nil then contentGroup:AddMember(papalymo); end
+	if mob1      ~= nil then contentGroup:AddMember(mob1); end
+	if mob2      ~= nil then contentGroup:AddMember(mob2); end
+	if mob3      ~= nil then contentGroup:AddMember(mob3); end
 	director:StartContentGroup();
 end
 
 function onEventStarted(player, actor, triggerName)
+	-- Ported from pmeteor quest_system QuestDirectorMan0g001.lua. The
+	-- prior Garlemald port over-engineered this with `waitForSignal`s
+	-- for `playerAttack` / `tpOver1000` / `weaponskillUsed` / 3×`mobkill`
+	-- — none of which are reliably wired/triggerable, so the director
+	-- stalled after the first cinematic. pmeteor's flow is simple: play
+	-- the active-mode cinematic, wait for the player to draw weapon
+	-- (`playerActive`), kick + 2nd cinematic, then drive the rest with
+	-- `wait()`s and tutorial widgets. Garlemald's prior `SetMod
+	-- (MinimumHpLock, 1)` is dropped — pmeteor does not set it and it
+	-- was suspected of affecting state during the active-mode step.
 	man0g0Quest = player:GetQuest("Man0g0");
-	player:SetMod(modifiersGlobal.MinimumHpLock, 1);
-	player:SendMessage(0x20, "", "Starting");
 	startTutorialMode(player);
-	callClientFunction(player, "delegateEvent", player, man0g0Quest, "processTtrBtl001", nil, nil, nil);
-	player:EndEvent();
-	player:SendMessage(0x20, "", "Waiting for player active");
-	waitForSignal("playerActive");
-	player:SendMessage(0x20, "", "player active");
-	wait(1); --If this isn't here, the scripts bugs out. TODO: Find a better alternative.
-	kickEventContinue(player, actor, "noticeEvent", "noticeEvent");	
-	callClientFunction(player, "delegateEvent", player, man0g0Quest, "processTtrBtl002", nil, nil, nil);
-	player:SendMessage(0x20, "", "processTtrBtl002 called");
-	player:EndEvent();
 
-	--Combat portion of tutorial
-	
 	if player:IsDiscipleOfWar() then
-		player:SendMessage(0x20, "", "Is DoW");
-		waitForSignal("playerAttack");
+		callClientFunction(player, "delegateEvent", player, man0g0Quest, "processTtrBtl001");
+		player:EndEvent();
+		waitForSignal("playerActive");
+		wait(1); -- pmeteor note: "If this isn't here, the scripts bugs out"
+		kickEventContinue(player, actor, "noticeEvent", "noticeEvent");
+		callClientFunction(player, "delegateEvent", player, man0g0Quest, "processTtrBtl002", nil, nil, nil);
+		player:EndEvent();
+
 		closeTutorialWidget(player);
-		showTutorialSuccessWidget(player, 9055); --Open TutorialSuccessWidget for attacking enemy
+		showTutorialSuccessWidget(player, 9055); -- attacking-enemy success
 		openTutorialWidget(player, CONTROLLER_KEYBOARD, TUTORIAL_TP);
-		waitForSignal("tpOver1000");
-		player:SetMod(modifiersGlobal.MinimumTpLock, 1000);
+		wait(3);
 		closeTutorialWidget(player);
 		openTutorialWidget(player, CONTROLLER_KEYBOARD, TUTORIAL_WEAPONSKILLS);
-		waitForSignal("weaponskillUsed");
-		player:SetMod(modifiersGlobal.MinimumTpLock, 0);
+		wait(3);
 		closeTutorialWidget(player);
-		showTutorialSuccessWidget(player, 9065); --Open TutorialSuccessWidget for weapon skill
+		showTutorialSuccessWidget(player, 9065); -- weapon-skill success
 	elseif player:IsDiscipleOfMagic() then
-		player:SendMessage(0x20, "", "Is DoM");
-		openTutorialWidget(player, CONTROLLER_KEYBOARD, TUTORIAL_CASTING);
-		waitForSignal("spellUsed");
+		callClientFunction(player, "delegateEvent", player, man0g0Quest, "processTtrBtlMagic001");
+		player:EndEvent();
+		wait(1);
+		kickEventContinue(player, actor, "noticeEvent", "noticeEvent");
 		closeTutorialWidget(player);
-	elseif player:IsDiscipleOfHand() then
-		waitForSignal("abilityUsed");
-	elseif player:IsDiscipleOfLand() then
-		waitForSignal("abilityUsed");
+		showTutorialSuccessWidget(player, 9050);
+		wait(1);
+		openTutorialWidget(player, CONTROLLER_KEYBOARD, TUTORIAL_DEFEATENEMY);
+		wait(3);
+		closeTutorialWidget(player);
 	end
-	
-	player:SendMessage(0x20, "", "Waiting for mobkill1");
-	waitForSignal("mobkill"); --Should be wait for mobkill
-	player:SendMessage(0x20, "", "Waiting for mobkill2");
-	waitForSignal("mobkill");
-	player:SendMessage(0x20, "", "Waiting for mobkill3");
-	waitForSignal("mobkill");
-	worldMaster = GetWorldMaster();
-	player:SetMod(modifiersGlobal.MinimumHpLock, 0);
-	player:SendMessage(0x20, "", "Sending data packet 'attention'");
-	player:SendDataPacket("attention", worldMaster, "", 51073, 2);
-	wait(5);
-	player:SendMessage(0x20, "", "Disengaging");
-	player:Disengage(0x0000);
-	wait(5);
-	player:SendMessage(0x20, "", "NextPhase(10)");
-	man0g0Quest:NextPhase(10);	
-	wait(5);
-	player:SendMessage(0x20, "", "ProcessEvent020_1");
-	callClientFunction(player, "delegateEvent", player, man0g0Quest, "processEvent020_1", nil, nil, nil);
 
-	wait(5);
-	
-	player:SendMessage(0x20, "", "Changing music");
+	wait(3);
+	worldMaster = GetWorldMaster();
+	player:SendDataPacket("attention", worldMaster, "", 51073, 2);
+	wait(7);
 	player:ChangeMusic(7);
-	wait(5);
-	
-	player:SendMessage(0x20, "", "Kick notice event");
-	kickEventContinue(player, actor, "noticeEvent", "noticeEvent");
-	wait(5);
-	
-	player:SendMessage(0x20, "", "ContentFinished");
-	player:GetZone():ContentFinished();	
-	wait(5);
-	player:SendMessage(0x20, "", "Remove from party");
-	player:RemoveFromCurrentPartyAndCleanup();
-    --player:EndEvent();
-    --GetWorldManager():DoZoneChange(player, 155, "PrivateAreaMasterPast", 1, 15, 175.38, -1.21, -1156.51, -2.1);
-	--[[
-	IF DoW:
-		OpenWidget (TP)
-		IF TP REACHED:
-			CloseWidget
-			OpenWidget (WS)
-		IF WS USED:
-			Success
-			CloseWidget
-	ELSE MAGIC:
-		OpenWidget (DEFEAT ENEMY)
-	]]
-	
-	player:EndEvent();	
-	
-	wait(5);
-	player:SendMessage(0x20, "", "Zone change");
+	player:ChangeState(0);
+
+	callClientFunction(player, "delegateEvent", player, man0g0Quest, "processEvent020_1");
+	man0g0Quest:StartSequence(10);
+
+	player:EndEvent();
+	player:GetZone():ContentFinished();
 	GetWorldManager():DoZoneChange(player, 155, "PrivateAreaMasterPast", 1, 15, 175.38, -1.21, -1156.51, -2.1);
-	
+	player:EndEvent();
 end
 
 function onUpdate(deltaTime, area)

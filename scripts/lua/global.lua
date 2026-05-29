@@ -40,6 +40,7 @@ MESSAGE_TYPE_URGENT_MESSAGE = 28;
 MESSAGE_TYPE_GENERAL_INFO   = 29;
 MESSAGE_TYPE_SYSTEM         = 32;
 MESSAGE_TYPE_SYSTEM_ERROR   = 33;
+MESSAGE_TYPE_NPC_LINKSHELL  = 39;
 
 -- INVENTORY
 INVENTORY_NORMAL = 0x0000; --Max 0xC8
@@ -145,6 +146,28 @@ SPAWN_CHOCOBO_GET = 0x13;
 SPAWN_CHOCOBO_RENTAL = 0x14;
 SPAWN_CUTTER_SANDS = 0x17;
 SPAWN_NIGHTMARE = 0x18;
+
+-- EVENT TYPES (pmeteor quest_system parity)
+-- Used as the 3rd arg to onEventStarted in command/quest scripts and
+-- the C# `EventStartPacket::eventType` field. Numeric values from
+-- pmeteor `Data/scripts/global.lua` lines 144-148. KEEP ALIGNED with
+-- `LuaEventType` in map-server/src/lua/event_type.rs if/when that
+-- enum is introduced server-side.
+ETYPE_COMMAND = 0;
+ETYPE_TALK    = 1;
+ETYPE_PUSH    = 2;
+ETYPE_EMOTE   = 3;
+ETYPE_NOTICE  = 5;
+
+-- MUSIC PLAY MODES / CHANNELS (pmeteor quest_system parity)
+-- Args to ChangeMusic / SetMusic native bindings. Numeric values from
+-- pmeteor `Data/scripts/global.lua` lines 151-156.
+MUSIC_IMMEDIATE      = 1;
+MUSIC_CROSSFADE      = 2;
+MUSIC_LAYER          = 3;
+MUSIC_FADEIN         = 4;
+MUSIC_NORMAL_CHANNEL = 5;
+MUSIC_BATTLE_CHANNEL = 6;
 
 --UTILS
 
