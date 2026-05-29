@@ -1268,7 +1268,7 @@ impl WorldManager {
                 c.chara.gc_rank_uldah,
             )
         };
-        let (mut zone_actor_id, region_id, bgm_day, mut zone_name, mut zone_class_path, mut zone_class_name) = {
+        let (zone_actor_id, mut region_id, bgm_day, zone_name, zone_class_path, zone_class_name) = {
             let z = zone_arc.read().await;
             (
                 z.core.actor_id,
@@ -1280,44 +1280,47 @@ impl WorldManager {
             )
         };
 
-        // SEQ-005 content-warp fix: when the player is being zoned into
-        // a scripted content area (the combat-tutorial private instance),
-        // present the PRIVATE AREA's master + SetMap target instead of
-        // the parent zone's. A `DoZoneChangeContent` keeps the player in
-        // the parent zone (`current_zone_id == parent_zone_id`, same map
-        // geometry — `region_id` is left untouched), so without this the
-        // bundle re-emits zone 166's area master with the SAME
-        // `zone_actor_id`. The 1.x client compares the SetMap area id
-        // against the one it already has, sees no change, and never
-        // re-runs its zone-in bootstrap — so it never echoes the
-        // `RX 0x0007` zone-in-complete and hangs forever on "Now
-        // Loading" (the cross-zone `DoZoneChange` path works precisely
-        // because it changes `zone_actor_id`). Overriding the area
-        // master to the private area's distinct actor id + class
-        // (`/Area/PrivateArea/Content/PrivateAreaMasterSimpleContent`)
-        // makes the client treat it as a new area instance, re-bootstrap
-        // the AreaBase, and complete the warp. The guard
-        // `current_zone_id == parent_zone_id` scopes this to the in-zone
-        // content warp; the content-exit `DoZoneChange` (to a different
-        // zone) falls through to the normal path.
+        // SEQ-005 content-warp — instance-region encoding (THE FIX).
+        //
+        // A `DoZoneChangeContent` keeps the player in the parent zone's
+        // geometry (here fst0Battle03 / region 106), but the 1.x client only
+        // COMPLETES a zone-in (echoes 0x0007, clears "Now Loading", then runs
+        // the director event) when the SetMap region differs from the
+        // currently-loaded region. Same-region = early-return in the SetMap
+        // handler (ZoneClient_handleMapOpcode_SetMap0x05_reloadDecision @
+        // 0x59ced0) = no reload = infinite "Now Loading".
+        //
+        // Key insight from the reload executor (FUN_0059e3c0, confirmed at
+        // runtime): the reload DECISION compares the full 32-bit region
+        // against [+0x94], but the geometry/scene key uses only the LOW 16
+        // BITS of the region:
+        //     scene_key = (uint16)region | (layout << 16)
+        // So setting the high 16 bits of the region makes it differ from the
+        // parent (106) — triggering the reload + full completion — while the
+        // low 16 bits (106) still select the correct fst0Battle geometry.
+        // This is exactly how a content INSTANCE differs from its public
+        // parent: same low-16 region (geometry), distinct high-16 (instance).
+        //
+        // The diagnostic with region=105 proved (a) a region change makes the
+        // warp complete (cinematic played, quest advanced) and (b) geometry
+        // is keyed by the region's low 16 bits (105 -> Mor Dhona). Encoding
+        // 106 | 0x10000 keeps the geometry (low-16 = 106) and forces the
+        // reload (full = 0x1006A != 106). `zone_actor_id`/name/class are left
+        // at the parent's (the d4a1fd1 override to the content master
+        // 0x65340002 fed a non-zone id and is intentionally dropped).
+        const CONTENT_INSTANCE_REGION_TAG: u32 = 0x0001_0000;
         if let Some(active) = session.active_content_script.as_ref()
             && session.current_zone_id == active.parent_zone_id
         {
-            zone_actor_id = active.content_area_actor_id;
-            zone_name = active.area_name.clone();
-            zone_class_path = active.area_class_path.clone();
-            zone_class_name = active
-                .area_class_path
-                .rsplit('/')
-                .next()
-                .unwrap_or(&active.area_class_path)
-                .to_string();
+            let parent_region = region_id;
+            region_id = (parent_region & 0xFFFF) | CONTENT_INSTANCE_REGION_TAG;
             tracing::info!(
                 session = session_id,
                 area = %active.area_name,
-                area_master = format!("0x{:08X}", active.content_area_actor_id),
-                class = %active.area_class_path,
-                "send_zone_in_bundle: presenting content private-area master (SEQ-005 content warp)",
+                parent_region,
+                instance_region = format!("0x{:X}", region_id),
+                zone_actor_id = format!("0x{:08X}", zone_actor_id),
+                "send_zone_in_bundle: content warp — instance-region encoding (low16=geometry, high16=instance)",
             );
         }
 

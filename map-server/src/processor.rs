@@ -3113,110 +3113,33 @@ impl PacketProcessor {
             }
         }
 
-        // Server-side cinematic kickoff fallback.
+        // NO server-side cinematic kickoff here (removed).
         //
-        // In pmeteor's reference capture, the client autonomously sends
-        // IN 0x012D EventStart for the content director ~2 seconds
-        // post-warp (target=director_actor_id, event_name="noticeEvent",
-        // event_type=5), which the server routes through
-        // `dispatch_event_start_to_content_director` → fires
-        // `onEventStarted` → emits OUT 0x0130 `callClientFunction
-        // "delegateEvent processTtrBtl001"` = the cinematic body.
+        // Packet-log evidence (packetlogs/map-packets.log, the region-103
+        // reload diagnostic) settled this: once the warp actually
+        // completes, the client DOES autonomously post
+        // `IN 0x012D EventStart` for the content director 0x65300003
+        // (event_name="noticeEvent") ~5s post-warp ([904] in that capture).
+        // The prior "client never fires EventStart" belief was from runs
+        // where the warp never completed.
         //
-        // Across 9+ smoke runs even after fixing the kick wire format
-        // (f4e2422), content-trio opcode (dbcc19a), pre-warp packet
-        // count, IN 0x0133 dispatcher (d9896de), 0x017A property-entry
-        // type (bf6e836), and contentArea:SpawnActor + actor-id
-        // mismatch (f411c05 + 53d8b58), garlemald's client STILL never
-        // fires that autonomous IN 0x012D for director. The exact
-        // client-side gate is some receiver-state primer that the
-        // Phase 9 #8a investigation couldn't fully pin down without
-        // runtime decompiler tracing.
+        // The previous workaround dispatched the director's
+        // `onEventStarted` HERE, mid-warp — which emitted the cinematic
+        // `RunEventFunction (delegateEvent processTtrBtl001)` at warp time
+        // ([889] @ 12:30:15.6), ~5s BEFORE the client was ready. The
+        // still-loading client dropped it; and because the director
+        // coroutine was now parked past its `callClientFunction` +
+        // `player:EndEvent()`, the client's REAL EventStart ([904] @
+        // 12:30:20.5) merely RESUMED the parked coroutine → straight to
+        // `EndEvent` ([905]) with no cinematic body. Net: the cinematic
+        // fired into the void and the ready client only ever saw EndEvent.
         //
-        // Workaround: explicitly run the director's `onEventStarted`
-        // here after the warp completes. This mirrors what pmeteor's
-        // engine produces implicitly when the client's autonomous
-        // EventStart arrives. The `dispatch_event_start_to_content_
-        // director` function already exists for the
-        // handle_event_start path; call it directly with the SEQ_005
-        // kick params (event_name=noticeEvent, event_type=5,
-        // lua_params=[True] matching the kick body).
-        //
-        // The director's onEventStarted body:
-        //   - callClientFunction("delegateEvent processTtrBtl001") →
-        //     OUT 0x0130 RunEventFunction (the cinematic body)
-        //   - player:EndEvent() → OUT 0x0131 EndEvent
-        //   - waitForSignal("playerActive") — parks the coroutine here;
-        //     resumed when the player triggers the active signal post-
-        //     cinematic (player active mode)
-        if let Some(active) = self
-            .world
-            .session(session_id)
-            .await
-            .and_then(|s| s.active_content_script)
-        {
-            let director_actor_id = active.director_actor_id;
-
-            // Synchronise the player's `EventSession` to the synthetic
-            // EventStart we're about to dispatch. The normal
-            // `handle_event_start` path (processor.rs:7000) calls
-            // `chara.event_session.start_event(...)` before dispatching,
-            // which populates `current_event_owner` / `current_event_name`
-            // / `current_event_type`. Those fields are what
-            // `dispatch_event_start_to_content_director` snapshots
-            // (line ~7235) and threads through
-            // `translate_lua_commands_into_outbox` to fill in the
-            // `RunEventFunction` packet's target+event_name+event_type
-            // bytes.
-            //
-            // Without this update, the session still reflects the
-            // player's PREVIOUS EventStart (typically `talkDefault` on
-            // the Yda zone NPC — target=0x45300001, event_type=1), and
-            // the cinematic OUT 0x0130 lands on the wire addressed to
-            // the wrong event. The 1.x client silently drops the
-            // function call and the cinematic never plays.
-            //
-            // We assign the fields directly rather than calling
-            // `start_event` because `start_event` would push an
-            // `EventStarted` event into the outbox; dispatching that
-            // would re-run the director's `onEventStarted` hook (the
-            // exact thing `dispatch_event_start_to_content_director` is
-            // about to do). The hook would run twice and emit two
-            // cinematic bodies.
-            {
-                let mut chara = handle.character.write().await;
-                chara.event_session.current_event_owner = director_actor_id;
-                chara.event_session.current_event_name = "noticeEvent".to_string();
-                chara.event_session.current_event_type = 5;
-            }
-
-            self.dispatch_event_start_to_content_director(
-                &handle,
-                session_id,
-                director_actor_id,
-                /* event_name  */ "noticeEvent".to_string(),
-                /* event_type  */ 5,
-                /* lua_params  */ vec![common::luaparam::LuaParam::True],
-            )
-            .await;
-            tracing::info!(
-                player = player_id,
-                director = format!("0x{:08X}", director_actor_id),
-                "DoZoneChangeContent: server-side cinematic kickoff (synthetic noticeEvent EventStart)",
-            );
-
-            // NOTE: the quest's `onNotice` (the `processTtrNomal001withHQ`
-            // cinematic + notice `EndEvent`) is NOT fired here. Packet-diff
-            // against captures/pmeteor-quest/20260426-160210-gridania-manual3
-            // shows the 1.x client does not post EventStart(type=5) for the
-            // content director post-warp — it posts EventStart(type=101,
-            // "talkDefault") on the content NPC, and pmeteor fires onNotice in
-            // RESPONSE to that (OUT RunEventFunction event_name="noticeEvent"
-            // ~2s later). Firing onNotice here (during the warp, before the
-            // client opens the event) sent the cinematic too early and the
-            // client dropped it. The real fire-point is the type-101 arm in
-            // `handle_event_start`.
-        }
+        // Fix: do nothing at warp time. Let the client's real EventStart
+        // flow through `handle_event_start` →
+        // `dispatch_event_start_to_content_director`, which does a FRESH
+        // `onEventStarted` dispatch (no parked coroutine to resume) and so
+        // emits the cinematic `RunEventFunction` at [904] time, when the
+        // client is actually ready to render it.
 
         tracing::info!(
             player = player_id,
@@ -3225,7 +3148,7 @@ impl PacketProcessor {
             x,
             y,
             z,
-            "DoZoneChangeContent applied (B7: warp + zone-in replay + onZoneIn fired + coroutine resume + cinematic kickoff)",
+            "DoZoneChangeContent applied (warp + zone-in replay; cinematic deferred to client EventStart)",
         );
     }
 
