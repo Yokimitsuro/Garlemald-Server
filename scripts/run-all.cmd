@@ -30,6 +30,12 @@ if errorlevel 1 exit /b 1
 
 if not exist "%REPO_ROOT%\logs" mkdir "%REPO_ROOT%\logs"
 
+rem Default the packet-log directory under .\logs and ensure it exists. set (under
+rem the active setlocal) is inherited by the child servers launched below, matching
+rem run-all.sh's exported default; an externally preset value is left untouched.
+if not defined GARLEMALD_PACKET_LOG_DIR set "GARLEMALD_PACKET_LOG_DIR=%REPO_ROOT%\logs\packet-logs"
+if not exist "%GARLEMALD_PACKET_LOG_DIR%" mkdir "%GARLEMALD_PACKET_LOG_DIR%"
+
 rem Web first (so signup is reachable before the rest of the stack is warm),
 rem then lobby / world / map. The processes are independent -- no startup
 rem barrier is required between them.
