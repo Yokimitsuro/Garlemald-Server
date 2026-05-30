@@ -25,6 +25,8 @@ say "Building workspace ($profile)"
 cargo build --workspace $flag
 
 mkdir -p "$REPO_ROOT/logs"
+export GARLEMALD_PACKET_LOG_DIR="${GARLEMALD_PACKET_LOG_DIR:-$REPO_ROOT/logs/packet-logs}"
+mkdir -p "$GARLEMALD_PACKET_LOG_DIR"
 
 pids=()
 cleanup() {
