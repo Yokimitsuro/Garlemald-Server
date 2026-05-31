@@ -988,7 +988,6 @@ mod recalc_tests {
                     damage_power: 18,
                     attack: 5,
                     parry: 3,
-                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1004,7 +1003,6 @@ mod recalc_tests {
                     damage_power: 50,
                     attack: 2,
                     parry: 1,
-                    ..Default::default()
                 }),
                 ..Default::default()
             },
@@ -1152,8 +1150,8 @@ mod minimum_hp_lock_tests {
 
     /// With `MinimumHpLock = 1`, the same lethal damage leaves HP at
     /// 1. This is the combat-tutorial use case
-    /// (`SimpleContent30010.lua::onCreate`): the player can't die
-    /// to the wolves' first hit.
+    ///    (`SimpleContent30010.lua::onCreate`): the player can't die
+    ///    to the wolves' first hit.
     #[test]
     fn set_hp_floor_is_one_with_lock() {
         let mut c = Character::new(1);

@@ -3321,7 +3321,7 @@ pub struct LuaContentArea {
     /// LuaPlayer / LuaActor userdata to the script's onUpdate loop.
     /// Populated by the ticker from `session.transient_director_members`
     /// + the live `ActorRegistry`. Empty for onCreate / quest-hook
-    /// paths that don't need iteration.
+    ///   paths that don't need iteration.
     pub players: Vec<PlayerSnapshot>,
     pub allies: Vec<LuaActor>,
     pub monsters: Vec<LuaActor>,
@@ -3843,6 +3843,7 @@ impl UserData for LuaWorldManager {
         // quest scripts (24 call sites — `man0l1`, `man1g0`, `man2l0`,
         // etc.) to instance the player into a `PrivateAreaMasterPast`
         // replica. Cross-zone flow not wired; logs + skips.
+        #[allow(clippy::type_complexity)]
         methods.add_method(
             "WarpToPrivateArea",
             |_,
@@ -4850,7 +4851,7 @@ impl UserData for LuaQuestHandle {
                 _ => return Ok(()),
             };
             let flag_type = match iter.next() {
-                Some(Value::Integer(i)) => (i.max(0).min(255)) as u8,
+                Some(Value::Integer(i)) => i.clamp(0, 255) as u8,
                 _ => 0,
             };
             fn bool_or(v: Option<Value>, default: bool) -> bool {
@@ -5151,6 +5152,7 @@ impl UserData for LuaRecipeResolver {
         // arg of the closure is the invoking userdata — Lua still passes
         // it through the dot-indexed metamethod lookup; we pull the Arc
         // out of it so callers don't need to supply the resolver again.
+        #[allow(clippy::type_complexity)]
         methods.add_function(
             "GetRecipeFromMats",
             |lua,
@@ -5220,13 +5222,13 @@ impl UserData for LuaRecipeResolver {
             "RecipeToMatIdTable",
             |lua, args: (AnyUserData, Option<AnyUserData>)| {
                 let tbl = lua.create_table()?;
-                if let Some(ud) = args.1 {
-                    if let Ok(recipe) = ud.borrow::<LuaRecipe>() {
-                        for (i, m) in recipe.inner.materials.iter().enumerate() {
-                            tbl.raw_set(i as i64 + 1, *m)?;
-                        }
-                        return Ok(tbl);
+                if let Some(ud) = args.1
+                    && let Ok(recipe) = ud.borrow::<LuaRecipe>()
+                {
+                    for (i, m) in recipe.inner.materials.iter().enumerate() {
+                        tbl.raw_set(i as i64 + 1, *m)?;
                     }
+                    return Ok(tbl);
                 }
                 for i in 0..8 {
                     tbl.raw_set(i as i64 + 1, 0u32)?;
@@ -5265,10 +5267,8 @@ impl UserData for LuaGatherNode {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("GetItemKeys", |lua, this, _: ()| {
             let tbl = lua.create_table()?;
-            let mut i = 1i64;
-            for key in this.inner.active_item_keys() {
+            for (i, key) in (1i64..).zip(this.inner.active_item_keys()) {
                 tbl.raw_set(i, key)?;
-                i += 1;
             }
             Ok(tbl)
         });

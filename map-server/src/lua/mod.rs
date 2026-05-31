@@ -1018,7 +1018,7 @@ impl LuaEngine {
         player_id: u32,
         args: MultiValue,
     ) -> Option<Vec<LuaCommand>> {
-        let Some(parked) = self.scheduler.lock().ok().and_then(|mut s| {
+        let parked = self.scheduler.lock().ok().and_then(|mut s| {
             s.take_event(player_id).or_else(|| {
                 if player_id != 0 {
                     s.take_event(0)
@@ -1026,9 +1026,7 @@ impl LuaEngine {
                     None
                 }
             })
-        }) else {
-            return None;
-        };
+        })?;
         let resume_result = parked.thread.resume::<Value>(args);
         let commands = CommandQueue::drain(&parked.queue);
         if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {
@@ -1876,12 +1874,16 @@ mod tests {
         let dummy_queue = CommandQueue::new();
 
         let mut area = sample_content_area(dummy_queue.clone());
-        let mut p1 = userdata::PlayerSnapshot::default();
-        p1.actor_id = 0x0001;
-        p1.is_engaged = true;
-        let mut p2 = userdata::PlayerSnapshot::default();
-        p2.actor_id = 0x0002;
-        p2.is_engaged = false;
+        let p1 = userdata::PlayerSnapshot {
+            actor_id: 0x0001,
+            is_engaged: true,
+            ..Default::default()
+        };
+        let p2 = userdata::PlayerSnapshot {
+            actor_id: 0x0002,
+            is_engaged: false,
+            ..Default::default()
+        };
         area.players.push(p1);
         area.players.push(p2);
 

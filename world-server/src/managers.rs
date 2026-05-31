@@ -261,10 +261,10 @@ impl LinkshellManager {
         rank: u8,
     ) -> Result<()> {
         db.linkshell_change_rank(ls_id, chara_id, rank).await?;
-        if let Some(ls) = self.cache.lock().await.get_mut(&ls_id) {
-            if let Some(m) = ls.members.iter_mut().find(|m| m.character_id == chara_id) {
-                m.rank = rank;
-            }
+        if let Some(ls) = self.cache.lock().await.get_mut(&ls_id)
+            && let Some(m) = ls.members.iter_mut().find(|m| m.character_id == chara_id)
+        {
+            m.rank = rank;
         }
         Ok(())
     }

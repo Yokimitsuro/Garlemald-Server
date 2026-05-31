@@ -79,6 +79,7 @@ fn encode_group_member_at(data: &mut [u8], slot_offset: usize, m: &GroupMember) 
 ///   0x6C  const               u32  = 0x6D
 ///   0x70  const               u32  = 0x6D
 ///   0x74  member_count        u32
+#[allow(clippy::too_many_arguments)]
 pub fn build_group_header(
     source_actor_id: u32,
     location_code: u64,
@@ -242,6 +243,7 @@ pub fn build_group_members_x64(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_group_members_n(
     source_actor_id: u32,
     location_code: u64,

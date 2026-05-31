@@ -2394,7 +2394,7 @@ async fn equipped_item_param_bonus_lifts_derived_secondary() {
                  VALUES (:cid, :class, :slot, :iid)",
                 named_params! {
                     ":cid": 1_u32,
-                    ":class": crate::gamedata::CLASSID_PUG as u8,
+                    ":class": { crate::gamedata::CLASSID_PUG },
                     ":slot": 3_u16, // SLOT_BODY
                     ":iid": 500_u64,
                 },
@@ -2490,7 +2490,7 @@ async fn hp_change_on_equip_emits_state_bundle_to_self() {
                  VALUES (:cid, :class, :slot, :iid)",
                 named_params! {
                     ":cid": 1_u32,
-                    ":class": crate::gamedata::CLASSID_GLA as u8,
+                    ":class": { crate::gamedata::CLASSID_GLA },
                     ":slot": crate::actor::player::SLOT_BODY,
                     ":iid": 600_u64,
                 },
@@ -2758,7 +2758,7 @@ async fn equipped_mainhand_weapon_populates_modifiers_and_damage() {
                  VALUES (:cid, :class, :slot, :iid)",
                 named_params! {
                     ":cid": 1_u32,
-                    ":class": crate::gamedata::CLASSID_PUG as u8,
+                    ":class": { crate::gamedata::CLASSID_PUG },
                     ":slot": crate::actor::player::SLOT_MAINHAND,
                     ":iid": 501_u64,
                 },
@@ -2954,9 +2954,9 @@ async fn gather_resolver_build_aim_slots_matches_seeded_layout() {
         .expect("aim slots for seeded node");
     // Node 1001 references items 1 (aim 30 → slot 4), 2 (aim 10 → slot 2),
     // 3 (aim 20 → slot 3).
-    assert!(slots[1].empty == false && slots[1].item_key == 2); // Bone Chip
-    assert!(slots[2].empty == false && slots[2].item_key == 3); // Copper Ore
-    assert!(slots[3].empty == false && slots[3].item_key == 1); // Rock Salt
+    assert!(!slots[1].empty && slots[1].item_key == 2); // Bone Chip
+    assert!(!slots[2].empty && slots[2].item_key == 3); // Copper Ore
+    assert!(!slots[3].empty && slots[3].item_key == 1); // Rock Salt
     assert_eq!(slots.iter().filter(|s| !s.empty).count(), 3);
 }
 
@@ -4562,7 +4562,7 @@ async fn chocobo_issue_and_load_round_trip() {
     let (has2, app2, name2): (i64, i64, String) = db
         .conn_for_test()
         .call_db(|c| {
-            Ok(c.query_row(
+            c.query_row(
                 r"SELECT hasChocobo, chocoboAppearance, chocoboName
                   FROM characters_chocobo WHERE characterId = 101",
                 [],
@@ -4573,7 +4573,7 @@ async fn chocobo_issue_and_load_round_trip() {
                         r.get::<_, String>(2)?,
                     ))
                 },
-            )?)
+            )
         })
         .await
         .unwrap();
@@ -4658,7 +4658,7 @@ async fn issue_chocobo_lua_command_mirrors_state() {
     let row: (i64, i64, String) = db
         .conn_for_test()
         .call_db(|c| {
-            Ok(c.query_row(
+            c.query_row(
                 r"SELECT hasChocobo, chocoboAppearance, chocoboName
                   FROM characters_chocobo WHERE characterId = 55",
                 [],
@@ -4669,7 +4669,7 @@ async fn issue_chocobo_lua_command_mirrors_state() {
                         r.get::<_, String>(2)?,
                     ))
                 },
-            )?)
+            )
         })
         .await
         .unwrap();
@@ -7758,7 +7758,7 @@ async fn gc_setters_round_trip() {
     let (gc, l, g, u): (i64, i64, i64, i64) = db
         .conn_for_test()
         .call_db(|c| {
-            Ok(c.query_row(
+            c.query_row(
                 r"SELECT gcCurrent, gcLimsaRank, gcGridaniaRank, gcUldahRank
                   FROM characters WHERE id = 401",
                 [],
@@ -7770,7 +7770,7 @@ async fn gc_setters_round_trip() {
                         r.get::<_, i64>(3)?,
                     ))
                 },
-            )?)
+            )
         })
         .await
         .unwrap();
@@ -7932,11 +7932,11 @@ async fn join_gc_sets_chara_state_and_db() {
     let (gc, u): (i64, i64) = db
         .conn_for_test()
         .call_db(|c| {
-            Ok(c.query_row(
+            c.query_row(
                 r"SELECT gcCurrent, gcUldahRank FROM characters WHERE id = 88",
                 [],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-            )?)
+            )
         })
         .await
         .unwrap();
@@ -7962,11 +7962,11 @@ async fn join_gc_sets_chara_state_and_db() {
     let post_rank: i64 = db
         .conn_for_test()
         .call_db(|c| {
-            Ok(c.query_row(
+            c.query_row(
                 r"SELECT gcUldahRank FROM characters WHERE id = 88",
                 [],
                 |r| r.get::<_, i64>(0),
-            )?)
+            )
         })
         .await
         .unwrap();
@@ -8077,11 +8077,11 @@ async fn promote_gc_happy_path_spends_seals_and_bumps_rank() {
     let stored_rank: i64 = db
         .conn_for_test()
         .call_db(|c| {
-            Ok(c.query_row(
+            c.query_row(
                 "SELECT gcLimsaRank FROM characters WHERE id = 171",
                 [],
                 |r| r.get::<_, i64>(0),
-            )?)
+            )
         })
         .await
         .unwrap();
@@ -9296,7 +9296,7 @@ async fn fieldcraft_leve_progress_ticks_on_add_item() {
     );
     // Silence unused-import warning on the range bound while also
     // asserting the fixture really is a fieldcraft leve.
-    assert!(130_003 >= FIELDCRAFT_LEVE_ID_MIN);
+    const { assert!(130_003 >= FIELDCRAFT_LEVE_ID_MIN) };
 }
 
 /// Fieldcraft leve progress is gated on the ACCEPTED_FLAG_BIT — a

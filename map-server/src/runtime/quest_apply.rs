@@ -961,6 +961,7 @@ async fn apply_hate_container_add_base_hate(
 /// the actor isn't in the registry or has no zone we just log and
 /// drop, matching the C# implicit silent-skip when CurrentArea is
 /// null.
+#[allow(clippy::too_many_arguments)]
 async fn apply_move_actor_to_position(
     actor_id: u32,
     x: f32,
@@ -2399,6 +2400,7 @@ pub async fn apply_add_item_to_retainer(
 /// [`StatusEffect`]: crate::status::StatusEffect
 /// [`StatusEffectContainer`]: crate::status::StatusEffectContainer
 /// [`StatusOutbox`]: crate::status::StatusOutbox
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_try_status(
     source_actor_id: u32,
     target_actor_id: u32,
@@ -3372,6 +3374,7 @@ pub async fn kick_quest_proximity_pushes(
     // out class ids that already fired this sequence — without this
     // the trigger re-fires every ~350ms while the player sits inside
     // the radius.
+    #[allow(clippy::type_complexity)]
     let (quest_pushes, journal_summary): (Vec<(u32, Vec<u32>)>, Vec<(u32, usize, usize)>) = {
         let c = handle.character.read().await;
         let pushes: Vec<(u32, Vec<u32>)> = c
@@ -3416,7 +3419,7 @@ pub async fn kick_quest_proximity_pushes(
             use std::sync::atomic::{AtomicU32, Ordering};
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            if n % 30 == 0 {
+            if n.is_multiple_of(30) {
                 tracing::info!(
                     player = player_id,
                     journal = ?journal_summary,
@@ -3696,37 +3699,37 @@ async fn fire_quest_npc_hook_via_command(
 
     // Auto-resume parked `_WAIT_EVENT` coroutine.
     let player_id = handle.actor_id;
-    if let Some(after) = lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new()) {
-        if !after.is_empty() {
-            let session_after = {
-                let c = handle.character.read().await;
-                c.event_session.clone()
-            };
-            let mut outbox = crate::event::outbox::EventOutbox::new();
-            crate::event::lua_bridge::translate_lua_commands_into_outbox(
-                &after,
-                &session_after,
-                &mut outbox,
-            );
-            for e in outbox.drain() {
-                Box::pin(crate::event::dispatcher::dispatch_event_event(
-                    &e,
-                    registry,
-                    world,
-                    db,
-                    Some(lua),
-                ))
-                .await;
-            }
-            Box::pin(apply_runtime_lua_commands(
-                after,
+    if let Some(after) = lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        && !after.is_empty()
+    {
+        let session_after = {
+            let c = handle.character.read().await;
+            c.event_session.clone()
+        };
+        let mut outbox = crate::event::outbox::EventOutbox::new();
+        crate::event::lua_bridge::translate_lua_commands_into_outbox(
+            &after,
+            &session_after,
+            &mut outbox,
+        );
+        for e in outbox.drain() {
+            Box::pin(crate::event::dispatcher::dispatch_event_event(
+                &e,
                 registry,
-                db,
                 world,
+                db,
                 Some(lua),
             ))
             .await;
         }
+        Box::pin(apply_runtime_lua_commands(
+            after,
+            registry,
+            db,
+            world,
+            Some(lua),
+        ))
+        .await;
     }
 }
 
@@ -3885,37 +3888,37 @@ pub async fn fire_quest_on_talk_via_command(
     // it, `player:EndEvent()` after `callClientFunction` never runs and
     // the client stays in event-locked state.
     let player_id = handle.actor_id;
-    if let Some(after) = lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new()) {
-        if !after.is_empty() {
-            let session_after = {
-                let c = handle.character.read().await;
-                c.event_session.clone()
-            };
-            let mut outbox = crate::event::outbox::EventOutbox::new();
-            crate::event::lua_bridge::translate_lua_commands_into_outbox(
-                &after,
-                &session_after,
-                &mut outbox,
-            );
-            for e in outbox.drain() {
-                Box::pin(crate::event::dispatcher::dispatch_event_event(
-                    &e,
-                    registry,
-                    world,
-                    db,
-                    Some(lua),
-                ))
-                .await;
-            }
-            Box::pin(apply_runtime_lua_commands(
-                after,
+    if let Some(after) = lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        && !after.is_empty()
+    {
+        let session_after = {
+            let c = handle.character.read().await;
+            c.event_session.clone()
+        };
+        let mut outbox = crate::event::outbox::EventOutbox::new();
+        crate::event::lua_bridge::translate_lua_commands_into_outbox(
+            &after,
+            &session_after,
+            &mut outbox,
+        );
+        for e in outbox.drain() {
+            Box::pin(crate::event::dispatcher::dispatch_event_event(
+                &e,
                 registry,
-                db,
                 world,
+                db,
                 Some(lua),
             ))
             .await;
         }
+        Box::pin(apply_runtime_lua_commands(
+            after,
+            registry,
+            db,
+            world,
+            Some(lua),
+        ))
+        .await;
     }
 }
 
@@ -3924,6 +3927,7 @@ pub async fn fire_quest_on_talk_via_command(
 // drains emitted commands back through `apply_runtime_lua_command`.
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn fire_quest_hook(
     handle: &ActorHandle,
     quest_id: u32,

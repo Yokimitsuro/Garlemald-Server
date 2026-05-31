@@ -24,7 +24,7 @@
 //!     every Lua VM shares one copy,
 //!   * exposes a single "build aim slots" pivot that converts a node id
 //!     + its items into the 11-slot table the DummyCommand minigame
-//!     feeds through `callClientFunction`.
+//!       feeds through `callClientFunction`.
 
 #![allow(dead_code)]
 

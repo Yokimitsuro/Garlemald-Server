@@ -25,6 +25,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerSection,
     pub database: DatabaseSection,
@@ -54,16 +55,6 @@ pub struct ScriptingSection {
     /// When `false`, skip the DB loaders + `spawn_all_actors`. Used by the
     /// integration test harness.
     pub load_from_database: bool,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerSection::default(),
-            database: DatabaseSection::default(),
-            scripting: ScriptingSection::default(),
-        }
-    }
 }
 
 impl Default for ServerSection {

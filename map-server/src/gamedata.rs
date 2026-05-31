@@ -285,6 +285,7 @@ impl AppearanceFull {
 /// client a face_type of 0 in almost every slot and left mouth/nose/
 /// eye-shape/eyebrows zero — the avatar renderer read those as "no
 /// face" and drew a mannequin head (no eyes, no mouth).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn pack_face_info(
     characteristics: u8,
     characteristics_color: u8,

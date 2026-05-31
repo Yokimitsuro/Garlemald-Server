@@ -68,6 +68,8 @@ pub struct Recipe {
 }
 
 impl Recipe {
+    // Wide ctor mirrors the C# `Recipe(...)` field order verbatim.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u32,
         result_item_id: u32,

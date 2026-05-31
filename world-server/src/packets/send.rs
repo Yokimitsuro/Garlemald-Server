@@ -207,7 +207,7 @@ pub const MESSAGE_TYPE_YELL: u8 = 0x1D;
 /// - 0x00..0x08: `group_id` u64
 /// - 0x40..0x44: group type (`Group.CompanyGroup = 20002`)
 /// - 0x60..0x64: `group_id == 0 ? 0 : 1`
-/// The rest of the 0x98-byte body stays zero.
+///   The rest of the 0x98-byte body stays zero.
 pub fn build_set_active_linkshell(session_id: u32, group_id: u64) -> SubPacket {
     // Body size 0x98 (PACKET_SIZE) - 0x20 (both headers) = 0x78 = 120 bytes,
     // matching the C# `byte[PACKET_SIZE - 0x20]` body allocation.

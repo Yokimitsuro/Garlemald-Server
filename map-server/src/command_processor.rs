@@ -149,10 +149,10 @@ impl CommandProcessor {
 
     /// `home <name>` — server-driven home-point revive. Restores HP/MP
     /// + state via `apply_revive`, then warps the player to their
-    /// stored homepoint aetheryte. Mirrors the "bandaid fix for
-    /// returning while dead" branch in `TeleportCommand.lua` so we
-    /// can verify the death/revive flow without standing up the
-    /// client's death-overlay menu network.
+    ///   stored homepoint aetheryte. Mirrors the "bandaid fix for
+    ///   returning while dead" branch in `TeleportCommand.lua` so we
+    ///   can verify the death/revive flow without standing up the
+    ///   client's death-overlay menu network.
     async fn handle_home(&self, args: &Args<'_>) -> String {
         let Some(name) = args.rest_joined(0) else {
             return "usage: home <name>".into();
@@ -613,20 +613,20 @@ impl CommandProcessor {
         // `spawn_type=2` matches the retail "warp-by-GM" spawn code;
         // `is_zoning_player=false` because we're not going through the
         // loading screen. (Cross-zone variant left as a follow-up.)
-        if current_zone_id == zone_id {
-            if let Some(client) = self.world.client(session_id).await {
-                let pkt = crate::packets::send::build_set_actor_position(
-                    actor_id,
-                    actor_id as i32,
-                    x,
-                    y,
-                    z,
-                    rotation,
-                    2,
-                    false,
-                );
-                client.send_bytes(pkt.to_bytes()).await;
-            }
+        if current_zone_id == zone_id
+            && let Some(client) = self.world.client(session_id).await
+        {
+            let pkt = crate::packets::send::build_set_actor_position(
+                actor_id,
+                actor_id as i32,
+                x,
+                y,
+                z,
+                rotation,
+                2,
+                false,
+            );
+            client.send_bytes(pkt.to_bytes()).await;
         }
         format!("warped {name} to zone {zone_id} at ({x:.2}, {y:.2}, {z:.2})")
     }
@@ -1200,7 +1200,6 @@ mod tests {
                     [],
                     |r| r.get(0),
                 )
-                .map_err(Into::into)
             })
             .await
             .unwrap();
@@ -1243,11 +1242,11 @@ mod tests {
         let (gc, l): (i64, i64) = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT gcCurrent, gcLimsaRank FROM characters WHERE id = 300",
                     [],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1259,11 +1258,11 @@ mod tests {
         let l2: i64 = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT gcLimsaRank FROM characters WHERE id = 300",
                     [],
                     |r| r.get::<_, i64>(0),
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1303,7 +1302,7 @@ mod tests {
         let (has, app, name): (i64, i64, String) = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT hasChocobo, chocoboAppearance, chocoboName
                       FROM characters_chocobo WHERE characterId = 200",
                     [],
@@ -1314,7 +1313,7 @@ mod tests {
                             r.get::<_, String>(2)?,
                         ))
                     },
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1332,12 +1331,12 @@ mod tests {
         let (app2, name2): (i64, String) = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT chocoboAppearance, chocoboName
                       FROM characters_chocobo WHERE characterId = 200",
                     [],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1447,11 +1446,9 @@ mod tests {
         let stored: u32 = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(
-                    c.query_row("SELECT homepoint FROM characters WHERE id = 12", [], |r| {
-                        r.get(0)
-                    })?,
-                )
+                c.query_row("SELECT homepoint FROM characters WHERE id = 12", [], |r| {
+                    r.get(0)
+                })
             })
             .await
             .unwrap();

@@ -356,8 +356,8 @@ pub fn build_linked_item_list_x32(
 /// (body = 0x174 / 372 bytes), which only fits 62 of the advertised 64
 /// entries and throws on a full batch. We size the body to fit 64 × 6 bytes
 /// + the 0x20 header (0x1A0) so a full batch doesn't truncate. Client-side
-/// compat with 1.23b here is untested because this path effectively never
-/// fires — equipment tops out at ~35 slots.
+///   compat with 1.23b here is untested because this path effectively never
+///   fires — equipment tops out at ~35 slots.
 pub fn build_linked_item_list_x64(
     actor_id: u32,
     entries: &[(u16, InventoryItem)],

@@ -251,17 +251,17 @@ impl GameTicker {
 
                 // Resolve every director member → LuaActor /
                 // PlayerSnapshot, classified by ActorKindTag.
-                let member_ids = active
-                    .director_actor_id
-                    .ne(&0)
-                    .then(|| {
+                let member_ids = if active.director_actor_id.ne(&0) {
+                    {
                         session
                             .transient_director_members
                             .get(&active.director_actor_id)
                             .cloned()
                             .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
+                    }
+                } else {
+                    Default::default()
+                };
                 for mid in member_ids {
                     let Some(handle) = self.registry.get(mid).await else {
                         continue;
@@ -416,7 +416,7 @@ impl GameTicker {
                         chara.chara.new_main_state = crate::actor::MAIN_STATE_PASSIVE;
                     } else {
                         chara.chara.rental_min_left =
-                            (((chara.chara.rental_expire_time - tick_utc) / 60) as u8).min(255);
+                            ((chara.chara.rental_expire_time - tick_utc) / 60) as u8;
                     }
                 }
 

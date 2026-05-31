@@ -129,8 +129,8 @@ pub fn build_delete_all_actors(actor_id: u32) -> SubPacket {
 ///
 /// Captured retail bytes (`ffxiv_traces/from_gridania_to_blackshroud.pcapng`
 /// + `gridania_to_coerthas.pcapng`): SubPacket size 0x28, body 8
-/// zero bytes. Same opcode as `OP_RX_LANGUAGE_CODE` — direction
-/// disambiguates.
+///   zero bytes. Same opcode as `OP_RX_LANGUAGE_CODE` — direction
+///   disambiguates.
 pub fn build_mass_delete_actor_start(actor_id: u32) -> SubPacket {
     SubPacket::new(OP_MASS_DELETE_ACTOR_START, actor_id, body(0x28))
 }

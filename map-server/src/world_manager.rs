@@ -56,8 +56,8 @@ use crate::zone::zone::Zone;
 ///   - byte 0: runningByteTotal = 1 + target.len()
 ///   - byte 1: target marker = 0x82 + target.len()
 ///   - byte 2..: target path ("/_init")
-/// Body is zero-filled to the 0xA8 packet size and wrapped as a
-/// game-message subpacket (opcode 0x0137).
+///     Body is zero-filled to the 0xA8 packet size and wrapped as a
+///     game-message subpacket (opcode 0x0137).
 fn build_director_init_packet(actor_id: u32) -> common::subpacket::SubPacket {
     use std::io::Write as _;
     let mut data = vec![0u8; 0xA8 - 0x20];
@@ -414,8 +414,6 @@ fn push_npc_spawn(
     let display_name_id = character.base.display_name_id;
     let (packet_name_id, packet_name) = if !custom_display_name.is_empty() {
         (0u32, custom_display_name.clone())
-    } else if display_name_id == 0 || display_name_id == 0xFFFF_FFFF {
-        (display_name_id, String::new())
     } else {
         (display_name_id, String::new())
     };
@@ -1177,6 +1175,8 @@ impl WorldManager {
     /// stubbed — the minimum viable login flow doesn't need them and they
     /// depend on plumbing that's still in progress (item_packages live on
     /// the `Player` shape, the registry only holds `Character`).
+    // cap intentionally usize::MAX (disabled); >= kept for when it's lowered.
+    #[allow(clippy::absurd_extreme_comparisons)]
     pub async fn send_zone_in_bundle(
         &self,
         registry: &ActorRegistry,
@@ -1851,7 +1851,7 @@ impl WorldManager {
             let mut npc_bundle = Vec::new();
             push_npc_spawn(
                 &mut npc_bundle,
-                &*character,
+                &character,
                 &zone_name,
                 // Priv-level is 0 for the root Zone (non-PrivateArea).
                 // PrivateArea spawns route through a different fanout
@@ -2035,22 +2035,22 @@ impl WorldManager {
                 "login director spawn packets appended (after player + NPCs)"
             );
         }
-        if let Some(active) = session.active_content_script.as_ref() {
-            if Some(active.director_actor_id) != login_director_spec.as_ref().map(|s| s.actor_id) {
-                let content_director_class_path = format!("/Director/{}", active.director_name);
-                director_subpackets.extend(build_director_spawn_subpackets(
-                    active.director_actor_id,
-                    active.parent_zone_id,
-                    &content_director_class_path,
-                    &active.director_name,
-                    &zone_name,
-                ));
-                tracing::info!(
-                    director = active.director_actor_id,
-                    director_name = %active.director_name,
-                    "content director spawn packets appended (after player + NPCs)"
-                );
-            }
+        if let Some(active) = session.active_content_script.as_ref()
+            && Some(active.director_actor_id) != login_director_spec.as_ref().map(|s| s.actor_id)
+        {
+            let content_director_class_path = format!("/Director/{}", active.director_name);
+            director_subpackets.extend(build_director_spawn_subpackets(
+                active.director_actor_id,
+                active.parent_zone_id,
+                &content_director_class_path,
+                &active.director_name,
+                &zone_name,
+            ));
+            tracing::info!(
+                director = active.director_actor_id,
+                director_name = %active.director_name,
+                "content director spawn packets appended (after player + NPCs)"
+            );
         }
         for mut sub in director_subpackets {
             sub.set_target_id(session_id);

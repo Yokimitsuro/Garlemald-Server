@@ -531,6 +531,7 @@ pub fn build_text_sheet_dispid_x60(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_text_sheet_dispid_n(
     receiver_actor_id: u32,
     disp_id: u32,

@@ -75,7 +75,7 @@ pub fn build_end_event(
 /// - 0x00..0x04: `trigger_actor_id` (u32)
 /// - 0x04..0x08: `owner_actor_id`   (u32)
 /// - 0x08     : `event_type`       (u8, `5` from `Player.KickEvent`, `0`
-///                                  from `KickEventSpecial`)
+///   from `KickEventSpecial`)
 /// - 0x09     : 0x17                (C# magic byte)
 /// - 0x0A..0x0C: 0x75DC             (C# magic u16)
 /// - 0x0C..0x10: 0x30400000         (C# server codes)

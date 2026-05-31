@@ -493,6 +493,7 @@ async fn resolve_auto_attack(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_action(
     attacker_actor_id: u32,
     defender_actor_id: u32,
@@ -1866,9 +1867,11 @@ mod home_point_revive_tests {
         registry.insert(handle.clone()).await;
 
         // Pre-seat a session so destination_* can be updated.
-        let mut session = Session::default();
-        session.id = 42;
-        session.current_zone_id = source_zone;
+        let session = Session {
+            id: 42,
+            current_zone_id: source_zone,
+            ..Default::default()
+        };
         world.upsert_session(session).await;
 
         let zone_arc = world.zone(source_zone).await.expect("zone registered");

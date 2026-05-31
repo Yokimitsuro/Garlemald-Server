@@ -933,17 +933,18 @@ impl PacketProcessor {
                 // (this) — previously the bundle would emit packets
                 // for the OpeningDirector at every warp regardless
                 // of mid-session SetLoginDirector calls.
-                if !class_path.is_empty() && director_actor_id != 0 {
-                    if let Some(mut snap) = self.world.session(handle.session_id).await {
-                        let zone_actor_id = snap.current_zone_id;
-                        snap.login_director = Some(crate::data::LoginDirectorSpec {
-                            actor_id: director_actor_id,
-                            zone_actor_id,
-                            class_path: class_path.clone(),
-                            class_name: class_name.clone(),
-                        });
-                        self.world.upsert_session(snap).await;
-                    }
+                if !class_path.is_empty()
+                    && director_actor_id != 0
+                    && let Some(mut snap) = self.world.session(handle.session_id).await
+                {
+                    let zone_actor_id = snap.current_zone_id;
+                    snap.login_director = Some(crate::data::LoginDirectorSpec {
+                        actor_id: director_actor_id,
+                        zone_actor_id,
+                        class_path: class_path.clone(),
+                        class_name: class_name.clone(),
+                    });
+                    self.world.upsert_session(snap).await;
                 }
                 tracing::info!(
                     player = player_id,
@@ -2272,6 +2273,7 @@ impl PacketProcessor {
     /// the player's current (public) view would leak the content-area
     /// NPCs. The post-warp `send_zone_in_bundle` picks them up via
     /// `actors_around(50.0)` and emits the bundle then.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_spawn_actor(
         &self,
         zone_id: u32,
@@ -4582,25 +4584,25 @@ impl PacketProcessor {
         // anything-but-GONE (otherwise SetNpcLs(id, GONE) on a
         // never-owned LS would fire spuriously).
         let now_owned = is_calling || is_extra;
-        if !was_owned && now_owned {
-            if let Some(handle) = self.registry.get(player_id).await {
-                if let Some(client) = self.world.client(handle.session_id).await {
-                    let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                        handle.actor_id,
-                        crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                        /* text_id */ 25118,
-                        crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                        &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
-                        /* prefer_alt */ false,
-                    );
-                    client.send_bytes(pkt.to_bytes()).await;
-                    tracing::debug!(
-                        player = player_id,
-                        npc_ls_id,
-                        "SetNpcLs first-add: 25118 'linkpearl obtained' toast fired",
-                    );
-                }
-            }
+        if !was_owned
+            && now_owned
+            && let Some(handle) = self.registry.get(player_id).await
+            && let Some(client) = self.world.client(handle.session_id).await
+        {
+            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                handle.actor_id,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                /* text_id */ 25118,
+                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+                &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
+                /* prefer_alt */ false,
+            );
+            client.send_bytes(pkt.to_bytes()).await;
+            tracing::debug!(
+                player = player_id,
+                npc_ls_id,
+                "SetNpcLs first-add: 25118 'linkpearl obtained' toast fired",
+            );
         }
     }
 
@@ -4668,21 +4670,21 @@ impl PacketProcessor {
         // Fan out the canonical "<command> equipped" toast.
         // Mirror C# `Player.EquipAbility`'s
         // `SendGameMessage(WorldMaster, 30603, 0x20, 0, commandId)`.
-        if let Some(handle) = self.registry.get(player_id).await {
-            if let Some(client) = self.world.client(handle.session_id).await {
-                let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                    handle.actor_id,
-                    crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                    /* text_id */ 30603,
-                    crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                    &[
-                        common::luaparam::LuaParam::UInt32(0),
-                        common::luaparam::LuaParam::UInt32(command_id),
-                    ],
-                    /* prefer_alt */ false,
-                );
-                client.send_bytes(pkt.to_bytes()).await;
-            }
+        if let Some(handle) = self.registry.get(player_id).await
+            && let Some(client) = self.world.client(handle.session_id).await
+        {
+            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                handle.actor_id,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                /* text_id */ 30603,
+                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+                &[
+                    common::luaparam::LuaParam::UInt32(0),
+                    common::luaparam::LuaParam::UInt32(command_id),
+                ],
+                /* prefer_alt */ false,
+            );
+            client.send_bytes(pkt.to_bytes()).await;
         }
     }
 
@@ -4740,21 +4742,22 @@ impl PacketProcessor {
         // Fan out the canonical "<command> unequipped" toast — only
         // when there was a command in the slot (matches C#'s
         // `if (printMessage && commandId != 0)` gate).
-        if unmasked_command_id != 0 && session_id != 0 {
-            if let Some(client) = self.world.client(session_id).await {
-                let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                    player_id,
-                    crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                    /* text_id */ 30604,
-                    crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                    &[
-                        common::luaparam::LuaParam::UInt32(0),
-                        common::luaparam::LuaParam::UInt32(unmasked_command_id),
-                    ],
-                    /* prefer_alt */ false,
-                );
-                client.send_bytes(pkt.to_bytes()).await;
-            }
+        if unmasked_command_id != 0
+            && session_id != 0
+            && let Some(client) = self.world.client(session_id).await
+        {
+            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                player_id,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                /* text_id */ 30604,
+                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+                &[
+                    common::luaparam::LuaParam::UInt32(0),
+                    common::luaparam::LuaParam::UInt32(unmasked_command_id),
+                ],
+                /* prefer_alt */ false,
+            );
+            client.send_bytes(pkt.to_bytes()).await;
         }
     }
 
@@ -4909,21 +4912,21 @@ impl PacketProcessor {
         // Sibling auto-fire of the EquipAbility 30603 toast — same
         // wire shape, same C# precedent (Player.EquipAbility passes
         // `printMessage = true` from EquipAbilityInFirstOpenSlot).
-        if let Some(handle) = self.registry.get(player_id).await {
-            if let Some(client) = self.world.client(handle.session_id).await {
-                let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                    handle.actor_id,
-                    crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                    /* text_id */ 30603,
-                    crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
-                    &[
-                        common::luaparam::LuaParam::UInt32(0),
-                        common::luaparam::LuaParam::UInt32(command_id),
-                    ],
-                    /* prefer_alt */ false,
-                );
-                client.send_bytes(pkt.to_bytes()).await;
-            }
+        if let Some(handle) = self.registry.get(player_id).await
+            && let Some(client) = self.world.client(handle.session_id).await
+        {
+            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                handle.actor_id,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                /* text_id */ 30603,
+                crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+                &[
+                    common::luaparam::LuaParam::UInt32(0),
+                    common::luaparam::LuaParam::UInt32(command_id),
+                ],
+                /* prefer_alt */ false,
+            );
+            client.send_bytes(pkt.to_bytes()).await;
         }
     }
 
@@ -5289,7 +5292,7 @@ impl PacketProcessor {
     ///   switch derivation since the cinematic doesn't expose the
     ///   intermediate value and the script callers pass the
     ///   already-resolved personality directly)
-    /// SNpcCoordinate is preserved (SetSNpc doesn't write it).
+    ///   SNpcCoordinate is preserved (SetSNpc doesn't write it).
     async fn apply_set_snpc(
         &self,
         player_id: u32,
@@ -5545,10 +5548,10 @@ impl PacketProcessor {
     /// * the player isn't enlisted in `gc` (`chara.gc_current != gc`),
     /// * current rank has no `next_rank` (already at/past 1.23b cap of 31),
     /// * seal balance is below `gc_promotion_cost(current)`.
-    /// On success: spends `cost` seals via `db.add_seals(-cost)`,
-    /// bumps the per-GC rank field on `CharaState` to `next_rank`,
-    /// persists the rank via `db.set_gc_rank`, and emits
-    /// `SetGrandCompanyPacket` so the client sees the new rank.
+    ///   On success: spends `cost` seals via `db.add_seals(-cost)`,
+    ///   bumps the per-GC rank field on `CharaState` to `next_rank`,
+    ///   persists the rank via `db.set_gc_rank`, and emits
+    ///   `SetGrandCompanyPacket` so the client sees the new rank.
     async fn apply_promote_gc(&self, player_id: u32, gc: u8) {
         if !crate::actor::gc::is_valid_gc(gc) {
             tracing::debug!(player = player_id, gc, "PromoteGC: invalid gc id");
@@ -5693,7 +5696,7 @@ impl PacketProcessor {
         // through the shared `broadcast_around_actor` helper, matching
         // the chocobo `SendMountAppearance` pattern at
         // `apply_send_mount_appearance:1719-1745`.
-        const RANKUP_ANIMATION_ID: u32 = 0x4000_FFB;
+        const RANKUP_ANIMATION_ID: u32 = 0x0400_0FFB;
         let sub = tx::actor::build_play_animation_on_actor(handle.actor_id, RANKUP_ANIMATION_ID);
         if let Ok(base) = common::BasePacket::create_from_subpacket(&sub, true, false) {
             let bytes = base.to_bytes();
@@ -5786,13 +5789,11 @@ impl PacketProcessor {
             let session_id = handle.session_id;
             if session_id != 0
                 && let Some(mut session) = self.world.session(session_id).await
+                && let Some(r) = &session.spawned_retainer
+                && r.retainer_id == retainer_id
             {
-                if let Some(r) = &session.spawned_retainer
-                    && r.retainer_id == retainer_id
-                {
-                    session.spawned_retainer = None;
-                    self.world.upsert_session(session).await;
-                }
+                session.spawned_retainer = None;
+                self.world.upsert_session(session).await;
             }
         }
         tracing::info!(
@@ -5860,13 +5861,12 @@ impl PacketProcessor {
         if session_id == 0 {
             return;
         }
-        if let Some(mut session) = self.world.session(session_id).await {
-            if let Some(r) = session.spawned_retainer.as_mut()
-                && r.retainer_id == retainer_id
-            {
-                r.name = new_name;
-                self.world.upsert_session(session).await;
-            }
+        if let Some(mut session) = self.world.session(session_id).await
+            && let Some(r) = session.spawned_retainer.as_mut()
+            && r.retainer_id == retainer_id
+        {
+            r.name = new_name;
+            self.world.upsert_session(session).await;
         }
     }
 
@@ -5982,6 +5982,7 @@ impl PacketProcessor {
     /// then — if the `AddEnpcOutcome` reports a state change worth
     /// broadcasting — emits the matching event-status + quest-graphic
     /// packets to the player.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_quest_set_enpc(
         &self,
         player_id: u32,
@@ -6326,16 +6327,16 @@ impl PacketProcessor {
             c.quest_journal.complete(quest_id);
             slot.map(|s| s as i32)
         };
-        if let Some(slot) = removed_slot {
-            if let Err(e) = self.db.remove_quest(player_id, quest_id).await {
-                tracing::warn!(
-                    error = %e,
-                    player = player_id,
-                    quest = quest_id,
-                    slot,
-                    "CompleteQuest: scenario-row delete failed",
-                );
-            }
+        if let Some(slot) = removed_slot
+            && let Err(e) = self.db.remove_quest(player_id, quest_id).await
+        {
+            tracing::warn!(
+                error = %e,
+                player = player_id,
+                quest = quest_id,
+                slot,
+                "CompleteQuest: scenario-row delete failed",
+            );
         }
         if let Err(e) = self.db.complete_quest(player_id, quest_id).await {
             tracing::warn!(

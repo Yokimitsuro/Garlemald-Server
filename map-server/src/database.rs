@@ -814,10 +814,10 @@ impl Database {
                                 .unwrap_or(-1);
                             let val: i32 =
                                 r.get::<_, Option<i32>>(val_idx).ok().flatten().unwrap_or(0);
-                            if let Some(mod_id) = decode_param_bonus_type(ty) {
-                                if val != 0 {
-                                    bonuses.push((mod_id, val));
-                                }
+                            if let Some(mod_id) = decode_param_bonus_type(ty)
+                                && val != 0
+                            {
+                                bonuses.push((mod_id, val));
                             }
                         }
                         // Weapon columns: 33 (damageInterval), 34
@@ -2039,8 +2039,8 @@ impl Database {
                 let v = c
                     .query_row(&sql, named_params! { ":cid": chara_id }, |r| {
                         let mut out = [0u32; 20];
-                        for i in 0..20 {
-                            out[i] = r.get::<_, u32>(i).unwrap_or_default();
+                        for (i, slot) in out.iter_mut().enumerate() {
+                            *slot = r.get::<_, u32>(i).unwrap_or_default();
                         }
                         Ok(out)
                     })

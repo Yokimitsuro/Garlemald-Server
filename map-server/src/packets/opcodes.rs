@@ -162,16 +162,16 @@ pub const OP_RX_DATA_REQUEST: u16 = 0x012F;
 /// name (`/_init`) padded to 16 bytes + 16 bytes reserved. Retail
 /// fires 270 of these per session; dropped before this audit.
 pub const OP_RX_GROUP_CREATED: u16 = 0x0133;
-/// Wiki: "Target Locked" (client→server). The 1.x client sends this
-/// when the player presses target-lock on an actor. Const already
-/// defined (`OP_RX_LOCK_TARGET = 0x00CC` below) but **not** in
-/// `handle_game_message`'s dispatch table. Retail: 66 events.
-/// Wiki: "Target Selected" (client→server). Sent when the player
-/// soft-targets an actor. Const `OP_RX_SET_TARGET = 0x00CD` exists
-/// but isn't dispatched. Retail: 118 events.
-/// Wiki: "Unknown 0x007" — RX_ZONE_IN_COMPLETE per garlemald's
-/// existing const. Already defined as `OP_RX_ZONE_IN_COMPLETE` but
-/// not in dispatch. Retail: 24 events.
+// Wiki: "Target Locked" (client→server). The 1.x client sends this
+// when the player presses target-lock on an actor. Const already
+// defined (`OP_RX_LOCK_TARGET = 0x00CC` below) but **not** in
+// `handle_game_message`'s dispatch table. Retail: 66 events.
+// Wiki: "Target Selected" (client→server). Sent when the player
+// soft-targets an actor. Const `OP_RX_SET_TARGET = 0x00CD` exists
+// but isn't dispatched. Retail: 118 events.
+// Wiki: "Unknown 0x007" — RX_ZONE_IN_COMPLETE per garlemald's
+// existing const. Already defined as `OP_RX_ZONE_IN_COMPLETE` but
+// not in dispatch. Retail: 24 events.
 
 /// Chat. Client sends at opcode 0x0003 (collision with send's
 /// `OP_SEND_MESSAGE_PUBLIC` — distinguished by direction).
