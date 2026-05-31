@@ -1189,11 +1189,21 @@ pub async fn apply_runtime_lua_commands(
     lua: Option<&Arc<LuaEngine>>,
 ) {
     for cmd in cmds {
-        let tag = std::mem::discriminant(&cmd);
+        // Keep a copy for diagnostics only when DEBUG is enabled for this
+        // target, so non-debug filters pay nothing. The drain is low-frequency
+        // (quest-hook command batches), so the clone cost is negligible. We log
+        // the whole command (variant name + fields) rather than the opaque
+        // `Discriminant(N)`: event-flavoured commands (e.g. `RunEventFunction`,
+        // `EndEvent`) routinely fall through here *after* the event bridge has
+        // already emitted them, so naming the command is what lets a genuinely
+        // dropped command be told apart from expected post-bridge noise.
+        let diag = tracing::enabled!(tracing::Level::DEBUG).then(|| cmd.clone());
         let handled = apply_runtime_lua_command(cmd, registry, db, world, lua).await;
-        if !handled {
+        if !handled
+            && let Some(cmd) = diag
+        {
             tracing::debug!(
-                ?tag,
+                ?cmd,
                 "runtime lua command unhandled (login-scoped or unrecognised)",
             );
         }
@@ -3124,68 +3134,36 @@ pub async fn apply_quest_on_notice(
         ))
         .await;
 
-        // The opening-cutscene hook `man0l0.lua::onNotice` runs:
+        // The opening-cutscene hook (e.g. `man0g0.lua::onNotice`) runs:
         //
         //     callClientFunction(player, "delegateEvent", player, quest,
         //                        "processTtrNomal001withHQ")
         //     player:EndEvent()
         //     quest:UpdateENPCs()
         //
-        // `callClientFunction` (in scripts/global.lua) does
-        // `coroutine.yield("_WAIT_EVENT", player)`, so the coroutine
-        // parks after the first call. The 1.x client never sends a
-        // matching `0x012E EventUpdate` for cutscene completion — the
-        // cinematic plays asynchronously, the client expects the
-        // server to drive the post-cinematic state on its own — so
-        // the parked coroutine would sit forever, `player:EndEvent()`
-        // (the `0x0131 EndEventPacket` that frees the client from
-        // event-locked state) never fires, and the player can't
-        // interact with NPCs even though visually the world is
-        // rendered. Auto-fire the parked coroutine immediately so the
-        // post-`callClientFunction` lines in the hook (the EndEvent
-        // and UpdateENPCs calls) run in the same drain pass. Re-drain
-        // anything those produce.
-        // Do NOT auto-resume the parked `_WAIT_EVENT` coroutine here.
+        // `callClientFunction` (scripts/lua/global.lua) does
+        // `coroutine.yield("_WAIT_EVENT", player)`, so the coroutine parks
+        // after emitting just the `RunEventFunction` (0x0130) above. The
+        // remaining lines — `player:EndEvent()` (0x0131, which frees the
+        // client from event-locked state) and `quest:UpdateENPCs()` — must
+        // run ONLY after the client has finished playing the cinematic.
+        // The 1.x client signals completion with an `EventUpdate` (0x012E),
+        // which `handle_event_update` → `dispatch_event_updated_drain` →
+        // `fire_player_event_and_drain` uses to resume this parked coroutine
+        // (the player-0 bare-string park is picked up by that path's
+        // `take_event(0)` fallback). This mirrors Meteor's
+        // `LuaEngine.OnEventUpdate` (`Map Server/Lua/LuaEngine.cs`).
         //
-        // The opening hook (`man0g0.lua::onNotice` and siblings) is:
-        //   callClientFunction(... "processTtrNomal001withHQ")  -- RunEventFunction (already sent above)
-        //   player:EndEvent()                                   -- 0x0131
-        //   quest:UpdateENPCs()
-        // `callClientFunction` yields on `_WAIT_EVENT`, so only the
-        // RunEventFunction was produced in the first drain (already
-        // dispatched). The `EndEvent` + `UpdateENPCs` are still parked
-        // behind the yield.
-        //
-        // A previous version force-resumed the coroutine right here, which
-        // pushed the `EndEvent` onto the wire ~0ms after the
-        // RunEventFunction — *while the cinematic is still playing*.
-        // Packet-log evidence (packetlogs/map-packets.log, 2026-05-28
-        // Gridania repro):
-        //   07:13:03.874 OUT RunEventFunction processTtrNomal001withHQ owner=0x65300002
-        //   07:13:03.874 OUT EndEvent          "noticeEvent"           owner=0x00000000
-        // That premature EndEvent (also with owner=0, since
-        // current_event_owner was already cleared) tears down the
-        // client's event session mid-cutscene; when the cinematic then
-        // marshals its own outbound EventUpdate (0x012E) the event owner
-        // resolves to NULL. Native Windows faults
-        // (c0000005 @ ffxivgame+0x492550); Wine tolerates the NULL read,
-        // which is why macOS plays the cinematic through and Windows
-        // crashed at the journal-tutorial step.
-        //
-        // The correct flow: leave the coroutine PARKED. The 1.x client
-        // sends a `0x012E EventUpdate` when the cinematic reaches its
-        // server-sync point (confirmed in the working macOS capture
-        // packetlogs/map-packets_mac.log — first client EventUpdate
-        // ~64s after the kickoff). `handle_event_update` →
-        // `EventSession::update_event` → `dispatch_event_updated_drain`
-        // then resumes this coroutine and emits the `EndEvent` +
-        // `UpdateENPCs` at the right time — after the cinematic, so the
-        // EventUpdate was built against an OPEN event (no NULL owner, no
-        // crash), and the deferred EndEvent closes the event so the
-        // player leaves event-mode and can move (WASD) again.
-        //
-        // (The earlier "client never sends EventUpdate, must force-resume"
-        // assumption was wrong — the macOS capture shows it does.)
+        // We deliberately DO NOT auto-fire the parked coroutine here. A
+        // previous version did — to dodge a hang back when the `target_id`
+        // bug made the client ignore event subpackets and never send the
+        // `EventUpdate` — but that emitted `EndEvent` in the same pass as
+        // `RunEventFunction`, tearing the event down mid-cinematic and
+        // crashing the client at the dialog center→top-left handoff, before
+        // movement control was granted. With `target_id` now set to the
+        // player (see `set_target_id` in event/dispatcher.rs) the client
+        // receives the cutscene and drives the resume itself, so leaving the
+        // coroutine parked is both correct and necessary.
     }
 }
 

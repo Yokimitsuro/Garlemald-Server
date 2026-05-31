@@ -137,6 +137,16 @@ pub async fn dispatch_event_event(
                 lua_params,
             );
             sub.set_target_id(*player_actor_id);
+            tracing::debug!(
+                player = *player_actor_id,
+                trigger = *trigger_actor_id,
+                owner = *owner_actor_id,
+                event = %event_name,
+                function = %function_name,
+                event_type = *event_type,
+                params = lua_params.len(),
+                "TX 0x0130 RunEventFunction (drives an event/cutscene; target_id=player)",
+            );
             send_to_player(world, registry, *player_actor_id, sub.to_bytes()).await;
         }
         EventEvent::EndEvent {
@@ -148,6 +158,13 @@ pub async fn dispatch_event_event(
             let mut sub =
                 tx::build_end_event(*player_actor_id, *owner_actor_id, event_name, *event_type);
             sub.set_target_id(*player_actor_id);
+            tracing::debug!(
+                player = *player_actor_id,
+                owner = *owner_actor_id,
+                event = %event_name,
+                event_type = *event_type,
+                "TX 0x0131 EndEvent (server ends the event for the client)",
+            );
             send_to_player(world, registry, *player_actor_id, sub.to_bytes()).await;
         }
         EventEvent::KickEvent {
@@ -166,6 +183,15 @@ pub async fn dispatch_event_event(
                 lua_params,
             );
             sub.set_target_id(*player_actor_id);
+            tracing::debug!(
+                player = *player_actor_id,
+                target = *target_actor_id,
+                owner = *owner_actor_id,
+                event = %event_name,
+                event_type = *event_type,
+                params = lua_params.len(),
+                "TX KickEvent (asks client to start an event on target)",
+            );
             send_to_player(world, registry, *player_actor_id, sub.to_bytes()).await;
         }
 
@@ -1005,9 +1031,20 @@ async fn send_to_player(
     bytes: Vec<u8>,
 ) {
     let Some(handle) = registry.get(player_actor_id).await else {
+        tracing::debug!(
+            player = player_actor_id,
+            bytes = bytes.len(),
+            "send_to_player dropped packet — actor not in registry",
+        );
         return;
     };
     let Some(client) = world.client(handle.session_id).await else {
+        tracing::debug!(
+            player = player_actor_id,
+            session = handle.session_id,
+            bytes = bytes.len(),
+            "send_to_player dropped packet — no live client for session",
+        );
         return;
     };
     client.send_bytes(bytes).await;
