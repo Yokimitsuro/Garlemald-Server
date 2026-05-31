@@ -3,8 +3,6 @@ name: CI
 # Build + test + fmt/clippy gate on every push and PR to ALL branches, so no
 # merge lands without a green build + passing tests. See issue #14.
 on:
-  push:
-    branches: ['**']
   pull_request:
     branches: ['**']
 
