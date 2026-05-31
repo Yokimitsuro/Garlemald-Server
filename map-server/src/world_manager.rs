@@ -140,8 +140,7 @@ pub fn build_director_spawn_subpackets(
     if class_lower.len() > max_class_len {
         class_lower.truncate(max_class_len);
     }
-    let director_actor_name =
-        format!("{class_lower}_{zone_short}_0@{zone_actor_id:03X}00");
+    let director_actor_name = format!("{class_lower}_{zone_short}_0@{zone_actor_id:03X}00");
     let director_bind_params = vec![
         common::luaparam::LuaParam::String(class_path.to_string()),
         common::luaparam::LuaParam::False,
@@ -161,18 +160,24 @@ pub fn build_director_spawn_subpackets(
         // the `KickEventPacket("noticeEvent")` a few packets later
         // can't resolve to any registered condition on the director and
         // the client silently drops it.
+        tx::actor_events::build_set_notice_event_condition_raw(actor_id, 0x0E, 0x00, "noticeEvent"),
         tx::actor_events::build_set_notice_event_condition_raw(
-            actor_id, 0x0E, 0x00, "noticeEvent",
+            actor_id,
+            0x00,
+            0x01,
+            "noticeRequest",
         ),
-        tx::actor_events::build_set_notice_event_condition_raw(
-            actor_id, 0x00, 0x01, "noticeRequest",
-        ),
-        tx::actor_events::build_set_notice_event_condition_raw(
-            actor_id, 0x00, 0x01, "reqForChild",
-        ),
+        tx::actor_events::build_set_notice_event_condition_raw(actor_id, 0x00, 0x01, "reqForChild"),
         tx::actor::build_set_actor_speed_default(actor_id),
         tx::actor::build_set_actor_position(
-            actor_id, actor_id as i32, 0.0, 0.0, 0.0, 0.0, 0x0, false,
+            actor_id,
+            actor_id as i32,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0x0,
+            false,
         ),
         tx::actor::build_set_actor_name(actor_id, 0, &director_actor_name),
         tx::actor::build_set_actor_state(actor_id, 0, 0),
@@ -245,7 +250,14 @@ fn push_master_spawn(
     // actor-resolve path and raises 0xc000000d a couple seconds after the
     // zone-in packets are consumed.
     subpackets.push(tx::actor::build_set_actor_position(
-        actor_id, actor_id as i32, 0.0, 0.0, 0.0, 0.0, 0x1, false,
+        actor_id,
+        actor_id as i32,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0x1,
+        false,
     ));
     // C# `CreateNamePacket` uses displayNameId=0 when a customDisplayName
     // is set; all three masters ship with names ("debug", "worldMaster",
@@ -504,7 +516,13 @@ fn push_npc_spawn(
     ));
     subpackets.push(tx::actor::build_set_actor_state(actor_id, state, 0));
     subpackets.push(tx::actor::build_set_actor_sub_state(
-        actor_id, 0, 0, 0, 0, 0, motion_pack,
+        actor_id,
+        0,
+        0,
+        0,
+        0,
+        0,
+        motion_pack,
     ));
     subpackets.push(tx::actor::build_set_actor_status_all(actor_id, &[0u16; 20]));
     subpackets.push(tx::actor::build_set_actor_icon(actor_id, 0));
@@ -553,15 +571,8 @@ fn push_npc_spawn(
     let mp = character.chara.mp.max(0) as u16;
     let mp_max = character.chara.max_mp.max(0) as u16;
     let tp = character.chara.tp;
-    let npc_init = tx::actor::build_npc_property_init(
-        actor_id,
-        property_flags,
-        hp,
-        hp_max,
-        mp,
-        mp_max,
-        tp,
-    );
+    let npc_init =
+        tx::actor::build_npc_property_init(actor_id, property_flags, hp, hp_max, mp, mp_max, tp);
     subpackets.extend(npc_init);
 
     // SetEventStatus enable-flags for every condition the spawn bundle
@@ -673,7 +684,11 @@ impl WorldManager {
     /// the live actor's `(zone_id, unique_id)` key. Returns `None` if
     /// the targeted actor is not a gather-node spawn (or gather spawns
     /// weren't loaded at boot).
-    pub async fn gather_metadata(&self, zone_id: u32, unique_id: &str) -> Option<GatherNodeMetadata> {
+    pub async fn gather_metadata(
+        &self,
+        zone_id: u32,
+        unique_id: &str,
+    ) -> Option<GatherNodeMetadata> {
         self.gather_node_metadata
             .read()
             .await
@@ -1224,9 +1239,7 @@ impl WorldManager {
                 .slots
                 .iter()
                 .enumerate()
-                .filter_map(|(slot, q)| {
-                    q.as_ref().map(|q| (slot as u32, q.actor_id))
-                })
+                .filter_map(|(slot, q)| q.as_ref().map(|q| (slot as u32, q.actor_id)))
                 .collect();
             (
                 c.base.display_name().to_string(),
@@ -1413,13 +1426,12 @@ impl WorldManager {
             let c = actor_handle.character.read().await;
             (c.chara.mount_state, c.chara.rental_expire_time)
         };
-        let music_id = if main_state == crate::actor::MAIN_STATE_MOUNTED as u8
-            && mount_state_char != 0
-        {
-            if rental_expire != 0 { 64 } else { 83 }
-        } else {
-            bgm_day
-        };
+        let music_id =
+            if main_state == crate::actor::MAIN_STATE_MOUNTED as u8 && mount_state_char != 0 {
+                if rental_expire != 0 { 64 } else { 83 }
+            } else {
+                bgm_day
+            };
         subpackets.extend(vec![
             tx::actor::build_set_actor_is_zoning(actor_id, false),
             tx::misc::build_set_dalamud(actor_id, 0),
@@ -1467,13 +1479,9 @@ impl WorldManager {
         subpackets.push(tx::player::build_set_special_event_work(actor_id));
         subpackets.push(tx::player::build_set_achievement_points(actor_id, 0));
         subpackets.push(tx::player::build_set_latest_achievements(
-            actor_id,
-            &[0u32; 5],
+            actor_id, &[0u32; 5],
         ));
-        subpackets.push(tx::player::build_set_completed_achievements(
-            actor_id,
-            &[],
-        ));
+        subpackets.push(tx::player::build_set_completed_achievements(actor_id, &[]));
         subpackets.push(tx::actor::build_actor_instantiate(
             actor_id,
             0,
@@ -1581,11 +1589,7 @@ impl WorldManager {
             actor_id, hp, hp_max, mp, mp_max, tp,
         ));
         subpackets.extend(tx::actor::build_player_state_at_quickly_for_all(
-            actor_id,
-            hp,
-            hp_max,
-            class_slot,
-            1,
+            actor_id, hp, hp_max, class_slot, 1,
         ));
         // `battleTemp.generalParameter[0..3] = 1` matches C# defaults for
         // NAMEPLATE_SHOWN (0), TARGETABLE (1), NAMEPLATE_SHOWN2 (2), and
@@ -1753,16 +1757,14 @@ impl WorldManager {
                 true,
             );
             let all_flags = [true; 2048];
-            subpackets.push(
-                crate::packets::send::player::build_set_cutscene_book(
-                    actor_id,
-                    "<Path Companion>",
-                    11,
-                    1,
-                    1,
-                    Some(&all_flags[..]),
-                ),
-            );
+            subpackets.push(crate::packets::send::player::build_set_cutscene_book(
+                actor_id,
+                "<Path Companion>",
+                11,
+                1,
+                1,
+                Some(&all_flags[..]),
+            ));
             // Meteor's Create0x132 passes dreamId = 0x16 as the
             // "just logged into an inn" scene and innId = inn code.
             subpackets.push(crate::packets::send::player::build_set_player_dream(
@@ -1832,7 +1834,10 @@ impl WorldManager {
         // through the same populace pipeline.
         for (neighbour_id, kind) in neighbours {
             use crate::zone::area::ActorKind;
-            if !matches!(kind, ActorKind::Npc | ActorKind::BattleNpc | ActorKind::Ally) {
+            if !matches!(
+                kind,
+                ActorKind::Npc | ActorKind::BattleNpc | ActorKind::Ally
+            ) {
                 continue;
             }
             let Some(handle) = registry.get(neighbour_id).await else {
@@ -2031,11 +2036,8 @@ impl WorldManager {
             );
         }
         if let Some(active) = session.active_content_script.as_ref() {
-            if Some(active.director_actor_id)
-                != login_director_spec.as_ref().map(|s| s.actor_id)
-            {
-                let content_director_class_path =
-                    format!("/Director/{}", active.director_name);
+            if Some(active.director_actor_id) != login_director_spec.as_ref().map(|s| s.actor_id) {
+                let content_director_class_path = format!("/Director/{}", active.director_name);
                 director_subpackets.extend(build_director_spawn_subpackets(
                     active.director_actor_id,
                     active.parent_zone_id,

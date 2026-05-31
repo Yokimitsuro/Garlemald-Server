@@ -58,7 +58,8 @@ pub fn build_set_talk_event_condition(actor_id: u32, condition: &TalkCondition) 
     let mut data = body(0x48);
     let mut c = Cursor::new(&mut data[..]);
     c.write_u8(4).unwrap();
-    c.write_u8(if condition.is_disabled { 1 } else { 0 }).unwrap();
+    c.write_u8(if condition.is_disabled { 1 } else { 0 })
+        .unwrap();
     write_condition_name(&mut c, &condition.condition_name);
     SubPacket::new(OP_SET_TALK_EVENT_CONDITION, actor_id, data)
 }
@@ -110,7 +111,8 @@ pub fn build_set_emote_event_condition(actor_id: u32, condition: &EmoteCondition
     let mut data = body(0x48);
     let mut c = Cursor::new(&mut data[..]);
     c.write_u8(condition.unknown1).unwrap();
-    c.write_u16::<LittleEndian>(condition.emote_id as u16).unwrap();
+    c.write_u16::<LittleEndian>(condition.emote_id as u16)
+        .unwrap();
     write_condition_name(&mut c, &condition.condition_name);
     SubPacket::new(OP_SET_EMOTE_EVENT_CONDITION, actor_id, data)
 }

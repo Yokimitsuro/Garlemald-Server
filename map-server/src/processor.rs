@@ -39,11 +39,10 @@ use crate::packets::opcodes::{
     OP_RX_DATA_REQUEST, OP_RX_END_RECRUITING, OP_RX_EVENT_START, OP_RX_EVENT_UPDATE,
     OP_RX_FAQ_BODY_REQUEST, OP_RX_FAQ_LIST_REQUEST, OP_RX_FRIEND_STATUS, OP_RX_FRIENDLIST_ADD,
     OP_RX_FRIENDLIST_REMOVE, OP_RX_FRIENDLIST_REQUEST, OP_RX_GM_TICKET_BODY, OP_RX_GM_TICKET_END,
-    OP_RX_GM_TICKET_SEND, OP_RX_GM_TICKET_STATE, OP_RX_GROUP_CREATED,
-    OP_RX_ITEM_PACKAGE_REQUEST, OP_RX_LANGUAGE_CODE, OP_RX_LOCK_TARGET, OP_RX_RECRUITER_STATE,
-    OP_RX_RECRUITING_DETAILS, OP_RX_SET_TARGET, OP_RX_START_RECRUITING,
-    OP_RX_SUPPORT_ISSUE_REQUEST, OP_RX_UPDATE_PLAYER_POSITION, OP_RX_ZONE_IN_COMPLETE,
-    OP_SESSION_BEGIN, OP_SESSION_END,
+    OP_RX_GM_TICKET_SEND, OP_RX_GM_TICKET_STATE, OP_RX_GROUP_CREATED, OP_RX_ITEM_PACKAGE_REQUEST,
+    OP_RX_LANGUAGE_CODE, OP_RX_LOCK_TARGET, OP_RX_RECRUITER_STATE, OP_RX_RECRUITING_DETAILS,
+    OP_RX_SET_TARGET, OP_RX_START_RECRUITING, OP_RX_SUPPORT_ISSUE_REQUEST,
+    OP_RX_UPDATE_PLAYER_POSITION, OP_RX_ZONE_IN_COMPLETE, OP_SESSION_BEGIN, OP_SESSION_END,
 };
 use crate::packets::receive::{
     AchievementProgressRequestPacket, AddRemoveSocialPacket, ChatMessagePacket, EventStartPacket,
@@ -301,14 +300,14 @@ impl PacketProcessor {
         character.chara.max_hp = hp_max;
         character.chara.mp = mp;
         character.chara.max_mp = mp_max;
-        character.chara.mods.set(
-            crate::actor::modifier::Modifier::Hp,
-            hp_max as f64,
-        );
-        character.chara.mods.set(
-            crate::actor::modifier::Modifier::Mp,
-            mp_max as f64,
-        );
+        character
+            .chara
+            .mods
+            .set(crate::actor::modifier::Modifier::Hp, hp_max as f64);
+        character
+            .chara
+            .mods
+            .set(crate::actor::modifier::Modifier::Mp, mp_max as f64);
         // Run the Player baseline-stat seeder *before* calculate_base_stats
         // so STR/VIT/DEX/INT/MND/PIE have non-zero values at login and
         // every subsequent recalc (equip/status/trait) reads real
@@ -470,11 +469,7 @@ impl PacketProcessor {
     /// game-message subpacket. Without this ack the client never advances
     /// to sending 0x0006 (LanguageCode), so the login flow stalls before
     /// `handle_language_code` and the zone-in bundle ever fire.
-    async fn handle_gm_handshake_ack(
-        &self,
-        client: &ClientHandle,
-        session_id: u32,
-    ) -> Result<()> {
+    async fn handle_gm_handshake_ack(&self, client: &ClientHandle, session_id: u32) -> Result<()> {
         let reply = tx::build_gm_0x02_ack(session_id);
         client.send_bytes(reply.to_bytes()).await;
         tracing::debug!(session = session_id, "gm handshake ack sent");
@@ -748,9 +743,7 @@ impl PacketProcessor {
                         crate::lua::command::LuaCommandArg::Bool(false) => {
                             common::luaparam::LuaParam::False
                         }
-                        crate::lua::command::LuaCommandArg::Nil => {
-                            common::luaparam::LuaParam::Nil
-                        }
+                        crate::lua::command::LuaCommandArg::Nil => common::luaparam::LuaParam::Nil,
                         crate::lua::command::LuaCommandArg::ActorId(id) => {
                             common::luaparam::LuaParam::Actor(id)
                         }
@@ -760,7 +753,11 @@ impl PacketProcessor {
                 // 2-arg Lua form and 3-arg form both land here); only
                 // the rarely-used `KickEventSpecial` uses 0.
                 let mut sub = crate::packets::send::events::build_kick_event(
-                    player_id, actor_id, &trigger, 5, &lua_params,
+                    player_id,
+                    actor_id,
+                    &trigger,
+                    5,
+                    &lua_params,
                 );
                 sub.set_target_id(session_id);
                 if let Some(client) = self.world.client(session_id).await {
@@ -840,15 +837,11 @@ impl PacketProcessor {
                 // — strip it back off here so `create_director_with_id`
                 // re-applies the encoding correctly (otherwise the
                 // round-trip drifts by 4 every CreateDirector call).
-                let director_local_id =
-                    (director_actor_id & 0x0007_FFFF).saturating_sub(2);
+                let director_local_id = (director_actor_id & 0x0007_FFFF).saturating_sub(2);
                 if let Some(zone_arc) = self.world.zone(zone_actor_id).await {
                     let mut zone = zone_arc.write().await;
-                    zone.core.create_director_with_id(
-                        director_local_id,
-                        class_path.clone(),
-                        false,
-                    );
+                    zone.core
+                        .create_director_with_id(director_local_id, class_path.clone(), false);
                 }
                 tracing::info!(
                     director = director_actor_id,
@@ -1047,9 +1040,7 @@ impl PacketProcessor {
                         crate::lua::command::LuaCommandArg::Bool(false) => {
                             common::luaparam::LuaParam::False
                         }
-                        crate::lua::command::LuaCommandArg::Nil => {
-                            common::luaparam::LuaParam::Nil
-                        }
+                        crate::lua::command::LuaCommandArg::Nil => common::luaparam::LuaParam::Nil,
                         crate::lua::command::LuaCommandArg::ActorId(id) => {
                             common::luaparam::LuaParam::Actor(id)
                         }
@@ -1107,10 +1098,16 @@ impl PacketProcessor {
                 self.apply_set_snpc(player_id, nickname, actor_class_id, personality)
                     .await;
             }
-            LC::DoClassChange { player_id, class_id } => {
+            LC::DoClassChange {
+                player_id,
+                class_id,
+            } => {
                 self.apply_do_class_change(player_id, class_id).await;
             }
-            LC::PrepareClassChange { player_id, class_id } => {
+            LC::PrepareClassChange {
+                player_id,
+                class_id,
+            } => {
                 self.apply_prepare_class_change(player_id, class_id).await;
             }
             LC::QuestSetNpcLsFrom {
@@ -1237,7 +1234,11 @@ impl PacketProcessor {
                 flag,
             } => {
                 crate::runtime::quest_apply::apply_set_quest_complete(
-                    player_id, quest_id, flag, &self.registry, &self.db,
+                    player_id,
+                    quest_id,
+                    flag,
+                    &self.registry,
+                    &self.db,
                 )
                 .await;
             }
@@ -1267,12 +1268,7 @@ impl PacketProcessor {
                 }
                 match self.db.add_gil(actor_id, amount).await {
                     Ok(total) => {
-                        tracing::info!(
-                            actor = actor_id,
-                            delta = amount,
-                            total,
-                            "AddGil applied",
-                        );
+                        tracing::info!(actor = actor_id, delta = amount, total, "AddGil applied",);
                         // Currency-package inventory refresh packet emission
                         // deferred — the next zone-in / explicit inventory
                         // resync reflects the new balance.
@@ -1573,7 +1569,8 @@ impl PacketProcessor {
                 retainer_id,
                 new_name,
             } => {
-                self.apply_rename_retainer(player_id, retainer_id, new_name).await;
+                self.apply_rename_retainer(player_id, retainer_id, new_name)
+                    .await;
             }
             LC::AddRetainerBazaarItem {
                 retainer_id,
@@ -1594,7 +1591,10 @@ impl PacketProcessor {
             LC::SetSleeping { player_id } => {
                 self.apply_set_sleeping(player_id).await;
             }
-            LC::StartDream { player_id, dream_id } => {
+            LC::StartDream {
+                player_id,
+                dream_id,
+            } => {
                 self.apply_start_dream(player_id, dream_id).await;
             }
             LC::EndDream { player_id } => {
@@ -1611,7 +1611,8 @@ impl PacketProcessor {
                 appearance_id,
                 name,
             } => {
-                self.apply_issue_chocobo(player_id, appearance_id, name).await;
+                self.apply_issue_chocobo(player_id, appearance_id, name)
+                    .await;
             }
             LC::StartChocoboRental { player_id, minutes } => {
                 self.apply_start_chocobo_rental(player_id, minutes).await;
@@ -1628,10 +1629,18 @@ impl PacketProcessor {
             LC::JoinGC { player_id, gc } => {
                 self.apply_join_gc(player_id, gc).await;
             }
-            LC::SetGCRank { player_id, gc, rank } => {
+            LC::SetGCRank {
+                player_id,
+                gc,
+                rank,
+            } => {
                 self.apply_set_gc_rank(player_id, gc, rank).await;
             }
-            LC::AddSeals { player_id, gc, amount } => {
+            LC::AddSeals {
+                player_id,
+                gc,
+                amount,
+            } => {
                 self.apply_add_seals(player_id, gc, amount).await;
             }
             LC::PromoteGC { player_id, gc } => {
@@ -1838,16 +1847,15 @@ impl PacketProcessor {
         // session so the ticker can fire `onUpdate(tick, area)`
         // periodically. Cleared on logout / `ContentFinished`.
         if let Some(mut snap) = self.world.session(handle.session_id).await {
-            snap.active_content_script =
-                Some(crate::data::ActiveContentScript {
-                    parent_zone_id,
-                    area_name: area_name.clone(),
-                    area_class_path: area_class_path.clone(),
-                    director_name: director_name.clone(),
-                    director_actor_id,
-                    content_area_actor_id,
-                    content_script: content_script.clone(),
-                });
+            snap.active_content_script = Some(crate::data::ActiveContentScript {
+                parent_zone_id,
+                area_name: area_name.clone(),
+                area_class_path: area_class_path.clone(),
+                director_name: director_name.clone(),
+                director_actor_id,
+                content_area_actor_id,
+                content_script: content_script.clone(),
+            });
             self.world.upsert_session(snap).await;
         }
 
@@ -2431,11 +2439,7 @@ impl PacketProcessor {
     ///     with no client of their own).
     ///   * Member names default to a synthetic `bnpc_<id>` if the
     ///     actor isn't in the registry yet (rare race window).
-    async fn apply_party_add_member(
-        &self,
-        leader_actor_id: u32,
-        member_actor_id: u32,
-    ) {
+    async fn apply_party_add_member(&self, leader_actor_id: u32, member_actor_id: u32) {
         let Some(leader_handle) = self.registry.get(leader_actor_id).await else {
             tracing::debug!(
                 leader = format!("0x{leader_actor_id:08X}"),
@@ -2547,7 +2551,10 @@ impl PacketProcessor {
         ];
 
         let Some(client) = self.world.client(session_id).await else {
-            tracing::debug!(session = session_id, "PartyAddMember skipped — no client handle");
+            tracing::debug!(
+                session = session_id,
+                "PartyAddMember skipped — no client handle"
+            );
             return;
         };
         for sub in &mut subs {
@@ -2871,10 +2878,7 @@ impl PacketProcessor {
                     crate::packets::send::actor::build_set_actor_property_u32(
                         actor_id,
                         "charaWork/currentContentGroup",
-                        common::utils::murmur_hash2(
-                            "charaWork.currentContentGroup",
-                            0,
-                        ),
+                        common::utils::murmur_hash2("charaWork.currentContentGroup", 0),
                         GROUP_TYPE_CONTENT_GROUP,
                     ),
                     crate::packets::send::groups::build_group_header(
@@ -2934,9 +2938,7 @@ impl PacketProcessor {
         // Clear pending_kick_event so send_zone_in_bundle's end-of-bundle
         // emission doesn't re-fire it. Idempotent — a no-op if we didn't
         // pre-emit.
-        if emitted_pre_warp_kick
-            && let Some(mut snap) = self.world.session(session_id).await
-        {
+        if emitted_pre_warp_kick && let Some(mut snap) = self.world.session(session_id).await {
             snap.pending_kick_event = None;
             self.world.upsert_session(snap).await;
         }
@@ -2947,9 +2949,7 @@ impl PacketProcessor {
             )
             .await;
         client
-            .send_bytes(
-                crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes(),
-            )
+            .send_bytes(crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes())
             .await;
 
         // 4. Replay the zone-in bundle. `send_zone_in_bundle` reads from
@@ -3084,10 +3084,9 @@ impl PacketProcessor {
                 //    the wire as 0x0130 / 0x0131. So the cinematic
                 //    body finally lands in the post-warp packet
                 //    stream.
-                if let Some(resumed) = lua.fire_player_event_and_drain(
-                    player_id,
-                    mlua::MultiValue::new(),
-                ) {
+                if let Some(resumed) =
+                    lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+                {
                     let resumed_count = resumed.len();
                     if !resumed.is_empty() {
                         crate::runtime::quest_apply::apply_runtime_lua_commands(
@@ -3272,9 +3271,7 @@ impl PacketProcessor {
             )
             .await;
         client
-            .send_bytes(
-                crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes(),
-            )
+            .send_bytes(crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes())
             .await;
 
         // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
@@ -3320,7 +3317,13 @@ impl PacketProcessor {
         };
         let (zone_id, cur_x, cur_y, cur_z, cur_rot) = {
             let c = handle.character.read().await;
-            (c.base.zone_id, c.base.position_x, c.base.position_y, c.base.position_z, c.base.rotation)
+            (
+                c.base.zone_id,
+                c.base.position_x,
+                c.base.position_y,
+                c.base.position_z,
+                c.base.rotation,
+            )
         };
         let (x, y, z, rotation) = target.unwrap_or((cur_x, cur_y, cur_z, cur_rot));
         // spawn_type=2 == "warp" (matches Meteor's WarpToPublicArea
@@ -3353,7 +3356,13 @@ impl PacketProcessor {
         };
         let (zone_id, cur_x, cur_y, cur_z, cur_rot) = {
             let c = handle.character.read().await;
-            (c.base.zone_id, c.base.position_x, c.base.position_y, c.base.position_z, c.base.rotation)
+            (
+                c.base.zone_id,
+                c.base.position_x,
+                c.base.position_y,
+                c.base.position_z,
+                c.base.rotation,
+            )
         };
         let (x, y, z, rotation) = target.unwrap_or((cur_x, cur_y, cur_z, cur_rot));
         self.apply_do_zone_change(
@@ -3495,8 +3504,7 @@ impl PacketProcessor {
         npc.character.base.actor_id = retainer_actor_id;
         npc.character.chara.actor_class_id = template.actor_class_id;
         // Retail uses `_rtnre{actorId:x7}` for the wire actor name.
-        npc.character.base.actor_name =
-            format!("_rtnre{:07x}", retainer_actor_id);
+        npc.character.base.actor_name = format!("_rtnre{:07x}", retainer_actor_id);
 
         // Resolve the zone name for `generate_npc_actor_name` inside
         // `push_npc_spawn`. Missing zone is non-fatal — the helper
@@ -3511,10 +3519,7 @@ impl PacketProcessor {
         // never broadcasts them via `BroadcastPacketAroundActor`, only
         // queues onto the owner's `actorInstanceList` in
         // `Session.UpdateInstance` (Session.cs:134).
-        let bundle = crate::world_manager::build_retainer_spawn_bundle(
-            &npc.character,
-            &zone_name,
-        );
+        let bundle = crate::world_manager::build_retainer_spawn_bundle(&npc.character, &zone_name);
         if let Some(client) = self.world.client(session_id).await {
             for mut sub in bundle {
                 sub.set_target_id(session_id);
@@ -3538,8 +3543,8 @@ impl PacketProcessor {
         // owning client matching the pattern used for parties.
         let group_id = retainer_meeting_group_id(retainer_actor_id);
         {
-            use crate::group::{GroupKind, GroupTypeId, RetainerMeetingRelationGroup};
             use crate::group::outbox::{GroupEvent, GroupOutbox};
+            use crate::group::{GroupKind, GroupTypeId, RetainerMeetingRelationGroup};
             let mut outbox = GroupOutbox::new();
             let _group = RetainerMeetingRelationGroup::new(
                 group_id,
@@ -3565,13 +3570,8 @@ impl PacketProcessor {
                     debug_assert_eq!(*kind, GroupKind::Retainer);
                     debug_assert_eq!(*type_id, GroupTypeId::RETAINER);
                 }
-                crate::group::dispatch_group_event(
-                    &event,
-                    &self.registry,
-                    &self.world,
-                    &resolver,
-                )
-                .await;
+                crate::group::dispatch_group_event(&event, &self.registry, &self.world, &resolver)
+                    .await;
             }
         }
 
@@ -3658,13 +3658,8 @@ impl PacketProcessor {
                 retainer_name: snap.name.clone(),
             };
             for event in outbox.drain() {
-                crate::group::dispatch_group_event(
-                    &event,
-                    &self.registry,
-                    &self.world,
-                    &resolver,
-                )
-                .await;
+                crate::group::dispatch_group_event(&event, &self.registry, &self.world, &resolver)
+                    .await;
             }
         }
         tracing::info!(
@@ -3867,10 +3862,7 @@ impl PacketProcessor {
     /// drops every effect tagged for logout removal and drains the
     /// resulting status events (slot-clear packets + `onLose` Lua
     /// hooks + recalc) before the client connection drops.
-    async fn purge_status_effects_on_disconnect(
-        &self,
-        handle: &crate::runtime::ActorHandle,
-    ) {
+    async fn purge_status_effects_on_disconnect(&self, handle: &crate::runtime::ActorHandle) {
         let mut outbox = crate::status::StatusOutbox::new();
         {
             let mut c = handle.character.write().await;
@@ -3932,11 +3924,8 @@ impl PacketProcessor {
         if session_id != 0
             && let Some(client) = self.world.client(session_id).await
         {
-            let pkt = crate::packets::send::player::build_set_player_dream(
-                handle.actor_id,
-                0,
-                inn_code,
-            );
+            let pkt =
+                crate::packets::send::player::build_set_player_dream(handle.actor_id, 0, inn_code);
             if let Ok(base) = common::BasePacket::create_from_subpacket(&pkt, true, false) {
                 client.send_bytes(base.to_bytes()).await;
             }
@@ -4048,10 +4037,7 @@ impl PacketProcessor {
                 expire,
                 min_left,
             ),
-            2 => crate::packets::send::player::build_set_current_mount_goobbue(
-                handle.actor_id,
-                1,
-            ),
+            2 => crate::packets::send::player::build_set_current_mount_goobbue(handle.actor_id, 1),
             _ => return,
         };
         if let Ok(base) = common::BasePacket::create_from_subpacket(&pkt, true, false) {
@@ -4094,8 +4080,7 @@ impl PacketProcessor {
             tracing::warn!(player = player_id, err = %e, "SetChocoboName: DB persist failed");
         }
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt =
-                crate::packets::send::player::build_set_chocobo_name(handle.actor_id, &name);
+            let pkt = crate::packets::send::player::build_set_chocobo_name(handle.actor_id, &name);
             if let Ok(base) = common::BasePacket::create_from_subpacket(&pkt, true, false) {
                 client.send_bytes(base.to_bytes()).await;
             }
@@ -4124,13 +4109,8 @@ impl PacketProcessor {
             )
         };
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt = crate::packets::send::player::build_set_grand_company(
-                handle.actor_id,
-                gc,
-                l,
-                g,
-                u,
-            );
+            let pkt =
+                crate::packets::send::player::build_set_grand_company(handle.actor_id, gc, l, g, u);
             if let Ok(base) = common::BasePacket::create_from_subpacket(&pkt, true, false) {
                 client.send_bytes(base.to_bytes()).await;
             }
@@ -4965,11 +4945,7 @@ impl PacketProcessor {
             _ => 0,
         };
         let new_value = current.saturating_add(1).max(1);
-        if let Err(e) = self
-            .db
-            .save_player_play_time(player_id, new_value)
-            .await
-        {
+        if let Err(e) = self.db.save_player_play_time(player_id, new_value).await {
             tracing::warn!(
                 player = player_id, play_time = new_value,
                 err = %e,
@@ -5041,8 +5017,8 @@ impl PacketProcessor {
             let mut c = handle.character.write().await;
             c.chara.current_job = job_id as u16;
         }
-        let bytes = crate::packets::send::player::build_set_current_job(actor_id, job_id as u32)
-            .to_bytes();
+        let bytes =
+            crate::packets::send::player::build_set_current_job(actor_id, job_id as u32).to_bytes();
         crate::runtime::dispatcher::send_to_self_if_player(
             &self.registry,
             &self.world,
@@ -5133,10 +5109,9 @@ impl PacketProcessor {
             )
         };
         let (hp, hp_max, mp, mp_max, tp) = post_pools;
-        let mut subs =
-            crate::packets::send::actor::build_chara_state_at_quickly_for_all(
-                actor_id, hp, hp_max, mp, mp_max, tp,
-            );
+        let mut subs = crate::packets::send::actor::build_chara_state_at_quickly_for_all(
+            actor_id, hp, hp_max, mp, mp_max, tp,
+        );
         // Players also get the player-variant bundle (extra fields:
         // class slot + main-skill level). Bnpcs don't need it; the
         // chara variant alone updates their nameplate HP bar.
@@ -5176,7 +5151,11 @@ impl PacketProcessor {
             actor = actor_id,
             ?kind,
             value,
-            hp, hp_max, mp, mp_max, tp,
+            hp,
+            hp_max,
+            mp,
+            mp_max,
+            tp,
             "SetPool applied + broadcast"
         );
     }
@@ -5240,7 +5219,11 @@ impl PacketProcessor {
             client.send_bytes(pkt.to_bytes()).await;
             tracing::info!(
                 actor = actor_id,
-                x, y, z, rotation, spawn_type,
+                x,
+                y,
+                z,
+                rotation,
+                spawn_type,
                 "WarpToPosition applied + SetActorPosition emitted"
             );
         } else {
@@ -5711,10 +5694,7 @@ impl PacketProcessor {
         // the chocobo `SendMountAppearance` pattern at
         // `apply_send_mount_appearance:1719-1745`.
         const RANKUP_ANIMATION_ID: u32 = 0x4000_FFB;
-        let sub = tx::actor::build_play_animation_on_actor(
-            handle.actor_id,
-            RANKUP_ANIMATION_ID,
-        );
+        let sub = tx::actor::build_play_animation_on_actor(handle.actor_id, RANKUP_ANIMATION_ID);
         if let Ok(base) = common::BasePacket::create_from_subpacket(&sub, true, false) {
             let bytes = base.to_bytes();
             // Self-emit so the promoting player sees the salute
@@ -5830,12 +5810,7 @@ impl PacketProcessor {
     /// so the same session's future reads (e.g. the
     /// `GetSpawnedRetainer():GetName()` chain) see the new name
     /// without a re-summon.
-    async fn apply_rename_retainer(
-        &self,
-        player_id: u32,
-        retainer_id: u32,
-        new_name: String,
-    ) {
+    async fn apply_rename_retainer(&self, player_id: u32, retainer_id: u32, new_name: String) {
         if new_name.trim().is_empty() {
             tracing::debug!(
                 player = player_id,
@@ -6171,10 +6146,8 @@ impl PacketProcessor {
             sub.set_target_id(player_id);
             client.send_bytes(sub.to_bytes()).await;
         }
-        let mut graphic = crate::packets::send::build_set_actor_quest_graphic(
-            npc_actor_id,
-            enpc.quest_flag_type,
-        );
+        let mut graphic =
+            crate::packets::send::build_set_actor_quest_graphic(npc_actor_id, enpc.quest_flag_type);
         graphic.set_target_id(player_id);
         client.send_bytes(graphic.to_bytes()).await;
     }
@@ -6301,7 +6274,12 @@ impl PacketProcessor {
                 "AddQuest DB persist failed",
             );
         }
-        tracing::info!(player = player_id, quest = quest_id, slot, "AddQuest applied");
+        tracing::info!(
+            player = player_id,
+            quest = quest_id,
+            slot,
+            "AddQuest applied"
+        );
 
         // Fan out the canonical "<Quest> added to journal" toast.
         // Mirror C# `WorldManager.AddQuest`'s
@@ -6425,11 +6403,7 @@ impl PacketProcessor {
                 "AbandonQuest DB delete failed",
             );
         }
-        tracing::info!(
-            player = player_id,
-            quest = quest_id,
-            "AbandonQuest applied",
-        );
+        tracing::info!(player = player_id, quest = quest_id, "AbandonQuest applied",);
 
         // Fan out the canonical "<Quest> abandoned." toast.
         // Mirror C# `WorldManager.AbandonQuest`'s
@@ -6498,15 +6472,17 @@ impl PacketProcessor {
             let quest = c
                 .quest_journal
                 .get(quest_id)
-                .map(|q| (
-                    q.get_sequence(),
-                    q.get_flags(),
-                    q.get_counter(0),
-                    q.get_counter(1),
-                    q.get_counter(2),
-                    q.get_npc_ls_from(),
-                    q.get_npc_ls_msg_step(),
-                ))
+                .map(|q| {
+                    (
+                        q.get_sequence(),
+                        q.get_flags(),
+                        q.get_counter(0),
+                        q.get_counter(1),
+                        q.get_counter(2),
+                        q.get_npc_ls_from(),
+                        q.get_npc_ls_msg_step(),
+                    )
+                })
                 .unwrap_or((0, 0, 0, 0, 0, 0, 0));
             let handle = crate::lua::LuaQuestHandle {
                 player_id: snapshot.actor_id,
@@ -6628,8 +6604,8 @@ impl PacketProcessor {
                 sequence: q.get_sequence(),
                 flags: q.get_flags(),
                 counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
-            npc_ls_from: q.get_npc_ls_from(),
-            npc_ls_msg_step: q.get_npc_ls_msg_step(),
+                npc_ls_from: q.get_npc_ls_from(),
+                npc_ls_msg_step: q.get_npc_ls_msg_step(),
                 queue: crate::lua::command::CommandQueue::new(),
             };
             (snap, qh)
@@ -7107,7 +7083,8 @@ impl PacketProcessor {
             0 => Some("onCommand"),
             _ => None,
         } {
-            self.fire_quest_hook_for_active_quests(&handle, owner_actor_id, hook_name).await;
+            self.fire_quest_hook_for_active_quests(&handle, owner_actor_id, hook_name)
+                .await;
         }
 
         // SEQ-005 content-tutorial handshake (UNRESOLVED — breadcrumb for
@@ -7591,9 +7568,7 @@ impl PacketProcessor {
                     }
                 }
             } else {
-                tracing::warn!(
-                    "gm command requested via chat but CommandProcessor is not wired",
-                );
+                tracing::warn!("gm command requested via chat but CommandProcessor is not wired",);
             }
             return Ok(());
         }
@@ -7997,7 +7972,9 @@ fn hash_name_to_id(name: &str) -> u64 {
 /// reads: `GetPlayTime` (returns 0 → "new player"), `GetInitialTown`,
 /// `HasQuest`, `GetZoneID`, plus the `playerWork.tribe` field read in
 /// the tutorial branch.
-pub(crate) fn build_player_snapshot_for_login(c: &Character) -> crate::lua::userdata::PlayerSnapshot {
+pub(crate) fn build_player_snapshot_for_login(
+    c: &Character,
+) -> crate::lua::userdata::PlayerSnapshot {
     crate::lua::userdata::PlayerSnapshot {
         actor_id: c.base.actor_id,
         name: c.base.actor_name.clone(),
@@ -8082,7 +8059,9 @@ pub(crate) fn build_player_snapshot_for_login(c: &Character) -> crate::lua::user
 /// returns accurate values for `HasQuest` / `IsQuestCompleted` /
 /// `GetFreeQuestSlot` and so `LuaQuestHandle` getters resolve against
 /// real sequence/flags/counters.
-pub(crate) fn build_player_snapshot_from_character(c: &Character) -> crate::lua::userdata::PlayerSnapshot {
+pub(crate) fn build_player_snapshot_from_character(
+    c: &Character,
+) -> crate::lua::userdata::PlayerSnapshot {
     let mut snapshot = build_player_snapshot_for_login(c);
     // Overlay the live EventSession state. The Lua bindings for
     // `player:RunEventFunction(...)` and `player:EndEvent()` read

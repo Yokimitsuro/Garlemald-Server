@@ -214,7 +214,10 @@ fn append_hex_dump(out: &mut String, bytes: &[u8]) {
 /// lifetime of the process since the file may be rotated externally.
 #[allow(dead_code)]
 pub fn log_path() -> Option<&'static Path> {
-    LOGGER.get().and_then(|o| o.as_ref()).map(|l| l.path.as_path())
+    LOGGER
+        .get()
+        .and_then(|o| o.as_ref())
+        .map(|l| l.path.as_path())
 }
 
 #[cfg(test)]

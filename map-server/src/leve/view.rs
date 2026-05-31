@@ -255,7 +255,10 @@ mod tests {
     #[test]
     fn type_classifier_splits_ranges_correctly() {
         assert_eq!(leve_type_from_quest_id(130_001), Some(LeveType::Fieldcraft));
-        assert_eq!(leve_type_from_quest_id(140_001), Some(LeveType::Battlecraft));
+        assert_eq!(
+            leve_type_from_quest_id(140_001),
+            Some(LeveType::Battlecraft)
+        );
         assert_eq!(leve_type_from_quest_id(120_001), None);
     }
 
@@ -329,7 +332,10 @@ mod tests {
         let mut view = RegionalLeveView::new(&mut q, &d);
         view.set_accepted(true);
         let fired = view.advance_progress(0);
-        assert!(!fired, "zero-objective rows are malformed; don't auto-complete");
+        assert!(
+            !fired,
+            "zero-objective rows are malformed; don't auto-complete"
+        );
         assert!(!view.is_completed());
     }
 }

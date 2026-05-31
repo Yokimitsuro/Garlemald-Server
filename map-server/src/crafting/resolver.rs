@@ -87,9 +87,7 @@ impl RecipeResolver {
     /// practice this is called once per craft-start to resolve the
     /// active leve's target item, not inside any hot loop.
     pub fn by_item_id(&self, item_id: u32) -> Option<&Recipe> {
-        self.by_id
-            .values()
-            .find(|r| r.result_item_id == item_id)
+        self.by_id.values().find(|r| r.result_item_id == item_id)
     }
 
     /// Recipes matching an ordered 8-slot material fingerprint. Padding
@@ -98,11 +96,7 @@ impl RecipeResolver {
     pub fn by_mats(&self, fingerprint: [u32; RECIPE_MATERIAL_SLOTS]) -> Vec<&Recipe> {
         self.by_mats
             .get(&fingerprint)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.by_id.get(id))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|id| self.by_id.get(id)).collect())
             .unwrap_or_default()
     }
 
@@ -142,7 +136,12 @@ mod tests {
             mk(1, 100, [10, 0, 0, 0, 0, 0, 0, 0]),
             mk(2, 100, [20, 0, 0, 0, 0, 0, 0, 0]),
         ]);
-        assert_eq!(r.by_item_id(100).map(|x| x.id).filter(|id| *id == 1 || *id == 2), r.by_item_id(100).map(|x| x.id));
+        assert_eq!(
+            r.by_item_id(100)
+                .map(|x| x.id)
+                .filter(|id| *id == 1 || *id == 2),
+            r.by_item_id(100).map(|x| x.id)
+        );
         assert!(r.by_item_id(999).is_none());
     }
 

@@ -382,7 +382,8 @@ pub fn build_set_event_status(
 ) -> SubPacket {
     let mut data = body(0x48);
     let mut c = Cursor::new(&mut data[..]);
-    c.write_u32::<LittleEndian>(if enabled { 1 } else { 0 }).unwrap();
+    c.write_u32::<LittleEndian>(if enabled { 1 } else { 0 })
+        .unwrap();
     c.write_u8(ty).unwrap();
     write_padded_ascii(&mut c, condition_name, 0x20);
     SubPacket::new(OP_SET_EVENT_STATUS, actor_id, data)

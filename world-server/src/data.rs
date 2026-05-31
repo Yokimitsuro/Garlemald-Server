@@ -94,7 +94,12 @@ pub struct SessionState {
 
 impl Session {
     pub fn new(session_id: u32, channel: SessionChannel, client: ClientHandle) -> Self {
-        Self { session_id, channel, client, state: Mutex::new(SessionState::default()) }
+        Self {
+            session_id,
+            channel,
+            client,
+            state: Mutex::new(SessionState::default()),
+        }
     }
 }
 

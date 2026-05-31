@@ -139,13 +139,7 @@ pub fn world_list_packets(sequence: u64, worlds: &[World]) -> Vec<SubPacket> {
             let mut buf = vec![0u8; CAPACITY];
             {
                 let mut c = Cursor::new(&mut buf[..]);
-                write_list_header(
-                    &mut c,
-                    sequence,
-                    packets.len(),
-                    MAX,
-                    worlds.len() - total,
-                );
+                write_list_header(&mut c, sequence, packets.len(), MAX, worlds.len() - total);
             }
             current = Some((buf, 0x10));
         }
@@ -155,7 +149,8 @@ pub fn world_list_packets(sequence: u64, worlds: &[World]) -> Vec<SubPacket> {
             c.set_position(*pos as u64);
             c.write_u16::<LittleEndian>(world.id).unwrap();
             c.write_u16::<LittleEndian>(world.list_position).unwrap();
-            c.write_u32::<LittleEndian>(world.population as u32).unwrap();
+            c.write_u32::<LittleEndian>(world.population as u32)
+                .unwrap();
             c.write_u64::<LittleEndian>(0).unwrap();
             let mut name = vec![0u8; 64];
             let name_bytes = world.name.as_bytes();
@@ -211,13 +206,7 @@ pub fn account_list_packets(sequence: u64, accounts: &[Account]) -> Vec<SubPacke
             let mut buf = vec![0u8; CAPACITY];
             {
                 let mut c = Cursor::new(&mut buf[..]);
-                write_list_header(
-                    &mut c,
-                    sequence,
-                    packets.len(),
-                    MAX,
-                    accounts.len() - total,
-                );
+                write_list_header(&mut c, sequence, packets.len(), MAX, accounts.len() - total);
             }
             current = Some((buf, 0x10));
         }
@@ -283,8 +272,8 @@ pub fn character_list_packets(
     // GARLEMALD_SUPPRESS_NEW_SLOT=1 for debugging the Character Select crash
     // — when that env var is set AND we already have a character, skip the
     // placeholder so the client only sees the real entries.
-    let suppress_placeholder = std::env::var_os("GARLEMALD_SUPPRESS_NEW_SLOT").is_some()
-        && !characters.is_empty();
+    let suppress_placeholder =
+        std::env::var_os("GARLEMALD_SUPPRESS_NEW_SLOT").is_some() && !characters.is_empty();
     let num_characters = if characters.len() >= 8 {
         8
     } else if suppress_placeholder {
@@ -300,13 +289,7 @@ pub fn character_list_packets(
             let mut buf = vec![0u8; CAPACITY];
             {
                 let mut c = Cursor::new(&mut buf[..]);
-                write_list_header(
-                    &mut c,
-                    sequence,
-                    packets.len(),
-                    MAX,
-                    num_characters - total,
-                );
+                write_list_header(&mut c, sequence, packets.len(), MAX, num_characters - total);
             }
             current = Some((buf, 0x10));
         }
@@ -318,7 +301,9 @@ pub fn character_list_packets(
             c.set_position(entry_start as u64);
 
             let world = world_lookup(chara.server_id);
-            let world_name = world.map(|w| w.name).unwrap_or_else(|| "Unknown".to_string());
+            let world_name = world
+                .map(|w| w.name)
+                .unwrap_or_else(|| "Unknown".to_string());
 
             c.write_u32::<LittleEndian>(0).unwrap();
             c.write_u32::<LittleEndian>(chara.id).unwrap();
@@ -363,13 +348,7 @@ pub fn character_list_packets(
             let mut buf = vec![0u8; CAPACITY];
             {
                 let mut c = Cursor::new(&mut buf[..]);
-                write_list_header(
-                    &mut c,
-                    sequence,
-                    packets.len(),
-                    MAX,
-                    num_characters - total,
-                );
+                write_list_header(&mut c, sequence, packets.len(), MAX, num_characters - total);
             }
             current = Some((buf, 0x10));
         }
@@ -398,9 +377,10 @@ pub fn character_list_packets(
     }
 
     if (char_count > 0 || num_characters == 0)
-        && let Some((buf, _)) = current.take() {
-            packets.push(subpacket_for(OPCODE, buf));
-        }
+        && let Some((buf, _)) = current.take()
+    {
+        packets.push(subpacket_for(OPCODE, buf));
+    }
 
     packets
 }
@@ -443,7 +423,8 @@ pub fn retainer_list_packets(sequence: u64, retainers: &[Retainer]) -> Vec<SubPa
             c.write_u32::<LittleEndian>(retainer.id).unwrap();
             c.write_u32::<LittleEndian>(retainer.character_id).unwrap();
             c.write_u16::<LittleEndian>(total as u16).unwrap();
-            c.write_u16::<LittleEndian>(if retainer.do_rename { 0x04 } else { 0x00 }).unwrap();
+            c.write_u16::<LittleEndian>(if retainer.do_rename { 0x04 } else { 0x00 })
+                .unwrap();
             c.write_u32::<LittleEndian>(0).unwrap();
             write_padded_ascii(&mut c, &retainer.name, 0x20);
             *pos = c.position() as usize;
@@ -505,7 +486,11 @@ pub fn import_list_packets(sequence: u64, names: &[String]) -> Vec<SubPacket> {
             c.set_position(*pos as u64);
             c.write_u32::<LittleEndian>(0).unwrap();
             c.write_u32::<LittleEndian>(total as u32).unwrap();
-            let full = if !name.contains(' ') { format!("{name} Last") } else { name.clone() };
+            let full = if !name.contains(' ') {
+                format!("{name} Last")
+            } else {
+                name.clone()
+            };
             write_padded_ascii(&mut c, &full, 0x20);
             *pos = c.position() as usize;
         }

@@ -135,7 +135,15 @@ pub async fn fire_on_kill_bnpc(
             .active_quest_states
             .iter()
             .find(|s| s.quest_id == quest_id)
-            .map(|s| (s.sequence, s.flags, s.counters, s.npc_ls_from, s.npc_ls_msg_step))
+            .map(|s| {
+                (
+                    s.sequence,
+                    s.flags,
+                    s.counters,
+                    s.npc_ls_from,
+                    s.npc_ls_msg_step,
+                )
+            })
             .unwrap_or((0, 0, [0; 3], 0, 0));
         let handle = crate::lua::LuaQuestHandle {
             player_id: snapshot.actor_id,
@@ -273,7 +281,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let db = crate::database::Database::open(db_path).await.expect("db stub");
+        let db = crate::database::Database::open(db_path)
+            .await
+            .expect("db stub");
 
         fire_on_kill_bnpc(&handle, &lua, 1_000_438, &registry, &db, &world).await;
 
@@ -317,7 +327,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let db = crate::database::Database::open(db_path).await.expect("db stub");
+        let db = crate::database::Database::open(db_path)
+            .await
+            .expect("db stub");
 
         fire_on_kill_bnpc(&handle, &lua, 999, &registry, &db, &world).await;
         // The assertion here is "no panic" — the function falls out of

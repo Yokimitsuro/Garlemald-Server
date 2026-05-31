@@ -169,13 +169,15 @@ impl<'a> PassiveGuildleveView<'a> {
     pub fn craft_success(&mut self, result_quantity: u16) {
         let new_crafted = self.current_crafted().saturating_add(result_quantity);
         self.quest.set_counter(1, new_crafted);
-        self.quest.set_counter(0, self.current_attempt().saturating_add(1));
+        self.quest
+            .set_counter(0, self.current_attempt().saturating_add(1));
     }
 
     /// `PassiveGuildleve.CraftFail()` — one attempt consumed, nothing
     /// produced.
     pub fn craft_fail(&mut self) {
-        self.quest.set_counter(0, self.current_attempt().saturating_add(1));
+        self.quest
+            .set_counter(0, self.current_attempt().saturating_add(1));
     }
 }
 

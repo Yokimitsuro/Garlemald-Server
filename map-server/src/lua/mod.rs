@@ -106,11 +106,7 @@ pub struct LuaNpcSpec {
 }
 
 impl QuestHookArg {
-    fn into_value(
-        self,
-        lua: &Lua,
-        queue: Arc<Mutex<CommandQueue>>,
-    ) -> mlua::Result<Value> {
+    fn into_value(self, lua: &Lua, queue: Arc<Mutex<CommandQueue>>) -> mlua::Result<Value> {
         Ok(match self {
             QuestHookArg::Int(i) => Value::Integer(i as mlua::Integer),
             QuestHookArg::Bool(b) => Value::Boolean(b),
@@ -610,10 +606,7 @@ impl LuaEngine {
         };
 
         // Park if still alive + parked on a known wait directive.
-        if matches!(
-            thread.status(),
-            mlua::ThreadStatus::Resumable
-        ) {
+        if matches!(thread.status(), mlua::ThreadStatus::Resumable) {
             let directive = scheduler::classify_yield(&value);
             let parked = ParkedCoroutine {
                 lua: lua.clone(),
@@ -1179,17 +1172,41 @@ mod tests {
             vec![],
         );
 
-        assert!(result.error.is_none(), "onStart errored: {:?}", result.error);
-        let has_set_flag = result
-            .commands
-            .iter()
-            .any(|c| matches!(c, LuaCommand::QuestSetFlag { bit: 2, quest_id: 110_001, .. }));
-        let has_start_seq = result
-            .commands
-            .iter()
-            .any(|c| matches!(c, LuaCommand::QuestStartSequence { sequence: 5, quest_id: 110_001, .. }));
-        assert!(has_set_flag, "missing QuestSetFlag; got {:?}", result.commands);
-        assert!(has_start_seq, "missing QuestStartSequence; got {:?}", result.commands);
+        assert!(
+            result.error.is_none(),
+            "onStart errored: {:?}",
+            result.error
+        );
+        let has_set_flag = result.commands.iter().any(|c| {
+            matches!(
+                c,
+                LuaCommand::QuestSetFlag {
+                    bit: 2,
+                    quest_id: 110_001,
+                    ..
+                }
+            )
+        });
+        let has_start_seq = result.commands.iter().any(|c| {
+            matches!(
+                c,
+                LuaCommand::QuestStartSequence {
+                    sequence: 5,
+                    quest_id: 110_001,
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_set_flag,
+            "missing QuestSetFlag; got {:?}",
+            result.commands
+        );
+        assert!(
+            has_start_seq,
+            "missing QuestStartSequence; got {:?}",
+            result.commands
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1216,7 +1233,11 @@ mod tests {
             sample_quest_handle(CommandQueue::new()),
             vec![QuestHookArg::Bool(true)],
         );
-        assert!(result.error.is_none(), "missing hook should be quiet: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "missing hook should be quiet: {:?}",
+            result.error
+        );
         assert!(result.commands.is_empty());
 
         let _ = std::fs::remove_dir_all(root);
@@ -1270,7 +1291,11 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(c, LuaCommand::QuestSetFlag { bit: 5, .. }));
-        assert!(saw_flag, "npc:GetActorClassId matched — but SetQuestFlag didn't fire; got {:?}", result.commands);
+        assert!(
+            saw_flag,
+            "npc:GetActorClassId matched — but SetQuestFlag didn't fire; got {:?}",
+            result.commands
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1308,7 +1333,11 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(c, LuaCommand::QuestStartSequence { sequence: 99, .. }));
-        assert!(seen, "script didn't see sequence=10; got {:?}", result.commands);
+        assert!(
+            seen,
+            "script didn't see sequence=10; got {:?}",
+            result.commands
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1535,7 +1564,11 @@ mod tests {
             sample_content_area(dummy_queue.clone()),
             sample_director(dummy_queue),
         );
-        assert!(result.error.is_none(), "onZoneIn errored: {:?}", result.error);
+        assert!(
+            result.error.is_none(),
+            "onZoneIn errored: {:?}",
+            result.error
+        );
         let saw_setpos = result
             .commands
             .iter()
@@ -1637,7 +1670,11 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 8.0).abs() < 0.01));
-        assert!(saw_8, "GetSpeed should return 8 from snapshot.speed=8.0; got: {:?}", result.commands);
+        assert!(
+            saw_8,
+            "GetSpeed should return 8 from snapshot.speed=8.0; got: {:?}",
+            result.commands
+        );
     }
 
     /// Phase C2 — `player.target` returns a userdata with the right
@@ -2084,7 +2121,11 @@ mod tests {
             .commands
             .iter()
             .any(|c| matches!(c, LuaCommand::SetPos { x, .. } if (*x - 1.0).abs() < 0.01));
-        assert!(saw_pass, "Empty rosters should keep #t==0; got: {:?}", result.commands);
+        assert!(
+            saw_pass,
+            "Empty rosters should keep #t==0; got: {:?}",
+            result.commands
+        );
     }
 
     #[test]
@@ -2192,7 +2233,10 @@ mod tests {
         // EndEvent shouldn't fire — the coroutine yielded on _WAIT_EVENT
         // before reaching it.
         assert!(
-            !result.commands.iter().any(|c| matches!(c, LuaCommand::EndEvent { .. })),
+            !result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::EndEvent { .. })),
             "EndEvent should be deferred until coroutine resumes; got {:?}",
             result.commands,
         );
@@ -2298,7 +2342,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(moves.len(), 2, "expected 2 MoveActorToPosition cmds; got {:?}", result.commands);
+        assert_eq!(
+            moves.len(),
+            2,
+            "expected 2 MoveActorToPosition cmds; got {:?}",
+            result.commands
+        );
         assert_eq!(moves[0], (0x4000_2001, 365.5, 4.1, -700.0, 1.5, 1));
         // Second call omitted move_state — should default to 0.
         assert_eq!(moves[1], (0x4000_2001, 366.0, 4.1, -699.0, 0.0, 0));
@@ -2385,7 +2434,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(look_ats.len(), 2, "expected 2 LookAt cmds; got {:?}", result.commands);
+        assert_eq!(
+            look_ats.len(),
+            2,
+            "expected 2 LookAt cmds; got {:?}",
+            result.commands
+        );
         assert_eq!(look_ats[0], (0x4000_2001, 0x4000_2099));
         assert_eq!(look_ats[1], (0x4000_2001, 0x4000_3333));
     }
@@ -2460,7 +2514,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(moves.len(), 2, "expected 2 MoveActorToPosition cmds; got {:?}", result.commands);
+        assert_eq!(
+            moves.len(),
+            2,
+            "expected 2 MoveActorToPosition cmds; got {:?}",
+            result.commands
+        );
         assert_eq!(moves[0], (player_actor_id, 100.0, 0.0, 200.0, 1.5, 1));
         assert_eq!(moves[1], (player_actor_id, 101.0, 0.0, 201.0, 0.0, 0));
         let look_ats: Vec<_> = result
@@ -2474,7 +2533,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(look_ats.len(), 2, "expected 2 LookAt cmds; got {:?}", result.commands);
+        assert_eq!(
+            look_ats.len(),
+            2,
+            "expected 2 LookAt cmds; got {:?}",
+            result.commands
+        );
         assert_eq!(look_ats[0], (player_actor_id, 0x4000_5099));
         assert_eq!(look_ats[1], (player_actor_id, 0x4000_4444));
     }

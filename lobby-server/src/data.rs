@@ -68,7 +68,6 @@ pub struct Character {
     pub tribe: u8,
 }
 
-
 #[derive(Debug, Clone, Default)]
 pub struct Appearance {
     pub size: u8,
@@ -114,17 +113,17 @@ pub struct Appearance {
 /// into a single u32. Total width is 32 bits.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaceInfo {
-    pub characteristics: u32,        // 5 bits
-    pub characteristics_color: u32,  // 3 bits
-    pub face_type: u32,              // 6 bits
-    pub ears: u32,                   // 2 bits
-    pub mouth: u32,                  // 2 bits
-    pub features: u32,               // 2 bits
-    pub nose: u32,                   // 3 bits
-    pub eye_shape: u32,              // 3 bits
-    pub iris_size: u32,              // 1 bit
-    pub eyebrows: u32,               // 3 bits
-    pub unknown: u32,                // 2 bits
+    pub characteristics: u32,       // 5 bits
+    pub characteristics_color: u32, // 3 bits
+    pub face_type: u32,             // 6 bits
+    pub ears: u32,                  // 2 bits
+    pub mouth: u32,                 // 2 bits
+    pub features: u32,              // 2 bits
+    pub nose: u32,                  // 3 bits
+    pub eye_shape: u32,             // 3 bits
+    pub iris_size: u32,             // 1 bit
+    pub eyebrows: u32,              // 3 bits
+    pub unknown: u32,               // 2 bits
 }
 
 impl FaceInfo {
@@ -177,15 +176,15 @@ pub struct CharaInfo {
 /// Map tribe id → base racial model id, matching `CharaInfo.GetTribeModel`.
 pub fn get_tribe_model(tribe: u8) -> u32 {
     match tribe {
-        2 => 2,            // Hyur Midlander Female
-        4 | 6 => 3,        // Elezen Male
-        5 | 7 => 4,        // Elezen Female
-        8 | 10 => 5,       // Lalafell Male
-        9 | 11 => 6,       // Lalafell Female
-        12 | 13 => 8,      // Miqo'te Female
-        14 | 15 => 7,      // Roegadyn Male
-        3 => 9,            // Hyur Highlander Male
-        _ => 1,            // Hyur Midlander Male (default)
+        2 => 2,       // Hyur Midlander Female
+        4 | 6 => 3,   // Elezen Male
+        5 | 7 => 4,   // Elezen Female
+        8 | 10 => 5,  // Lalafell Male
+        9 | 11 => 6,  // Lalafell Female
+        12 | 13 => 8, // Miqo'te Female
+        14 | 15 => 7, // Roegadyn Male
+        3 => 9,       // Hyur Highlander Male
+        _ => 1,       // Hyur Midlander Male (default)
     }
 }
 

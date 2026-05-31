@@ -651,7 +651,11 @@ async fn dispatch_director_event_started(
             );
             return;
         };
-        (d.class_path.clone(), d.class_name.clone(), d.actor_name.clone())
+        (
+            d.class_path.clone(),
+            d.class_name.clone(),
+            d.actor_name.clone(),
+        )
     };
     let script_path = lua.resolver().director(&class_name);
     if !script_path.exists() {
@@ -909,14 +913,8 @@ async fn dispatch_event_updated_drain(
     // Drain non-event commands through the runtime-apply pipeline so
     // QuestSetFlag / QuestUpdateEnpcs / etc. fire the side-effects
     // (broadcasts, DB writes, dependent hook re-runs).
-    crate::runtime::quest_apply::apply_runtime_lua_commands(
-        after,
-        registry,
-        db,
-        world,
-        Some(lua),
-    )
-    .await;
+    crate::runtime::quest_apply::apply_runtime_lua_commands(after, registry, db, world, Some(lua))
+        .await;
 }
 
 #[allow(dead_code)]
@@ -1251,8 +1249,14 @@ mod tests {
         let talked: i64 = vm.globals().get("_talked_to").unwrap();
         let npc_class: String = vm.globals().get("_talked_npc").unwrap();
         let event_name: String = vm.globals().get("_talked_event").unwrap();
-        assert_eq!(talked, 1234, "player.actorId must round-trip the player's actor id");
-        assert_eq!(npc_class, "Greeter", "npc:GetName() must reach the LuaNpc accessor (it returns LuaActor.name, which the dispatcher seeds from class_name)");
+        assert_eq!(
+            talked, 1234,
+            "player.actorId must round-trip the player's actor id"
+        );
+        assert_eq!(
+            npc_class, "Greeter",
+            "npc:GetName() must reach the LuaNpc accessor (it returns LuaActor.name, which the dispatcher seeds from class_name)"
+        );
         assert_eq!(
             event_name, "onTalk",
             "eventName must be the third positional arg per Meteor's `LuaEngine.EventStarted` shim",
@@ -1360,7 +1364,10 @@ mod tests {
 
         let flags = {
             let c = player_handle.character.read().await;
-            c.quest_journal.get(110_500).map(|q| q.get_flags()).unwrap_or(0)
+            c.quest_journal
+                .get(110_500)
+                .map(|q| q.get_flags())
+                .unwrap_or(0)
         };
         assert_eq!(
             flags & (1 << 7),
@@ -1521,7 +1528,10 @@ mod tests {
 
         let flags = {
             let c = handle.character.read().await;
-            c.quest_journal.get(110_077).map(|q| q.get_flags()).unwrap_or(0)
+            c.quest_journal
+                .get(110_077)
+                .map(|q| q.get_flags())
+                .unwrap_or(0)
         };
         assert_eq!(
             flags & (1 << 5),

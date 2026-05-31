@@ -166,38 +166,20 @@ pub fn build_mass_delete_actor_x11(actor_id: u32, exempt_actors: &[u32]) -> SubP
 /// (wiki labels this "(x10)"; the `x10` is HEX). Body = 80 bytes
 /// (16×u32 actor + 16-byte zero pad). Empty slots stay zero.
 pub fn build_mass_delete_actor_x16(actor_id: u32, exempt_actors: &[u32]) -> SubPacket {
-    build_mass_delete_actor_body(
-        actor_id,
-        exempt_actors,
-        16,
-        OP_MASS_DELETE_ACTOR_X16,
-        0x70,
-    )
+    build_mass_delete_actor_body(actor_id, exempt_actors, 16, OP_MASS_DELETE_ACTOR_X16, 0x70)
 }
 
 /// OP_MASS_DELETE_ACTOR_X32 (0x000A) — same shape, 32 actor slots.
 /// Body = 160 bytes (32×u32 actor + 32-byte pad).
 pub fn build_mass_delete_actor_x32(actor_id: u32, exempt_actors: &[u32]) -> SubPacket {
-    build_mass_delete_actor_body(
-        actor_id,
-        exempt_actors,
-        32,
-        OP_MASS_DELETE_ACTOR_X32,
-        0xC0,
-    )
+    build_mass_delete_actor_body(actor_id, exempt_actors, 32, OP_MASS_DELETE_ACTOR_X32, 0xC0)
 }
 
 /// OP_MASS_DELETE_ACTOR_X64 (0x000B) — same shape, 64 actor slots.
 /// Body = 320 bytes (64×u32 actor + 64-byte pad). Not observed in
 /// the 56-capture survey, but defined for symmetry.
 pub fn build_mass_delete_actor_x64(actor_id: u32, exempt_actors: &[u32]) -> SubPacket {
-    build_mass_delete_actor_body(
-        actor_id,
-        exempt_actors,
-        64,
-        OP_MASS_DELETE_ACTOR_X64,
-        0x160,
-    )
+    build_mass_delete_actor_body(actor_id, exempt_actors, 64, OP_MASS_DELETE_ACTOR_X64, 0x160)
 }
 
 fn build_mass_delete_actor_body(

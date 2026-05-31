@@ -64,56 +64,96 @@ pub async fn apply_runtime_lua_command(
 ) -> Handled {
     use LuaCommandKind as LC;
     match cmd {
-        LC::AddQuest { player_id, quest_id } => {
+        LC::AddQuest {
+            player_id,
+            quest_id,
+        } => {
             apply_add_quest(player_id, quest_id, registry, db, lua).await;
             true
         }
-        LC::CompleteQuest { player_id, quest_id } => {
+        LC::CompleteQuest {
+            player_id,
+            quest_id,
+        } => {
             apply_complete_quest(player_id, quest_id, registry, db, lua).await;
             true
         }
-        LC::AbandonQuest { player_id, quest_id } => {
+        LC::AbandonQuest {
+            player_id,
+            quest_id,
+        } => {
             apply_abandon_quest(player_id, quest_id, registry, db, lua).await;
             true
         }
-        LC::QuestClearData { player_id, quest_id } => {
+        LC::QuestClearData {
+            player_id,
+            quest_id,
+        } => {
             apply_quest_mutation(player_id, quest_id, registry, db, |q| q.clear_data()).await;
             true
         }
-        LC::QuestClearFlags { player_id, quest_id } => {
+        LC::QuestClearFlags {
+            player_id,
+            quest_id,
+        } => {
             apply_quest_mutation(player_id, quest_id, registry, db, |q| q.clear_flags()).await;
             true
         }
-        LC::QuestSetFlag { player_id, quest_id, bit } => {
+        LC::QuestSetFlag {
+            player_id,
+            quest_id,
+            bit,
+        } => {
             apply_quest_mutation(player_id, quest_id, registry, db, |q| q.set_flag(bit)).await;
             true
         }
-        LC::QuestClearFlag { player_id, quest_id, bit } => {
+        LC::QuestClearFlag {
+            player_id,
+            quest_id,
+            bit,
+        } => {
             apply_quest_mutation(player_id, quest_id, registry, db, |q| q.clear_flag(bit)).await;
             true
         }
-        LC::QuestSetCounter { player_id, quest_id, idx, value } => {
+        LC::QuestSetCounter {
+            player_id,
+            quest_id,
+            idx,
+            value,
+        } => {
             apply_quest_mutation(player_id, quest_id, registry, db, |q| {
                 q.set_counter(idx as usize, value)
             })
             .await;
             true
         }
-        LC::QuestIncCounter { player_id, quest_id, idx } => {
+        LC::QuestIncCounter {
+            player_id,
+            quest_id,
+            idx,
+        } => {
             apply_quest_mutation(player_id, quest_id, registry, db, |q| {
                 q.inc_counter(idx as usize);
             })
             .await;
             true
         }
-        LC::QuestDecCounter { player_id, quest_id, idx } => {
+        LC::QuestDecCounter {
+            player_id,
+            quest_id,
+            idx,
+        } => {
             apply_quest_mutation(player_id, quest_id, registry, db, |q| {
                 q.dec_counter(idx as usize);
             })
             .await;
             true
         }
-        LC::QuestStartSequence { player_id, quest_id, sequence } => {
+        LC::QuestStartSequence {
+            player_id,
+            quest_id,
+            sequence,
+        } => {
             apply_quest_start_sequence(player_id, quest_id, sequence, registry, db, world, lua)
                 .await;
             true
@@ -143,15 +183,26 @@ pub async fn apply_runtime_lua_command(
             .await;
             true
         }
-        LC::QuestUpdateEnpcs { player_id, quest_id } => {
+        LC::QuestUpdateEnpcs {
+            player_id,
+            quest_id,
+        } => {
             apply_quest_update_enpcs(player_id, quest_id, registry, db, world, lua).await;
             true
         }
-        LC::SetQuestComplete { player_id, quest_id, flag } => {
+        LC::SetQuestComplete {
+            player_id,
+            quest_id,
+            flag,
+        } => {
             apply_set_quest_complete(player_id, quest_id, flag, registry, db).await;
             true
         }
-        LC::AddExp { actor_id, class_id, exp } => {
+        LC::AddExp {
+            actor_id,
+            class_id,
+            exp,
+        } => {
             apply_add_exp(actor_id, class_id, exp, registry, db, Some(world), lua).await;
             true
         }
@@ -172,10 +223,7 @@ pub async fn apply_runtime_lua_command(
             // progress. Short-circuits cleanly when the catalog isn't
             // installed (fresh-DB boot) or the player has no matching
             // active leve.
-            if item_package == crate::inventory::PKG_NORMAL
-                && quantity > 0
-                && item_id != 0
-            {
+            if item_package == crate::inventory::PKG_NORMAL && quantity > 0 && item_id != 0 {
                 let delta = quantity.min(u16::MAX as i32) as u16;
                 advance_fieldcraft_leves(actor_id, item_id, delta, registry, db, lua).await;
             }
@@ -199,7 +247,8 @@ pub async fn apply_runtime_lua_command(
             leve_id,
             difficulty,
         } => {
-            let _ = apply_accept_regional_leve(player_id, leve_id, difficulty, registry, db, lua).await;
+            let _ =
+                apply_accept_regional_leve(player_id, leve_id, difficulty, registry, db, lua).await;
             true
         }
         LC::PurchaseRetainerBazaarItem {
@@ -207,13 +256,8 @@ pub async fn apply_runtime_lua_command(
             retainer_id,
             server_item_id,
         } => {
-            let _ = apply_purchase_retainer_bazaar_item(
-                buyer_id,
-                retainer_id,
-                server_item_id,
-                db,
-            )
-            .await;
+            let _ = apply_purchase_retainer_bazaar_item(buyer_id, retainer_id, server_item_id, db)
+                .await;
             true
         }
         LC::TryStatus {
@@ -241,7 +285,10 @@ pub async fn apply_runtime_lua_command(
             .await;
             true
         }
-        LC::QuestOnNotice { player_id, quest_id } => {
+        LC::QuestOnNotice {
+            player_id,
+            quest_id,
+        } => {
             apply_quest_on_notice(player_id, quest_id, registry, db, world, lua).await;
             true
         }
@@ -439,10 +486,8 @@ pub async fn apply_runtime_lua_command(
             rotation,
             move_state,
         } => {
-            apply_move_actor_to_position(
-                actor_id, x, y, z, rotation, move_state, registry, world,
-            )
-            .await;
+            apply_move_actor_to_position(actor_id, x, y, z, rotation, move_state, registry, world)
+                .await;
             true
         }
         LC::SetActorTargetAnimated {
@@ -468,11 +513,7 @@ pub async fn apply_runtime_lua_command(
 /// engaged — re-engaging the same target would clobber the existing
 /// state's swing clock, restarting the swing window. The C# engage
 /// path has the same gate (`if (IsEngaged) return false`).
-async fn apply_actor_engage(
-    actor_id: u32,
-    target_actor_id: u32,
-    registry: &ActorRegistry,
-) {
+async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &ActorRegistry) {
     if target_actor_id == 0 {
         tracing::debug!(
             actor = format!("0x{actor_id:08X}"),
@@ -541,11 +582,8 @@ async fn apply_change_state(
         );
         return;
     };
-    let sub = crate::packets::send::actor::build_set_actor_state(
-        actor_id,
-        (main_state & 0xFF) as u8,
-        0,
-    );
+    let sub =
+        crate::packets::send::actor::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
     let recipients = crate::runtime::broadcast::broadcast_around_actor(
         world,
         registry,
@@ -1160,14 +1198,8 @@ async fn apply_director_outbox_op<F>(
     // can persist on the `GuildleveEnded { was_completed: true }`
     // branch.
     for e in events {
-        crate::director::dispatch_director_event(
-            &e,
-            &player_members,
-            registry,
-            world,
-            Some(db),
-        )
-        .await;
+        crate::director::dispatch_director_event(&e, &player_members, registry, world, Some(db))
+            .await;
     }
     tracing::debug!(
         director = director_actor_id,
@@ -1199,9 +1231,7 @@ pub async fn apply_runtime_lua_commands(
         // dropped command be told apart from expected post-bridge noise.
         let diag = tracing::enabled!(tracing::Level::DEBUG).then(|| cmd.clone());
         let handled = apply_runtime_lua_command(cmd, registry, db, world, lua).await;
-        if !handled
-            && let Some(cmd) = diag
-        {
+        if !handled && let Some(cmd) = diag {
             tracing::debug!(
                 ?cmd,
                 "runtime lua command unhandled (login-scoped or unrecognised)",
@@ -1446,11 +1476,7 @@ pub async fn apply_abandon_quest(
             "AbandonQuest DB delete failed",
         );
     }
-    tracing::info!(
-        player = player_id,
-        quest = quest_id,
-        "AbandonQuest applied",
-    );
+    tracing::info!(player = player_id, quest = quest_id, "AbandonQuest applied",);
 }
 
 pub async fn apply_quest_start_sequence(
@@ -1878,7 +1904,10 @@ async fn emit_exp_property_updates(
             &format!("charaWork.battleSave.skillLevel[{}]", class_slot),
             new_level as u16,
         );
-        b.add_short("charaWork.parameterSave.state_mainSkillLevel", new_level as u16);
+        b.add_short(
+            "charaWork.parameterSave.state_mainSkillLevel",
+            new_level as u16,
+        );
         let level_packets = b.done();
         for sub in &level_packets {
             if let Ok(base) = common::BasePacket::create_from_subpacket(sub, true, false) {
@@ -2434,10 +2463,8 @@ pub async fn apply_try_status(
         .map(|e| e.catalogs().clone())
         .unwrap_or_else(|| std::sync::Arc::new(crate::lua::Catalogs::new()));
     for event in outbox.drain() {
-        crate::runtime::dispatcher::dispatch_status_event(
-            &event, registry, world, db, &catalogs,
-        )
-        .await;
+        crate::runtime::dispatcher::dispatch_status_event(&event, registry, world, db, &catalogs)
+            .await;
     }
     tracing::info!(
         source = source_actor_id,
@@ -2766,12 +2793,7 @@ pub async fn apply_add_gil(actor_id: u32, amount: i32, db: &Database) {
     }
     match db.add_gil(actor_id, amount).await {
         Ok(total) => {
-            tracing::info!(
-                actor = actor_id,
-                delta = amount,
-                total,
-                "AddGil applied",
-            );
+            tracing::info!(actor = actor_id, delta = amount, total, "AddGil applied",);
         }
         Err(e) => {
             tracing::warn!(
@@ -2838,10 +2860,8 @@ async fn broadcast_quest_enpc_update(
         sub.set_target_id(player_id);
         client.send_bytes(sub.to_bytes()).await;
     }
-    let mut graphic = crate::packets::send::build_set_actor_quest_graphic(
-        npc_actor_id,
-        enpc.quest_flag_type,
-    );
+    let mut graphic =
+        crate::packets::send::build_set_actor_quest_graphic(npc_actor_id, enpc.quest_flag_type);
     graphic.set_target_id(player_id);
     client.send_bytes(graphic.to_bytes()).await;
 }
@@ -3037,7 +3057,10 @@ pub async fn apply_quest_on_notice(
             completed_quests: c.quest_journal.iter_completed().collect(),
             ..Default::default()
         };
-        let q = c.quest_journal.get(quest_id).expect("quest_journal.has is true");
+        let q = c
+            .quest_journal
+            .get(quest_id)
+            .expect("quest_journal.has is true");
         let quest_handle = crate::lua::LuaQuestHandle {
             player_id: snap.actor_id,
             quest_id,
@@ -3045,8 +3068,8 @@ pub async fn apply_quest_on_notice(
             sequence: q.get_sequence(),
             flags: q.get_flags(),
             counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
-                    npc_ls_from: q.get_npc_ls_from(),
-                    npc_ls_msg_step: q.get_npc_ls_msg_step(),
+            npc_ls_from: q.get_npc_ls_from(),
+            npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
         };
         (snap, quest_handle)
@@ -3217,7 +3240,9 @@ pub async fn check_quest_proximity_pushes(
                     .state
                     .current
                     .values()
-                    .filter(|e| e.is_push_enabled && !q.state.recently_pushed.contains(&e.actor_class_id))
+                    .filter(|e| {
+                        e.is_push_enabled && !q.state.recently_pushed.contains(&e.actor_class_id)
+                    })
                     .map(|e| e.actor_class_id)
                     .collect();
                 (q.quest_id(), to_check)
@@ -3252,7 +3277,9 @@ pub async fn check_quest_proximity_pushes(
                     break;
                 }
             }
-            let Some(npc_handle) = npc_handle else { continue };
+            let Some(npc_handle) = npc_handle else {
+                continue;
+            };
 
             let npc_spec = {
                 let c = npc_handle.character.read().await;
@@ -3429,7 +3456,9 @@ pub async fn kick_quest_proximity_pushes(
                     break;
                 }
             }
-            let Some(npc_handle) = npc_handle else { continue };
+            let Some(npc_handle) = npc_handle else {
+                continue;
+            };
 
             let npc_actor_id = {
                 let c = npc_handle.character.read().await;
@@ -3492,8 +3521,10 @@ pub async fn fire_quest_on_push_via_command(
     world: &WorldManager,
     lua: Option<&Arc<LuaEngine>>,
 ) {
-    fire_quest_npc_hook_via_command(handle, quest_id, "onPush", npc_spec, registry, db, world, lua)
-        .await;
+    fire_quest_npc_hook_via_command(
+        handle, quest_id, "onPush", npc_spec, registry, db, world, lua,
+    )
+    .await;
 }
 
 /// Shared backend for `fire_quest_on_talk_via_command` and
@@ -3573,8 +3604,8 @@ async fn fire_quest_npc_hook_via_command(
             sequence: q.get_sequence(),
             flags: q.get_flags(),
             counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
-                    npc_ls_from: q.get_npc_ls_from(),
-                    npc_ls_msg_step: q.get_npc_ls_msg_step(),
+            npc_ls_from: q.get_npc_ls_from(),
+            npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
         };
         (snap, qh)
@@ -3687,7 +3718,14 @@ async fn fire_quest_npc_hook_via_command(
                 ))
                 .await;
             }
-            Box::pin(apply_runtime_lua_commands(after, registry, db, world, Some(lua))).await;
+            Box::pin(apply_runtime_lua_commands(
+                after,
+                registry,
+                db,
+                world,
+                Some(lua),
+            ))
+            .await;
         }
     }
 }
@@ -3767,7 +3805,10 @@ pub async fn fire_quest_on_talk_via_command(
             completed_quests: c.quest_journal.iter_completed().collect(),
             ..Default::default()
         };
-        let q = c.quest_journal.get(quest_id).expect("has(quest_id) is true");
+        let q = c
+            .quest_journal
+            .get(quest_id)
+            .expect("has(quest_id) is true");
         let qh = crate::lua::LuaQuestHandle {
             player_id: snap.actor_id,
             quest_id,
@@ -3775,8 +3816,8 @@ pub async fn fire_quest_on_talk_via_command(
             sequence: q.get_sequence(),
             flags: q.get_flags(),
             counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
-                    npc_ls_from: q.get_npc_ls_from(),
-                    npc_ls_msg_step: q.get_npc_ls_msg_step(),
+            npc_ls_from: q.get_npc_ls_from(),
+            npc_ls_msg_step: q.get_npc_ls_msg_step(),
             queue: crate::lua::command::CommandQueue::new(),
         };
         (snap, qh)
@@ -3867,7 +3908,11 @@ pub async fn fire_quest_on_talk_via_command(
                 .await;
             }
             Box::pin(apply_runtime_lua_commands(
-                after, registry, db, world, Some(lua),
+                after,
+                registry,
+                db,
+                world,
+                Some(lua),
             ))
             .await;
         }
@@ -4125,7 +4170,10 @@ mod tests {
         // bit 3 set on the live quest in the registry.
         let flags = {
             let c = handle.character.read().await;
-            c.quest_journal.get(110_002).map(|q| q.get_flags()).unwrap_or(0)
+            c.quest_journal
+                .get(110_002)
+                .map(|q| q.get_flags())
+                .unwrap_or(0)
         };
         assert_eq!(
             flags & (1 << 3),
@@ -4183,7 +4231,10 @@ mod tests {
 
         let flags = {
             let c = handle.character.read().await;
-            c.quest_journal.get(110_001).map(|q| q.get_flags()).unwrap_or(0)
+            c.quest_journal
+                .get(110_001)
+                .map(|q| q.get_flags())
+                .unwrap_or(0)
         };
         assert_eq!(flags, 0, "missing onNotice leaves flags untouched");
 
@@ -4276,7 +4327,10 @@ mod tests {
         // Post-condition: engaged, current state targets `target_id`.
         let handle = registry.get(actor_id).await.expect("registered");
         let c = handle.character.read().await;
-        assert!(c.ai_container.is_engaged(), "ally should be engaged after Engage()");
+        assert!(
+            c.ai_container.is_engaged(),
+            "ally should be engaged after Engage()"
+        );
         let cs = c
             .ai_container
             .current_state()
@@ -4339,7 +4393,10 @@ mod tests {
 
         let handle = registry.get(actor_id).await.expect("registered");
         let c = handle.character.read().await;
-        assert!(c.hate.has_hate_for(target_id), "base hate entry should exist");
+        assert!(
+            c.hate.has_hate_for(target_id),
+            "base hate entry should exist"
+        );
     }
 
     /// Phase C3 — apply paths quietly skip when target=0 or actor

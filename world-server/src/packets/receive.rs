@@ -45,7 +45,11 @@ impl HelloPacket {
             anyhow::bail!("hello packet too small");
         }
         let ascii = &base_packet_body[0x14..0x14 + 12];
-        let s: String = ascii.iter().take_while(|&&b| b != 0).map(|&b| b as char).collect();
+        let s: String = ascii
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect();
         let session_id: u32 = s.trim().parse().unwrap_or(0);
         Ok(Self { session_id })
     }
@@ -145,7 +149,11 @@ impl PartyModifyPacket {
         } else {
             (0, read_fixed_string(&mut c, 0x20)?)
         };
-        Ok(Self { command, actor_id, name })
+        Ok(Self {
+            command,
+            actor_id,
+            name,
+        })
     }
 }
 
@@ -158,7 +166,9 @@ impl PartyLeavePacket {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut c = Cursor::new(data);
         let flag = c.read_u8()?;
-        Ok(Self { is_disband: flag == 1 })
+        Ok(Self {
+            is_disband: flag == 1,
+        })
     }
 }
 
@@ -174,9 +184,17 @@ impl PartyInvitePacket {
         let mut c = Cursor::new(data);
         let command = c.read_u16::<LittleEndian>()?;
         if command == 1 {
-            Ok(Self { command, actor_id: c.read_u32::<LittleEndian>()?, name: String::new() })
+            Ok(Self {
+                command,
+                actor_id: c.read_u32::<LittleEndian>()?,
+                name: String::new(),
+            })
         } else {
-            Ok(Self { command, actor_id: 0, name: read_fixed_string(&mut c, 0x20)? })
+            Ok(Self {
+                command,
+                actor_id: 0,
+                name: read_fixed_string(&mut c, 0x20)?,
+            })
         }
     }
 }
@@ -214,7 +232,11 @@ impl CreateLinkshellPacket {
         let name = read_fixed_string(&mut c, 0x20)?;
         let crest_id = c.read_u16::<LittleEndian>()?;
         let master = c.read_u32::<LittleEndian>()?;
-        Ok(Self { name, crest_id, master })
+        Ok(Self {
+            name,
+            crest_id,
+            master,
+        })
     }
 }
 
@@ -245,7 +267,13 @@ impl ModifyLinkshellPacket {
             Self::CODE_MASTERCHANGE => master = c.read_u32::<LittleEndian>()?,
             _ => {}
         }
-        Ok(Self { current_name, arg_code, new_name, crest_id, master })
+        Ok(Self {
+            current_name,
+            arg_code,
+            new_name,
+            crest_id,
+            master,
+        })
     }
 }
 
@@ -257,7 +285,9 @@ pub struct DeleteLinkshellPacket {
 impl DeleteLinkshellPacket {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut c = Cursor::new(data);
-        Ok(Self { name: read_fixed_string(&mut c, 0x20)? })
+        Ok(Self {
+            name: read_fixed_string(&mut c, 0x20)?,
+        })
     }
 }
 
@@ -269,7 +299,9 @@ pub struct LinkshellChangePacket {
 impl LinkshellChangePacket {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut c = Cursor::new(data);
-        Ok(Self { ls_name: read_fixed_string(&mut c, 0x20)? })
+        Ok(Self {
+            ls_name: read_fixed_string(&mut c, 0x20)?,
+        })
     }
 }
 
@@ -301,7 +333,11 @@ impl LinkshellLeavePacket {
         let is_kicked = c.read_u16::<LittleEndian>()? == 1;
         let kicked_name = read_fixed_string(&mut c, 0x20)?;
         let ls_name = read_fixed_string(&mut c, 0x20)?;
-        Ok(Self { is_kicked, kicked_name, ls_name })
+        Ok(Self {
+            is_kicked,
+            kicked_name,
+            ls_name,
+        })
     }
 }
 
@@ -318,7 +354,11 @@ impl LinkshellRankChangePacket {
         let name = read_fixed_string(&mut c, 0x20)?;
         let ls_name = read_fixed_string(&mut c, 0x20)?;
         let rank = c.read_u8()?;
-        Ok(Self { name, ls_name, rank })
+        Ok(Self {
+            name,
+            ls_name,
+            rank,
+        })
     }
 }
 
@@ -335,7 +375,9 @@ impl PartyChatMessagePacket {
     pub fn parse(data: &[u8]) -> Result<Self> {
         // PartyChatMessagePacket.cs reads a null-terminated string from offset 0.
         let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
-        Ok(Self { message: String::from_utf8_lossy(&data[..end]).into_owned() })
+        Ok(Self {
+            message: String::from_utf8_lossy(&data[..end]).into_owned(),
+        })
     }
 }
 
@@ -347,7 +389,9 @@ pub struct GroupCreatedPacket {
 impl GroupCreatedPacket {
     pub fn parse(data: &[u8]) -> Result<Self> {
         let mut c = Cursor::new(data);
-        Ok(Self { group_id: c.read_u64::<LittleEndian>()? })
+        Ok(Self {
+            group_id: c.read_u64::<LittleEndian>()?,
+        })
     }
 }
 

@@ -929,7 +929,10 @@ async fn linkshell_chat_fans_to_online_members_only() {
     .await;
 
     // Sender does not echo to themselves.
-    assert!(rx1.try_recv().is_err(), "sender should not receive own LS chat");
+    assert!(
+        rx1.try_recv().is_err(),
+        "sender should not receive own LS chat"
+    );
     // Alice (online) receives the packet.
     let got = rx2.recv().await.expect("alice should receive LS chat");
     assert!(!got.is_empty());
@@ -1093,13 +1096,7 @@ async fn die_flips_main_state_and_broadcasts_around_actor() {
     dying.chara.hp = 0; // already at 0 — Die just flips the state
     dying.chara.max_hp = 1000;
     registry
-        .insert(ActorHandle::new(
-            2,
-            ActorKindTag::BattleNpc,
-            100,
-            0,
-            dying,
-        ))
+        .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, dying))
         .await;
     registry
         .insert(ActorHandle::new(
@@ -1124,13 +1121,23 @@ async fn die_flips_main_state_and_broadcasts_around_actor() {
     )
     .await;
 
-    let c = registry.get(2).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(2)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(
         c.base.current_main_state,
         crate::actor::MAIN_STATE_DEAD,
         "defender should be flipped to DEAD",
     );
-    assert!(rx.try_recv().is_ok(), "observer should receive SetActorState broadcast");
+    assert!(
+        rx.try_recv().is_ok(),
+        "observer should receive SetActorState broadcast"
+    );
 }
 
 #[tokio::test]
@@ -1178,13 +1185,7 @@ async fn revive_restores_hp_and_flips_state_back_to_passive() {
     chara.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
     chara.chara.new_main_state = crate::actor::MAIN_STATE_DEAD;
     registry
-        .insert(ActorHandle::new(
-            11,
-            ActorKindTag::Player,
-            100,
-            77,
-            chara,
-        ))
+        .insert(ActorHandle::new(11, ActorKindTag::Player, 100, 77, chara))
         .await;
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
     world.register_client(77, ClientHandle::new(77, tx)).await;
@@ -1200,11 +1201,21 @@ async fn revive_restores_hp_and_flips_state_back_to_passive() {
     )
     .await;
 
-    let c = registry.get(11).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(11)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(c.base.current_main_state, crate::actor::MAIN_STATE_PASSIVE);
     assert_eq!(c.chara.hp, 1000);
     assert_eq!(c.chara.mp, 400);
-    assert!(rx.try_recv().is_ok(), "owner should see state change broadcast");
+    assert!(
+        rx.try_recv().is_ok(),
+        "owner should see state change broadcast"
+    );
 }
 
 #[tokio::test]
@@ -1213,9 +1224,7 @@ async fn die_purges_lose_on_death_status_effects_and_broadcasts_clears() {
     use crate::lua::LuaEngine;
     use crate::runtime::dispatcher::dispatch_battle_event;
     use crate::status::ids::{STATUS_POISON, STATUS_RAMPART};
-    use crate::status::{
-        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
-    };
+    use crate::status::{DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox};
 
     let world = Arc::new(WorldManager::new());
     let registry = Arc::new(ActorRegistry::new());
@@ -1286,13 +1295,7 @@ async fn die_purges_lose_on_death_status_effects_and_broadcasts_clears() {
             .add_status_effect(rampart, 5, 0, DEFAULT_GAIN_TEXT_ID, &mut outbox);
     }
     registry
-        .insert(ActorHandle::new(
-            5,
-            ActorKindTag::Player,
-            100,
-            55,
-            owner,
-        ))
+        .insert(ActorHandle::new(5, ActorKindTag::Player, 100, 55, owner))
         .await;
     registry
         .insert(ActorHandle::new(
@@ -1324,7 +1327,14 @@ async fn die_purges_lose_on_death_status_effects_and_broadcasts_clears() {
     .await;
 
     // Status container: Poison purged, Rampart still present.
-    let c = registry.get(5).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(5)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert!(
         !c.status_effects.has(STATUS_POISON),
         "Poison (LOSE_ON_DEATH) should be purged on death",
@@ -1341,7 +1351,7 @@ async fn die_purges_lose_on_death_status_effects_and_broadcasts_clears() {
 
     // Wire: observer should see at least the SetActorState broadcast
     // (0x0134) plus a SetActorStatus (0x0177) clearing the Poison slot.
-    use crate::packets::opcodes::{OP_SET_ACTOR_STATUS, OP_SET_ACTOR_STATE};
+    use crate::packets::opcodes::{OP_SET_ACTOR_STATE, OP_SET_ACTOR_STATUS};
     let mut saw_state_change = false;
     let mut saw_status_clear = false;
     while let Ok(bytes) = rx_observer.try_recv() {
@@ -1355,7 +1365,10 @@ async fn die_purges_lose_on_death_status_effects_and_broadcasts_clears() {
             }
         }
     }
-    assert!(saw_state_change, "observer should receive SetActorState broadcast");
+    assert!(
+        saw_state_change,
+        "observer should receive SetActorState broadcast"
+    );
     assert!(
         saw_status_clear,
         "observer should receive SetActorStatus clear for the purged Poison slot",
@@ -1418,13 +1431,7 @@ async fn auto_attack_that_kills_flips_defender_to_dead() {
     attacker.chara.max_hp = 1000;
     attacker.chara.level = 50;
     registry
-        .insert(ActorHandle::new(
-            1,
-            ActorKindTag::Player,
-            100,
-            42,
-            attacker,
-        ))
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, attacker))
         .await;
 
     // Victim sitting at 1 HP — next auto-attack (0..=90 damage) is
@@ -1434,13 +1441,7 @@ async fn auto_attack_that_kills_flips_defender_to_dead() {
     victim.chara.max_hp = 1000;
     victim.chara.level = 1;
     registry
-        .insert(ActorHandle::new(
-            2,
-            ActorKindTag::BattleNpc,
-            100,
-            0,
-            victim,
-        ))
+        .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, victim))
         .await;
 
     {
@@ -1453,7 +1454,14 @@ async fn auto_attack_that_kills_flips_defender_to_dead() {
     // Tick forward past the swing timer enough times to guarantee a hit.
     for i in 1..=10 {
         ticker.tick_once((i as u64) * 2_600).await;
-        let c = registry.get(2).await.unwrap().character.read().await.clone();
+        let c = registry
+            .get(2)
+            .await
+            .unwrap()
+            .character
+            .read()
+            .await
+            .clone();
         if c.base.current_main_state == crate::actor::MAIN_STATE_DEAD {
             assert!(c.is_dead(), "HP should be 0 at DEAD state");
             return;
@@ -1545,11 +1553,7 @@ async fn quest_set_enpc_emits_event_status_and_quest_graphic_packets() {
 
     let world = Arc::new(WorldManager::new());
     let registry = Arc::new(ActorRegistry::new());
-    let db = Arc::new(
-        crate::database::Database::open(tempdb())
-            .await
-            .expect("db"),
-    );
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
     // `characters` FK anchor for save_quest.
     use common::db::ConnCallExt;
     db.conn_for_test()
@@ -1641,13 +1645,7 @@ async fn quest_set_enpc_emits_event_status_and_quest_graphic_packets() {
         ..EventConditionList::default()
     };
     registry
-        .insert(ActorHandle::new(
-            0x987_6543,
-            ActorKindTag::Npc,
-            100,
-            0,
-            npc,
-        ))
+        .insert(ActorHandle::new(0x987_6543, ActorKindTag::Npc, 100, 0, npc))
         .await;
 
     // Player's client channel — where the ENPC packets should land.
@@ -1659,7 +1657,7 @@ async fn quest_set_enpc_emits_event_status_and_quest_graphic_packets() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
 
     // Drive the apply path the way the real processor does when it
@@ -1728,15 +1726,23 @@ async fn save_quest_roundtrips_all_columns_through_load_quest_scenario() {
 
     let actor_aid = crate::actor::quest::quest_actor_id(110_005);
     db.save_quest(
-        101, 0, actor_aid, /* sequence */ 7, /* flags */ 0x0000_1A00,
-        /* counter1 */ 3, /* counter2 */ 12, /* counter3 */ 0xFFFF,
+        101,
+        0,
+        actor_aid,
+        /* sequence */ 7,
+        /* flags */ 0x0000_1A00,
+        /* counter1 */ 3,
+        /* counter2 */ 12,
+        /* counter3 */ 0xFFFF,
     )
     .await
     .unwrap();
 
     // Second slot — exercises the PK (characterId, slot) guard.
     let actor_aid_b = crate::actor::quest::quest_actor_id(110_020);
-    db.save_quest(101, 1, actor_aid_b, 0, 0, 0, 0, 0).await.unwrap();
+    db.save_quest(101, 1, actor_aid_b, 0, 0, 0, 0, 0)
+        .await
+        .unwrap();
 
     // Re-save slot 0 with new values — ON CONFLICT should update, not
     // duplicate.
@@ -1855,11 +1861,9 @@ async fn all_ported_quest_scripts_parse_without_error() {
     let mut loaded = 0usize;
     let mut failed: Vec<(String, String)> = Vec::new();
     let quests_dir = script_root.join("quests");
-    walk_lua_scripts(&quests_dir, &mut |path| {
-        match engine.load_script(path) {
-            Ok(_) => loaded += 1,
-            Err(e) => failed.push((path.display().to_string(), e.to_string())),
-        }
+    walk_lua_scripts(&quests_dir, &mut |path| match engine.load_script(path) {
+        Ok(_) => loaded += 1,
+        Err(e) => failed.push((path.display().to_string(), e.to_string())),
     });
 
     assert!(
@@ -1899,9 +1903,9 @@ async fn ported_man0l0_onstart_emits_start_sequence_zero() {
     // `QuestStartSequence { sequence: 0 }` when `onStart` fires.
     // Guards against silent divergence between the script's expected
     // API surface and garlemald's LuaQuestHandle methods.
-    use crate::lua::{LuaEngine, QuestHookArg, QuestStateSnapshot};
     use crate::lua::command::{CommandQueue, LuaCommand};
     use crate::lua::userdata::{LuaQuestHandle, PlayerSnapshot};
+    use crate::lua::{LuaEngine, QuestHookArg, QuestStateSnapshot};
 
     let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1944,11 +1948,21 @@ async fn ported_man0l0_onstart_emits_start_sequence_zero() {
         handle,
         Vec::<QuestHookArg>::new(),
     );
-    assert!(result.error.is_none(), "man0l0:onStart errored: {:?}", result.error);
-    let saw = result
-        .commands
-        .iter()
-        .any(|c| matches!(c, LuaCommand::QuestStartSequence { sequence: 0, quest_id: 110_001, .. }));
+    assert!(
+        result.error.is_none(),
+        "man0l0:onStart errored: {:?}",
+        result.error
+    );
+    let saw = result.commands.iter().any(|c| {
+        matches!(
+            c,
+            LuaCommand::QuestStartSequence {
+                sequence: 0,
+                quest_id: 110_001,
+                ..
+            }
+        )
+    });
     assert!(
         saw,
         "man0l0:onStart should emit QuestStartSequence(0); got {:?}",
@@ -1977,14 +1991,27 @@ async fn set_quest_complete_flips_bitstream_both_directions() {
     let registry = ActorRegistry::new();
     let character = Character::new(77);
     registry
-        .insert(ActorHandle::new(77, ActorKindTag::Player, 100, 42, character))
+        .insert(ActorHandle::new(
+            77,
+            ActorKindTag::Player,
+            100,
+            42,
+            character,
+        ))
         .await;
 
     // Set + verify.
     apply_set_quest_complete(77, 110_042, true, &registry, &db).await;
     assert!(db.is_quest_completed(77, 110_042).await.unwrap());
     {
-        let c = registry.get(77).await.unwrap().character.read().await.clone();
+        let c = registry
+            .get(77)
+            .await
+            .unwrap()
+            .character
+            .read()
+            .await
+            .clone();
         assert!(c.quest_journal.is_completed(110_042));
     }
 
@@ -1992,7 +2019,14 @@ async fn set_quest_complete_flips_bitstream_both_directions() {
     apply_set_quest_complete(77, 110_042, false, &registry, &db).await;
     assert!(!db.is_quest_completed(77, 110_042).await.unwrap());
     {
-        let c = registry.get(77).await.unwrap().character.read().await.clone();
+        let c = registry
+            .get(77)
+            .await
+            .unwrap()
+            .character
+            .read()
+            .await
+            .clone();
         assert!(!c.quest_journal.is_completed(110_042));
     }
 
@@ -2027,7 +2061,13 @@ async fn runtime_drain_fans_out_quest_commands_across_arms() {
     quest.clear_dirty();
     character.quest_journal.add(quest);
     registry
-        .insert(ActorHandle::new(33, ActorKindTag::Player, 100, 55, character))
+        .insert(ActorHandle::new(
+            33,
+            ActorKindTag::Player,
+            100,
+            55,
+            character,
+        ))
         .await;
     let world = WorldManager::new();
 
@@ -2052,7 +2092,14 @@ async fn runtime_drain_fans_out_quest_commands_across_arms() {
     apply_runtime_lua_commands(cmds, &registry, &db, &world, None).await;
 
     // Quest mutations landed on the live struct.
-    let c = registry.get(33).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(33)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     let q = c.quest_journal.get(110_100).expect("quest");
     assert!(q.get_flag(5));
     assert_eq!(q.get_counter(1), 42);
@@ -2096,10 +2143,7 @@ async fn complete_quest_is_idempotent_for_repeated_calls() {
         .unwrap();
     assert_eq!(row_count, 1);
     assert!(db.is_quest_completed(56, 110_500).await.unwrap());
-    assert_eq!(
-        db.load_completed_quests(56).await.unwrap().count_ones(),
-        1
-    );
+    assert_eq!(db.load_completed_quests(56).await.unwrap().count_ones(), 1);
 }
 
 // =============================================================================
@@ -2160,8 +2204,7 @@ async fn db_load_passive_guildleve_data_spans_reserved_id_range() {
     );
     for &id in map.keys() {
         assert!(
-            (crate::crafting::LOCAL_LEVE_ID_MIN..=crate::crafting::LOCAL_LEVE_ID_MAX)
-                .contains(&id),
+            (crate::crafting::LOCAL_LEVE_ID_MIN..=crate::crafting::LOCAL_LEVE_ID_MAX).contains(&id),
             "passive-guildleve id {id} out of 120_001..=120_452 range"
         );
     }
@@ -2279,10 +2322,7 @@ fn passive_guildleve_view_craft_success_end_to_end() {
         reward_item_id: [0; 4],
         reward_quantity: [0; 4],
     };
-    let mut quest = Quest::new(
-        crate::actor::quest::quest_actor_id(120_001),
-        "plg120001",
-    );
+    let mut quest = Quest::new(crate::actor::quest::quest_actor_id(120_001), "plg120001");
     let mut view = PassiveGuildleveView::new(&mut quest, &data);
     view.set_has_materials(true);
 
@@ -2463,7 +2503,19 @@ async fn hp_change_on_equip_emits_state_bundle_to_self() {
     // Actor zone-registered so broadcast_around_actor can find them.
     {
         let mut zone = crate::zone::zone::Zone::new(
-            100, "t", 1, "/T", 0, 0, 0, false, false, false, false, false, Some(&StubNavmeshLoader),
+            100,
+            "t",
+            1,
+            "/T",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
         );
         let mut ob = AreaOutbox::new();
         zone.core.add_actor(
@@ -2492,9 +2544,7 @@ async fn hp_change_on_equip_emits_state_bundle_to_self() {
         .await;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-    world
-        .register_client(42, ClientHandle::new(42, tx))
-        .await;
+    world.register_client(42, ClientHandle::new(42, tx)).await;
 
     dispatch_status_event(
         &StatusEvent::RecalcStats { owner_actor_id: 1 },
@@ -2659,9 +2709,7 @@ async fn addexp_past_threshold_levels_up_and_persists() {
 #[tokio::test]
 async fn equipped_mainhand_weapon_populates_modifiers_and_damage() {
     use crate::actor::modifier::Modifier;
-    use crate::battle::utils::{
-        CombatView, FixedRng, attack_calculate_base_damage,
-    };
+    use crate::battle::utils::{CombatView, FixedRng, attack_calculate_base_damage};
     use crate::data::{ItemData, WeaponAttributes};
     use crate::runtime::dispatcher::dispatch_status_event;
     use crate::status::outbox::StatusEvent;
@@ -2939,14 +2987,8 @@ async fn lua_gather_resolver_build_aim_slots_returns_eleven_row_table() {
     std::fs::write(&probe, "").unwrap();
     let (lua, _queue) = engine.load_script(&probe).expect("load probe");
 
-    let (num_slots, first_kind, first_item, first_yield, slot4_item): (
-        i64,
-        String,
-        i64,
-        i64,
-        i64,
-    ) = lua
-        .load(
+    let (num_slots, first_kind, first_item, first_yield, slot4_item): (i64, String, i64, i64, i64) =
+        lua.load(
             r#"
             local slots = GetGatherResolver():BuildAimSlots(1001)
             local n = 0
@@ -2997,10 +3039,7 @@ async fn add_item_creates_and_increments_characters_inventory_row() {
         .unwrap();
 
     // First harvest: 3 copper ore, quality 1.
-    assert_eq!(
-        db.add_harvest_item(42, 10_001_006, 3, 1).await.unwrap(),
-        3,
-    );
+    assert_eq!(db.add_harvest_item(42, 10_001_006, 3, 1).await.unwrap(), 3,);
     let (rows_after_first, qty_after_first): (i64, i32) = db
         .conn_for_test()
         .call_db(|c| {
@@ -3027,10 +3066,7 @@ async fn add_item_creates_and_increments_characters_inventory_row() {
     assert_eq!(qty_after_first, 3);
 
     // Second harvest: 2 more copper ore — stack merges in place.
-    assert_eq!(
-        db.add_harvest_item(42, 10_001_006, 2, 1).await.unwrap(),
-        5,
-    );
+    assert_eq!(db.add_harvest_item(42, 10_001_006, 2, 1).await.unwrap(), 5,);
     let (rows_after_second, qty_after_second): (i64, i32) = db
         .conn_for_test()
         .call_db(|c| {
@@ -3053,14 +3089,14 @@ async fn add_item_creates_and_increments_characters_inventory_row() {
         })
         .await
         .unwrap();
-    assert_eq!(rows_after_second, 1, "second harvest should merge, not spill");
+    assert_eq!(
+        rows_after_second, 1,
+        "second harvest should merge, not spill"
+    );
     assert_eq!(qty_after_second, 5);
 
     // Third harvest: different item (Rock Salt) lands in a new slot.
-    assert_eq!(
-        db.add_harvest_item(42, 10_009_104, 4, 1).await.unwrap(),
-        4,
-    );
+    assert_eq!(db.add_harvest_item(42, 10_009_104, 4, 1).await.unwrap(), 4,);
     let rows_after_third: i64 = db
         .conn_for_test()
         .call_db(|c| {
@@ -3074,7 +3110,10 @@ async fn add_item_creates_and_increments_characters_inventory_row() {
         })
         .await
         .unwrap();
-    assert_eq!(rows_after_third, 2, "different item should spill into a new slot");
+    assert_eq!(
+        rows_after_third, 2,
+        "different item should spill into a new slot"
+    );
 }
 
 /// `apply_add_item` routes through the runtime command drain — the
@@ -3145,8 +3184,16 @@ async fn gather_catalog_reseed_includes_mozk_rows() {
         .load_gather_resolver()
         .await
         .expect("gather catalog load");
-    assert_eq!(resolver.num_nodes(), 116, "2 tutorial + 114 mozk-sourced nodes");
-    assert_eq!(resolver.num_items(), 539, "8 tutorial + 531 mozk-sourced items");
+    assert_eq!(
+        resolver.num_nodes(),
+        116,
+        "2 tutorial + 114 mozk-sourced nodes"
+    );
+    assert_eq!(
+        resolver.num_items(),
+        539,
+        "8 tutorial + 531 mozk-sourced items"
+    );
 }
 
 /// Representative mozk row. Node 2000 is "Mine @ Bearded Rock" — the
@@ -3216,7 +3263,10 @@ async fn gather_spawns_attach_to_zones_and_metadata() {
             .filter(|s| s.unique_id.starts_with("mining_outcrop_central_thanalan_"))
             .count()
     };
-    assert_eq!(seeds_in_180, 2, "both tutorial gather spawns seeded into zone 180");
+    assert_eq!(
+        seeds_in_180, 2,
+        "both tutorial gather spawns seeded into zone 180"
+    );
 
     // Metadata map should carry a `(harvest_node_id, harvest_type)`
     // pair for each spawn.
@@ -3330,10 +3380,7 @@ async fn retainer_hire_list_dismiss_round_trip() {
 
     // Fresh character owns nothing.
     assert!(
-        db.list_character_retainers(77)
-            .await
-            .unwrap()
-            .is_empty(),
+        db.list_character_retainers(77).await.unwrap().is_empty(),
         "new character should have no retainers"
     );
     assert!(
@@ -3443,7 +3490,7 @@ async fn spawn_my_retainer_populates_session_snapshot() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(7).await.expect("player handle");
 
@@ -3553,7 +3600,7 @@ async fn spawn_my_retainer_sends_spawn_bundle_and_despawn_sends_remove() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(8).await.expect("player handle");
 
@@ -3781,7 +3828,7 @@ async fn set_sleeping_snaps_to_bed_when_in_inn_room() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(42).await.unwrap();
 
@@ -3798,7 +3845,12 @@ async fn set_sleeping_snaps_to_bed_when_in_inn_room() {
     // After: snapped to INN3_BED.
     let (x, y, z, rot) = {
         let c = handle.character.read().await;
-        (c.base.position_x, c.base.position_y, c.base.position_z, c.base.rotation)
+        (
+            c.base.position_x,
+            c.base.position_y,
+            c.base.position_z,
+            c.base.rotation,
+        )
     };
     assert!((x - (-2.65)).abs() < 0.01, "expected INN3_BED.x, got {x}");
     assert!((y - 0.0).abs() < 0.01);
@@ -3873,7 +3925,7 @@ async fn set_sleeping_no_ops_outside_inn_rooms() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(7).await.unwrap();
 
@@ -3885,7 +3937,10 @@ async fn set_sleeping_no_ops_outside_inn_rooms() {
         let c = handle.character.read().await;
         (c.base.position_x, c.base.position_z)
     };
-    assert!((x - 100.0).abs() < 0.01, "non-inn zone should not snap: got x={x}");
+    assert!(
+        (x - 100.0).abs() < 0.01,
+        "non-inn zone should not snap: got x={x}"
+    );
     assert!((z - 100.0).abs() < 0.01);
     assert!(!world.session(7).await.unwrap().is_sleeping);
 }
@@ -4007,8 +4062,7 @@ async fn logout_command_emits_logout_packet_to_owner_session() {
 
     let bytes = rx.try_recv().expect("Logout should send one packet");
     let mut offset = 0;
-    let base =
-        common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse base packet");
+    let base = common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse base packet");
     let subs = base.get_subpackets().expect("parse subpackets");
     assert_eq!(subs.len(), 1, "Logout sends one subpacket");
     // Logout/Quit are non-game-message subpackets, so the opcode lives
@@ -4027,9 +4081,7 @@ async fn logout_purges_lose_on_logout_status_effects() {
     use crate::lua::LuaCommandKind as LuaCommand;
     use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
     use crate::status::ids::{STATUS_POISON, STATUS_RAMPART};
-    use crate::status::{
-        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
-    };
+    use crate::status::{DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -4058,13 +4110,9 @@ async fn logout_purges_lose_on_logout_status_effects() {
         // the disconnect. Models a persistent buff like a food/medicine
         // timer that retail let you log out with.
         let food = StatusEffect::new(35, STATUS_RAMPART, 1.0, 0, 0, 0, 0);
-        chara.status_effects.add_status_effect(
-            food,
-            35,
-            0,
-            DEFAULT_GAIN_TEXT_ID,
-            &mut outbox,
-        );
+        chara
+            .status_effects
+            .add_status_effect(food, 35, 0, DEFAULT_GAIN_TEXT_ID, &mut outbox);
     }
     registry
         .insert(ActorHandle::new(35, ActorKindTag::Player, 200, 35, chara))
@@ -4092,7 +4140,14 @@ async fn logout_purges_lose_on_logout_status_effects() {
         .apply_login_lua_command(&handle, LuaCommand::Logout { player_id: 35 })
         .await;
 
-    let c = registry.get(35).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(35)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert!(
         !c.status_effects.has(STATUS_POISON),
         "LOSE_ON_LOGOUT effect should be purged",
@@ -4110,9 +4165,7 @@ async fn do_zone_change_purges_lose_on_zoning_status_effects() {
     use crate::lua::LuaCommandKind as LuaCommand;
     use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
     use crate::status::ids::{STATUS_POISON, STATUS_RAMPART};
-    use crate::status::{
-        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
-    };
+    use crate::status::{DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -4129,13 +4182,33 @@ async fn do_zone_change_purges_lose_on_zoning_status_effects() {
     // registered with the WorldManager so do_zone_change_with_private_area
     // can move the actor between them.
     let zone_src = Zone::new(
-        200, "src", 1, "/Area/Zone/Src", 0, 0, 0,
-        false, false, false, false, false,
+        200,
+        "src",
+        1,
+        "/Area/Zone/Src",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
         Some(&StubNavmeshLoader),
     );
     let zone_dst = Zone::new(
-        210, "dst", 1, "/Area/Zone/Dst", 0, 0, 0,
-        false, false, false, false, false,
+        210,
+        "dst",
+        1,
+        "/Area/Zone/Dst",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
         Some(&StubNavmeshLoader),
     );
     world.register_zone(zone_src).await;
@@ -4147,13 +4220,9 @@ async fn do_zone_change_purges_lose_on_zoning_status_effects() {
         let mut outbox = StatusOutbox::new();
         let mut zoned = StatusEffect::new(37, STATUS_POISON, 1.0, 0, 0, 0, 0);
         zoned.flags = StatusEffectFlags::LOSE_ON_ZONING;
-        chara.status_effects.add_status_effect(
-            zoned,
-            37,
-            0,
-            DEFAULT_GAIN_TEXT_ID,
-            &mut outbox,
-        );
+        chara
+            .status_effects
+            .add_status_effect(zoned, 37, 0, DEFAULT_GAIN_TEXT_ID, &mut outbox);
         let persistent = StatusEffect::new(37, STATUS_RAMPART, 1.0, 0, 0, 0, 0);
         chara.status_effects.add_status_effect(
             persistent,
@@ -4211,7 +4280,14 @@ async fn do_zone_change_purges_lose_on_zoning_status_effects() {
     )
     .await;
 
-    let c = registry.get(37).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(37)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert!(
         !c.status_effects.has(STATUS_POISON),
         "LOSE_ON_ZONING effect should be purged on zone change",
@@ -4220,7 +4296,10 @@ async fn do_zone_change_purges_lose_on_zoning_status_effects() {
         c.status_effects.has(STATUS_RAMPART),
         "non-LOSE_ON_ZONING effect should survive zone change",
     );
-    assert_eq!(c.base.zone_id, 210, "zone id should reflect the destination");
+    assert_eq!(
+        c.base.zone_id, 210,
+        "zone id should reflect the destination"
+    );
 }
 
 #[tokio::test]
@@ -4230,9 +4309,7 @@ async fn quitgame_purges_lose_on_logout_status_effects() {
     use crate::lua::LuaCommandKind as LuaCommand;
     use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
     use crate::status::ids::STATUS_POISON;
-    use crate::status::{
-        DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox,
-    };
+    use crate::status::{DEFAULT_GAIN_TEXT_ID, StatusEffect, StatusEffectFlags, StatusOutbox};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -4280,7 +4357,14 @@ async fn quitgame_purges_lose_on_logout_status_effects() {
         .apply_login_lua_command(&handle, LuaCommand::QuitGame { player_id: 36 })
         .await;
 
-    let c = registry.get(36).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(36)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert!(
         !c.status_effects.has(STATUS_POISON),
         "QuitGame mirrors Logout for LOSE_ON_LOGOUT cleanup",
@@ -4338,8 +4422,7 @@ async fn quitgame_command_emits_quit_packet_to_owner_session() {
 
     let bytes = rx.try_recv().expect("QuitGame should send one packet");
     let mut offset = 0;
-    let base =
-        common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse base packet");
+    let base = common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse base packet");
     let subs = base.get_subpackets().expect("parse subpackets");
     assert_eq!(subs.len(), 1, "QuitGame sends one subpacket");
     assert_eq!(
@@ -4454,7 +4537,13 @@ async fn chocobo_issue_and_load_round_trip() {
                 r"SELECT hasChocobo, chocoboAppearance, chocoboName
                   FROM characters_chocobo WHERE characterId = 101",
                 [],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )?;
             Ok(row)
         })
@@ -4466,7 +4555,9 @@ async fn chocobo_issue_and_load_round_trip() {
 
     // Rename, appearance-change both persist without touching the
     // has-chocobo flag.
-    db.change_player_chocobo_name(101, "Pecopeco").await.unwrap();
+    db.change_player_chocobo_name(101, "Pecopeco")
+        .await
+        .unwrap();
     db.change_player_chocobo_appearance(101, 9).await.unwrap();
     let (has2, app2, name2): (i64, i64, String) = db
         .conn_for_test()
@@ -4475,7 +4566,13 @@ async fn chocobo_issue_and_load_round_trip() {
                 r"SELECT hasChocobo, chocoboAppearance, chocoboName
                   FROM characters_chocobo WHERE characterId = 101",
                 [],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )?)
         })
         .await
@@ -4536,7 +4633,7 @@ async fn issue_chocobo_lua_command_mirrors_state() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(55).await.unwrap();
     processor
@@ -4565,7 +4662,13 @@ async fn issue_chocobo_lua_command_mirrors_state() {
                 r"SELECT hasChocobo, chocoboAppearance, chocoboName
                   FROM characters_chocobo WHERE characterId = 55",
                 [],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?)),
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
             )?)
         })
         .await
@@ -4625,7 +4728,14 @@ async fn rental_expiry_tick_dismounts() {
         .tick_once((common::utils::unix_timestamp() as u64) * 1000)
         .await;
 
-    let c = registry.get(33).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(33)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(c.chara.rental_expire_time, 0);
     assert_eq!(c.chara.rental_min_left, 0);
     assert_eq!(c.chara.mount_state, 0);
@@ -4696,7 +4806,14 @@ async fn add_exp_at_level_50_does_not_roll_past_cap() {
     )
     .await;
 
-    let c = registry.get(555).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(555)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(c.chara.level, 50, "level should not exceed MAX_LEVEL");
     assert_eq!(
         c.battle_save.skill_level[crate::gamedata::CLASSID_GLA as usize],
@@ -4826,8 +4943,14 @@ async fn level_up_fires_attain_level_and_learn_command_messages() {
             saw_learn = true;
         }
     }
-    assert!(saw_attain, "level-up should emit textId 33909 'You attain level N'");
-    assert!(saw_learn, "level-up should emit textId 33926 'You learn X' for each unlock");
+    assert!(
+        saw_attain,
+        "level-up should emit textId 33909 'You attain level N'"
+    );
+    assert!(
+        saw_learn,
+        "level-up should emit textId 33926 'You learn X' for each unlock"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -4888,7 +5011,14 @@ async fn modifier_raise_auto_revives_dead_player_on_next_tick() {
     let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry.clone(), db);
     ticker.tick_once(2_000_000_000).await;
 
-    let c = registry.get(700).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(700)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(
         c.base.current_main_state,
         crate::actor::MAIN_STATE_PASSIVE,
@@ -4952,21 +5082,40 @@ async fn battle_npc_respawns_after_default_delay() {
     let now_secs = 5_000_000u64;
     chara.chara.time_of_death_utc = (now_secs - 100) as u32;
     registry
-        .insert(ActorHandle::new(800, ActorKindTag::BattleNpc, 911, 0, chara))
+        .insert(ActorHandle::new(
+            800,
+            ActorKindTag::BattleNpc,
+            911,
+            0,
+            chara,
+        ))
         .await;
 
     let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry.clone(), db);
     ticker.tick_once(now_secs * 1000).await;
 
-    let c = registry.get(800).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(800)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(
         c.base.current_main_state,
         crate::actor::MAIN_STATE_PASSIVE,
         "BattleNpc should respawn after {BNPC_DEFAULT_RESPAWN_SECS}s",
     );
     assert_eq!(c.chara.hp, 200);
-    assert!((c.base.position_x - 50.0).abs() < 0.01, "snapped back to spawn x");
-    assert!((c.base.position_z - (-50.0)).abs() < 0.01, "snapped back to spawn z");
+    assert!(
+        (c.base.position_x - 50.0).abs() < 0.01,
+        "snapped back to spawn x"
+    );
+    assert!(
+        (c.base.position_z - (-50.0)).abs() < 0.01,
+        "snapped back to spawn z"
+    );
     assert_eq!(c.chara.time_of_death_utc, 0);
 }
 
@@ -5014,13 +5163,26 @@ async fn battle_npc_does_not_respawn_before_delay() {
     // Died 5 seconds ago — well under the 30s default delay.
     chara.chara.time_of_death_utc = (now_secs - 5) as u32;
     registry
-        .insert(ActorHandle::new(801, ActorKindTag::BattleNpc, 912, 0, chara))
+        .insert(ActorHandle::new(
+            801,
+            ActorKindTag::BattleNpc,
+            912,
+            0,
+            chara,
+        ))
         .await;
 
     let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry.clone(), db);
     ticker.tick_once(now_secs * 1000).await;
 
-    let c = registry.get(801).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(801)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(
         c.base.current_main_state,
         crate::actor::MAIN_STATE_DEAD,
@@ -5079,7 +5241,14 @@ async fn dead_player_without_raise_does_not_auto_respawn() {
     let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry.clone(), db);
     ticker.tick_once(9_000_000_000).await;
 
-    let c = registry.get(802).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(802)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(
         c.base.current_main_state,
         crate::actor::MAIN_STATE_DEAD,
@@ -5149,8 +5318,18 @@ async fn inn_auto_accrual_tick_grows_rest_bonus() {
     let t0 = 1_000_000u64;
     ticker.tick_once(t0 * 1000).await;
     {
-        let c = registry.get(900).await.unwrap().character.read().await.clone();
-        assert_eq!(c.chara.rest_bonus_exp_rate, 0, "anchor tick should not grant");
+        let c = registry
+            .get(900)
+            .await
+            .unwrap()
+            .character
+            .read()
+            .await
+            .clone();
+        assert_eq!(
+            c.chara.rest_bonus_exp_rate, 0,
+            "anchor tick should not grant"
+        );
         assert_eq!(c.chara.last_rest_accrual_utc, t0 as u32);
     }
 
@@ -5158,7 +5337,14 @@ async fn inn_auto_accrual_tick_grows_rest_bonus() {
     let t1 = t0 + INN_REST_INTERVAL_SECS as u64;
     ticker.tick_once(t1 * 1000).await;
     {
-        let c = registry.get(900).await.unwrap().character.read().await.clone();
+        let c = registry
+            .get(900)
+            .await
+            .unwrap()
+            .character
+            .read()
+            .await
+            .clone();
         assert_eq!(
             c.chara.rest_bonus_exp_rate, 1,
             "one INN_REST_INTERVAL_SECS gives +1 rested",
@@ -5170,7 +5356,14 @@ async fn inn_auto_accrual_tick_grows_rest_bonus() {
     let t2 = t1 + 10 * INN_REST_INTERVAL_SECS as u64;
     ticker.tick_once(t2 * 1000).await;
     {
-        let c = registry.get(900).await.unwrap().character.read().await.clone();
+        let c = registry
+            .get(900)
+            .await
+            .unwrap()
+            .character
+            .read()
+            .await
+            .clone();
         assert_eq!(c.chara.rest_bonus_exp_rate, 11);
     }
 
@@ -5178,7 +5371,14 @@ async fn inn_auto_accrual_tick_grows_rest_bonus() {
     let t3 = t2 + 1_000 * INN_REST_INTERVAL_SECS as u64;
     ticker.tick_once(t3 * 1000).await;
     {
-        let c = registry.get(900).await.unwrap().character.read().await.clone();
+        let c = registry
+            .get(900)
+            .await
+            .unwrap()
+            .character
+            .read()
+            .await
+            .clone();
         assert_eq!(
             c.chara.rest_bonus_exp_rate, INN_REST_BONUS_CAP,
             "rested should clamp at the cap",
@@ -5233,8 +5433,18 @@ async fn inn_auto_accrual_no_op_outside_inn_zone() {
 
     let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry.clone(), db);
     ticker.tick_once(2_000_000_000).await;
-    let c = registry.get(901).await.unwrap().character.read().await.clone();
-    assert_eq!(c.chara.rest_bonus_exp_rate, 30, "no rested change outside inn");
+    let c = registry
+        .get(901)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
+    assert_eq!(
+        c.chara.rest_bonus_exp_rate, 30,
+        "no rested change outside inn"
+    );
     assert_eq!(
         c.chara.last_rest_accrual_utc, 0,
         "anchor cleared so re-entry starts fresh",
@@ -5258,8 +5468,8 @@ async fn battle_kill_grants_gc_seals_to_enlisted_attacker() {
     use crate::runtime::dispatcher::dispatch_battle_event;
     use crate::zone::zone::Zone;
     use common::db::ConnCallExt;
-    use tokio::sync::mpsc;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     let world = Arc::new(WorldManager::new());
     let registry = Arc::new(ActorRegistry::new());
@@ -5304,7 +5514,13 @@ async fn battle_kill_grants_gc_seals_to_enlisted_attacker() {
     attacker.chara.gc_current = crate::actor::gc::GC_MAELSTROM;
     attacker.chara.gc_rank_limsa = 11;
     registry
-        .insert(ActorHandle::new(101, ActorKindTag::Player, 700, 101, attacker))
+        .insert(ActorHandle::new(
+            101,
+            ActorKindTag::Player,
+            700,
+            101,
+            attacker,
+        ))
         .await;
     let (tx, _rx) = mpsc::channel::<Vec<u8>>(64);
     world.register_client(101, ClientHandle::new(101, tx)).await;
@@ -5388,10 +5604,7 @@ async fn battle_kill_grants_gc_seals_to_enlisted_attacker() {
         .get_seals(101, crate::actor::gc::GC_MAELSTROM)
         .await
         .unwrap();
-    assert!(
-        post >= 12,
-        "expected ≥12 seals (mob level 12), got {post}"
-    );
+    assert!(post >= 12, "expected ≥12 seals (mob level 12), got {post}");
     // Bound check: no more than the rank cap (10_000 at rank 11).
     assert!(post <= 10_000, "seals should respect rank cap; got {post}");
 }
@@ -5449,7 +5662,13 @@ async fn battle_kill_grants_no_seals_to_unenlisted_attacker() {
     attacker.base.zone_id = 701;
     attacker.chara.gc_current = 0;
     registry
-        .insert(ActorHandle::new(303, ActorKindTag::Player, 701, 303, attacker))
+        .insert(ActorHandle::new(
+            303,
+            ActorKindTag::Player,
+            701,
+            303,
+            attacker,
+        ))
         .await;
 
     let mut defender = Character::new(404);
@@ -5458,7 +5677,13 @@ async fn battle_kill_grants_no_seals_to_unenlisted_attacker() {
     defender.chara.hp = 50;
     defender.chara.max_hp = 50;
     registry
-        .insert(ActorHandle::new(404, ActorKindTag::BattleNpc, 701, 0, defender))
+        .insert(ActorHandle::new(
+            404,
+            ActorKindTag::BattleNpc,
+            701,
+            0,
+            defender,
+        ))
         .await;
     {
         let mut z = zone_arc.write().await;
@@ -5579,7 +5804,10 @@ async fn leve_completion_grants_seals_to_enlisted_member() {
 
     award_leve_completion_seals(&handle, 3, &db).await;
 
-    let balance = db.get_seals(181, crate::actor::gc::GC_MAELSTROM).await.unwrap();
+    let balance = db
+        .get_seals(181, crate::actor::gc::GC_MAELSTROM)
+        .await
+        .unwrap();
     assert_eq!(
         balance, 350,
         "3-star leve should grant 350 seals from the difficulty table",
@@ -5683,7 +5911,10 @@ async fn leve_completion_respects_rank_seal_cap() {
 
     award_leve_completion_seals(&handle, 5, &db).await;
 
-    let balance = db.get_seals(183, crate::actor::gc::GC_TWIN_ADDER).await.unwrap();
+    let balance = db
+        .get_seals(183, crate::actor::gc::GC_TWIN_ADDER)
+        .await
+        .unwrap();
     assert_eq!(
         balance, 10_000,
         "post-cap deposit must be refused (capped at the rank seal ceiling)",
@@ -5743,7 +5974,9 @@ async fn dispatch_guildleve_ended_awards_seals_only_on_completion() {
     };
     dispatch_director_event(&abandoned, &[184], &registry, &world, Some(&db)).await;
     assert_eq!(
-        db.get_seals(184, crate::actor::gc::GC_IMMORTAL_FLAMES).await.unwrap(),
+        db.get_seals(184, crate::actor::gc::GC_IMMORTAL_FLAMES)
+            .await
+            .unwrap(),
         0,
         "abandoned leve must not grant seals",
     );
@@ -5758,7 +5991,9 @@ async fn dispatch_guildleve_ended_awards_seals_only_on_completion() {
     };
     dispatch_director_event(&completed, &[184], &registry, &world, Some(&db)).await;
     assert_eq!(
-        db.get_seals(184, crate::actor::gc::GC_IMMORTAL_FLAMES).await.unwrap(),
+        db.get_seals(184, crate::actor::gc::GC_IMMORTAL_FLAMES)
+            .await
+            .unwrap(),
         450,
         "completed 4-star leve should grant 450 seals",
     );
@@ -5811,7 +6046,11 @@ async fn lua_director_end_guildleve_binding_pushes_command() {
     f.call::<()>(dir_ud).expect("fire should not error");
 
     let cmds = CommandQueue::drain(&queue);
-    assert_eq!(cmds.len(), 3, "expected 3 EndGuildleve cmds; drained: {cmds:?}");
+    assert_eq!(
+        cmds.len(),
+        3,
+        "expected 3 EndGuildleve cmds; drained: {cmds:?}"
+    );
     assert!(matches!(
         cmds[0],
         crate::lua::LuaCommandKind::EndGuildleve {
@@ -5894,11 +6133,15 @@ async fn lua_director_remaining_leve_bindings_push_correct_commands() {
     assert_eq!(cmds.len(), 6, "expected 6 leve cmds; drained: {cmds:?}");
     assert!(matches!(
         cmds[0],
-        crate::lua::LuaCommandKind::StartGuildleve { director_actor_id: 0x6320_0001 }
+        crate::lua::LuaCommandKind::StartGuildleve {
+            director_actor_id: 0x6320_0001
+        }
     ));
     assert!(matches!(
         cmds[1],
-        crate::lua::LuaCommandKind::SyncAllInfo { director_actor_id: 0x6320_0001 }
+        crate::lua::LuaCommandKind::SyncAllInfo {
+            director_actor_id: 0x6320_0001
+        }
     ));
     // UpdateMarkers carries the index + xyz triple verbatim.
     if let crate::lua::LuaCommandKind::UpdateMarkers {
@@ -5993,8 +6236,14 @@ async fn full_leve_main_coroutine_sequence_drains_through_dispatcher() {
         "test",
         1,
         "/Area/Zone/Test",
-        0, 0, 0,
-        false, false, false, false, false,
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
         Some(&StubNavmeshLoader),
     );
     let director_actor_id = zone.core.create_guildleve_director(
@@ -6096,7 +6345,10 @@ async fn full_leve_main_coroutine_sequence_drains_through_dispatcher() {
     }
 
     // 3★ leve completion → 350 seals deposited.
-    let balance = db.get_seals(190, crate::actor::gc::GC_MAELSTROM).await.unwrap();
+    let balance = db
+        .get_seals(190, crate::actor::gc::GC_MAELSTROM)
+        .await
+        .unwrap();
     assert_eq!(
         balance, 350,
         "3-star leve sequence should grant 350 seals end-to-end",
@@ -6163,13 +6415,19 @@ async fn abandon_guildleve_emits_abandon_message_and_grants_no_seals() {
         "test",
         1,
         "/Area/Zone/Test",
-        0, 0, 0,
-        false, false, false, false, false,
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
         Some(&StubNavmeshLoader),
     );
-    let director_actor_id = zone.core.create_guildleve_director(
-        20_028, 4, 191, 20_021, 4, 300, [2, 0, 0, 0],
-    );
+    let director_actor_id =
+        zone.core
+            .create_guildleve_director(20_028, 4, 191, 20_021, 4, 300, [2, 0, 0, 0]);
     {
         let gld = zone
             .core
@@ -6206,14 +6464,14 @@ async fn abandon_guildleve_emits_abandon_message_and_grants_no_seals() {
     };
     let handle = registry.get(191).await.unwrap();
     processor
-        .apply_login_lua_command(
-            &handle,
-            LuaCommand::AbandonGuildleve { director_actor_id },
-        )
+        .apply_login_lua_command(&handle, LuaCommand::AbandonGuildleve { director_actor_id })
         .await;
 
     // No seals — abandon path runs `end_guildleve(false)` internally.
-    let balance = db.get_seals(191, crate::actor::gc::GC_IMMORTAL_FLAMES).await.unwrap();
+    let balance = db
+        .get_seals(191, crate::actor::gc::GC_IMMORTAL_FLAMES)
+        .await
+        .unwrap();
     assert_eq!(balance, 0, "abandoned leve must not grant seals");
 
     // At least the abandon-message packet hit the session.
@@ -6310,8 +6568,14 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
         "test",
         1,
         "/Area/Zone/Test",
-        0, 0, 0,
-        false, false, false, false, false,
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
         Some(&StubNavmeshLoader),
     );
     let director_actor_id = zone.core.create_guildleve_director(
@@ -6365,7 +6629,7 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(192).await.unwrap();
 
@@ -6383,7 +6647,9 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
         )
         .await;
     assert_eq!(
-        db.get_seals(192, crate::actor::gc::GC_MAELSTROM).await.unwrap(),
+        db.get_seals(192, crate::actor::gc::GC_MAELSTROM)
+            .await
+            .unwrap(),
         0,
         "first slice ends at wait(0.1); seal accrual should still be 0",
     );
@@ -6434,7 +6700,10 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
     .await;
 
     // Seal accrual fired end-to-end — 1★ leve → 150 seals.
-    let balance = db.get_seals(192, crate::actor::gc::GC_MAELSTROM).await.unwrap();
+    let balance = db
+        .get_seals(192, crate::actor::gc::GC_MAELSTROM)
+        .await
+        .unwrap();
     assert_eq!(
         balance, 150,
         "resumed main coroutine's EndGuildleve(true) should grant 150 seals (1★ table entry)",
@@ -6447,9 +6716,9 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
 /// still drains commands correctly and doesn't park anything.
 #[tokio::test]
 async fn director_main_coroutine_without_wait_completes_on_first_slice() {
-    use crate::lua::{LuaCommandKind as LuaCommand, LuaEngine};
-    use crate::lua::userdata::LuaDirectorHandle;
     use crate::lua::command::CommandQueue;
+    use crate::lua::userdata::LuaDirectorHandle;
+    use crate::lua::{LuaCommandKind as LuaCommand, LuaEngine};
 
     let root = std::env::temp_dir().join(format!(
         "garlemald-director-nowait-{}",
@@ -6479,7 +6748,11 @@ async fn director_main_coroutine_without_wait_completes_on_first_slice() {
         queue: CommandQueue::new(),
     };
     let partial = lua.spawn_director_main(&script_path, handle);
-    assert!(partial.error.is_none(), "main ran clean: {:?}", partial.error);
+    assert!(
+        partial.error.is_none(),
+        "main ran clean: {:?}",
+        partial.error
+    );
     assert_eq!(partial.commands.len(), 1);
     assert!(matches!(
         partial.commands[0],
@@ -6587,18 +6860,24 @@ async fn lua_end_guildleve_command_drains_through_dispatcher_and_grants_seals() 
         "test",
         1,
         "/Area/Zone/Test",
-        0, 0, 0,
-        false, false, false, false, false,
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
         Some(&StubNavmeshLoader),
     );
     let director_actor_id = zone.core.create_guildleve_director(
-        20_026,             // guildleve_id (sweep normal)
-        2,                  // difficulty: 2-star → 250 seals
-        185,                // owner_actor_id
-        20_021,             // plate_id
-        2,                  // location: Gridania music bucket
-        300,                // time_limit_seconds
-        [3, 0, 0, 0],       // aim_num_template
+        20_026,       // guildleve_id (sweep normal)
+        2,            // difficulty: 2-star → 250 seals
+        185,          // owner_actor_id
+        20_021,       // plate_id
+        2,            // location: Gridania music bucket
+        300,          // time_limit_seconds
+        [3, 0, 0, 0], // aim_num_template
     );
     // Add the player as a member of the leve director's roster — the
     // dispatcher's seal accrual loops over `player_members`, and an
@@ -6658,7 +6937,10 @@ async fn lua_end_guildleve_command_drains_through_dispatcher_and_grants_seals() 
 
     // Seals deposited from the leve completion (2★ → 250 from the
     // difficulty table).
-    let balance = db.get_seals(185, crate::actor::gc::GC_TWIN_ADDER).await.unwrap();
+    let balance = db
+        .get_seals(185, crate::actor::gc::GC_TWIN_ADDER)
+        .await
+        .unwrap();
     assert_eq!(
         balance, 250,
         "completed 2-star leve through Lua binding should grant 250 seals end-to-end",
@@ -6688,8 +6970,8 @@ async fn send_mount_appearance_broadcasts_to_nearby_players() {
     use crate::lua::LuaCommandKind as LuaCommand;
     use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
     use crate::zone::zone::Zone;
-    use tokio::sync::mpsc;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     let world = Arc::new(WorldManager::new());
     let registry = Arc::new(ActorRegistry::new());
@@ -6770,7 +7052,9 @@ async fn send_mount_appearance_broadcasts_to_nearby_players() {
         .insert(ActorHandle::new(2, ActorKindTag::Player, 500, 2, nearby))
         .await;
     let (tx_near, mut rx_near) = mpsc::channel::<Vec<u8>>(32);
-    world.register_client(2, ClientHandle::new(2, tx_near)).await;
+    world
+        .register_client(2, ClientHandle::new(2, tx_near))
+        .await;
     {
         let zone_arc = world.zone(500).await.unwrap();
         let mut z = zone_arc.write().await;
@@ -6818,7 +7102,7 @@ async fn send_mount_appearance_broadcasts_to_nearby_players() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(1).await.unwrap();
     processor
@@ -6851,8 +7135,8 @@ async fn level_up_state_for_all_broadcasts_to_nearby_players() {
     use crate::data::ClientHandle;
     use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
     use crate::zone::zone::Zone;
-    use tokio::sync::mpsc;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     let world = Arc::new(WorldManager::new());
     let registry = Arc::new(ActorRegistry::new());
@@ -6909,7 +7193,9 @@ async fn level_up_state_for_all_broadcasts_to_nearby_players() {
         .insert(ActorHandle::new(88, ActorKindTag::Player, 600, 88, source))
         .await;
     let (tx_src, mut rx_src) = mpsc::channel::<Vec<u8>>(32);
-    world.register_client(88, ClientHandle::new(88, tx_src)).await;
+    world
+        .register_client(88, ClientHandle::new(88, tx_src))
+        .await;
     {
         let zone_arc = world.zone(600).await.unwrap();
         let mut z = zone_arc.write().await;
@@ -6935,7 +7221,9 @@ async fn level_up_state_for_all_broadcasts_to_nearby_players() {
         .insert(ActorHandle::new(89, ActorKindTag::Player, 600, 89, nearby))
         .await;
     let (tx_near, mut rx_near) = mpsc::channel::<Vec<u8>>(32);
-    world.register_client(89, ClientHandle::new(89, tx_near)).await;
+    world
+        .register_client(89, ClientHandle::new(89, tx_near))
+        .await;
     {
         let zone_arc = world.zone(600).await.unwrap();
         let mut z = zone_arc.write().await;
@@ -7144,7 +7432,14 @@ async fn apply_add_exp_consumes_rested_pool() {
     )
     .await;
 
-    let c = registry.get(33).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(33)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(
         c.battle_save.skill_point[crate::gamedata::CLASSID_GLA as usize],
         150,
@@ -7165,11 +7460,10 @@ async fn apply_add_exp_consumes_rested_pool() {
                 [],
                 |r| r.get(0),
             )?;
-            let r: i32 = c.query_row(
-                "SELECT restBonus FROM characters WHERE id = 33",
-                [],
-                |r| r.get(0),
-            )?;
+            let r: i32 =
+                c.query_row("SELECT restBonus FROM characters WHERE id = 33", [], |r| {
+                    r.get(0)
+                })?;
             Ok((sp, r))
         })
         .await
@@ -7185,8 +7479,8 @@ async fn apply_add_exp_emits_property_packets_to_client() {
     use crate::actor::Character;
     use crate::data::ClientHandle;
     use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
-    use tokio::sync::mpsc;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     let world = Arc::new(WorldManager::new());
     let registry = Arc::new(ActorRegistry::new());
@@ -7263,8 +7557,8 @@ async fn apply_add_exp_level_up_emits_extra_state_for_all_bundle() {
     use crate::actor::Character;
     use crate::data::ClientHandle;
     use crate::runtime::actor_registry::{ActorHandle, ActorKindTag};
-    use tokio::sync::mpsc;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     let world = Arc::new(WorldManager::new());
     let registry = Arc::new(ActorRegistry::new());
@@ -7325,7 +7619,14 @@ async fn apply_add_exp_level_up_emits_extra_state_for_all_bundle() {
     );
 
     // State reflects the level up.
-    let c = registry.get(77).await.unwrap().character.read().await.clone();
+    let c = registry
+        .get(77)
+        .await
+        .unwrap()
+        .character
+        .read()
+        .await
+        .clone();
     assert_eq!(c.chara.level, 2);
     assert_eq!(
         c.battle_save.skill_level[crate::gamedata::CLASSID_GLA as usize],
@@ -7504,7 +7805,12 @@ async fn add_seals_creates_stack_then_increments() {
             .unwrap(),
         500
     );
-    assert_eq!(db.get_seals(402, crate::actor::gc::GC_MAELSTROM).await.unwrap(), 500);
+    assert_eq!(
+        db.get_seals(402, crate::actor::gc::GC_MAELSTROM)
+            .await
+            .unwrap(),
+        500
+    );
 
     // Serpent seals land on a separate stack (different item id).
     assert_eq!(
@@ -7599,7 +7905,7 @@ async fn join_gc_sets_chara_state_and_db() {
         world: world.clone(),
         registry: registry.clone(),
         lua: Some(lua.clone()),
-            cmd: None,
+        cmd: None,
     };
     let handle = registry.get(88).await.unwrap();
 
@@ -7636,7 +7942,10 @@ async fn join_gc_sets_chara_state_and_db() {
         .unwrap();
     assert_eq!(
         (gc, u),
-        (crate::actor::gc::GC_IMMORTAL_FLAMES as i64, crate::actor::gc::RANK_RECRUIT as i64),
+        (
+            crate::actor::gc::GC_IMMORTAL_FLAMES as i64,
+            crate::actor::gc::RANK_RECRUIT as i64
+        ),
     );
 
     // Promotion via SetGCRank persists and survives.
@@ -7703,9 +8012,13 @@ async fn promote_gc_happy_path_spends_seals_and_bumps_rank() {
     db.set_gc_current(171, crate::actor::gc::GC_MAELSTROM)
         .await
         .unwrap();
-    db.set_gc_rank(171, crate::actor::gc::GC_MAELSTROM, crate::actor::gc::RANK_RECRUIT)
-        .await
-        .unwrap();
+    db.set_gc_rank(
+        171,
+        crate::actor::gc::GC_MAELSTROM,
+        crate::actor::gc::RANK_RECRUIT,
+    )
+    .await
+    .unwrap();
     db.add_seals(171, crate::actor::gc::GC_MAELSTROM, 500)
         .await
         .unwrap();
@@ -7747,11 +8060,20 @@ async fn promote_gc_happy_path_spends_seals_and_bumps_rank() {
     // CharaState reflects the bump.
     {
         let c = handle.character.read().await;
-        assert_eq!(c.chara.gc_rank_limsa, 11, "rank bumped Recruit (127) → Private Third Class (11)");
+        assert_eq!(
+            c.chara.gc_rank_limsa, 11,
+            "rank bumped Recruit (127) → Private Third Class (11)"
+        );
     }
     // DB persisted: rank 11, seal balance 400 (500 - 100 cost).
-    let post_rank = db.get_seals(171, crate::actor::gc::GC_MAELSTROM).await.unwrap();
-    assert_eq!(post_rank, 400, "seal balance should be 500 - 100 cost = 400");
+    let post_rank = db
+        .get_seals(171, crate::actor::gc::GC_MAELSTROM)
+        .await
+        .unwrap();
+    assert_eq!(
+        post_rank, 400,
+        "seal balance should be 500 - 100 cost = 400"
+    );
     let stored_rank: i64 = db
         .conn_for_test()
         .call_db(|c| {
@@ -7830,9 +8152,13 @@ async fn promote_gc_salute_broadcasts_to_nearby_player() {
     db.set_gc_current(175, crate::actor::gc::GC_MAELSTROM)
         .await
         .unwrap();
-    db.set_gc_rank(175, crate::actor::gc::GC_MAELSTROM, crate::actor::gc::RANK_RECRUIT)
-        .await
-        .unwrap();
+    db.set_gc_rank(
+        175,
+        crate::actor::gc::GC_MAELSTROM,
+        crate::actor::gc::RANK_RECRUIT,
+    )
+    .await
+    .unwrap();
     db.add_seals(175, crate::actor::gc::GC_MAELSTROM, 200)
         .await
         .unwrap();
@@ -7881,11 +8207,23 @@ async fn promote_gc_salute_broadcasts_to_nearby_player() {
     promotee.chara.gc_current = crate::actor::gc::GC_MAELSTROM;
     promotee.chara.gc_rank_limsa = crate::actor::gc::RANK_RECRUIT;
     registry
-        .insert(ActorHandle::new(175, ActorKindTag::Player, 300, 175, promotee))
+        .insert(ActorHandle::new(
+            175,
+            ActorKindTag::Player,
+            300,
+            175,
+            promotee,
+        ))
         .await;
     let witness = Character::new(176);
     registry
-        .insert(ActorHandle::new(176, ActorKindTag::Player, 300, 176, witness))
+        .insert(ActorHandle::new(
+            176,
+            ActorKindTag::Player,
+            300,
+            176,
+            witness,
+        ))
         .await;
 
     world
@@ -7990,9 +8328,13 @@ async fn promote_gc_refuses_when_seals_below_cost() {
     db.set_gc_current(172, crate::actor::gc::GC_TWIN_ADDER)
         .await
         .unwrap();
-    db.set_gc_rank(172, crate::actor::gc::GC_TWIN_ADDER, crate::actor::gc::RANK_RECRUIT)
-        .await
-        .unwrap();
+    db.set_gc_rank(
+        172,
+        crate::actor::gc::GC_TWIN_ADDER,
+        crate::actor::gc::RANK_RECRUIT,
+    )
+    .await
+    .unwrap();
     db.add_seals(172, crate::actor::gc::GC_TWIN_ADDER, 50)
         .await
         .unwrap();
@@ -8035,7 +8377,10 @@ async fn promote_gc_refuses_when_seals_below_cost() {
         assert_eq!(c.chara.gc_rank_gridania, crate::actor::gc::RANK_RECRUIT);
     }
     // Seal balance untouched.
-    let balance = db.get_seals(172, crate::actor::gc::GC_TWIN_ADDER).await.unwrap();
+    let balance = db
+        .get_seals(172, crate::actor::gc::GC_TWIN_ADDER)
+        .await
+        .unwrap();
     assert_eq!(balance, 50, "insufficient-seals refusal must not deduct");
 }
 
@@ -8077,9 +8422,13 @@ async fn promote_gc_refuses_when_not_enlisted_in_target_gc() {
     db.set_gc_current(173, crate::actor::gc::GC_MAELSTROM)
         .await
         .unwrap();
-    db.set_gc_rank(173, crate::actor::gc::GC_MAELSTROM, crate::actor::gc::RANK_RECRUIT)
-        .await
-        .unwrap();
+    db.set_gc_rank(
+        173,
+        crate::actor::gc::GC_MAELSTROM,
+        crate::actor::gc::RANK_RECRUIT,
+    )
+    .await
+    .unwrap();
     // Seed 1000 Flame seals to prove the enrollment check fires
     // before the balance check.
     db.add_seals(173, crate::actor::gc::GC_IMMORTAL_FLAMES, 1000)
@@ -8126,7 +8475,10 @@ async fn promote_gc_refuses_when_not_enlisted_in_target_gc() {
         assert_eq!(c.chara.gc_rank_limsa, crate::actor::gc::RANK_RECRUIT);
     }
     // Flame seal balance untouched.
-    let balance = db.get_seals(173, crate::actor::gc::GC_IMMORTAL_FLAMES).await.unwrap();
+    let balance = db
+        .get_seals(173, crate::actor::gc::GC_IMMORTAL_FLAMES)
+        .await
+        .unwrap();
     assert_eq!(balance, 1000, "wrong-GC refusal must not deduct");
 }
 
@@ -8209,7 +8561,10 @@ async fn promote_gc_refuses_at_story_rank_cap() {
         let c = handle.character.read().await;
         assert_eq!(c.chara.gc_rank_uldah, 31);
     }
-    let balance = db.get_seals(174, crate::actor::gc::GC_IMMORTAL_FLAMES).await.unwrap();
+    let balance = db
+        .get_seals(174, crate::actor::gc::GC_IMMORTAL_FLAMES)
+        .await
+        .unwrap();
     assert_eq!(balance, 50_000);
 }
 
@@ -8299,7 +8654,10 @@ async fn promote_gc_refuses_at_sergeant_tier_shift_without_quest_completed() {
         let c = handle.character.read().await;
         assert_eq!(c.chara.gc_rank_limsa, 17);
     }
-    let balance = db.get_seals(177, crate::actor::gc::GC_MAELSTROM).await.unwrap();
+    let balance = db
+        .get_seals(177, crate::actor::gc::GC_MAELSTROM)
+        .await
+        .unwrap();
     assert_eq!(balance, 100_000, "tier-shift refusal must not deduct seals");
 }
 
@@ -8387,7 +8745,10 @@ async fn promote_gc_passes_sergeant_tier_shift_when_quest_completed() {
         assert_eq!(c.chara.gc_rank_limsa, 21);
     }
     // Seal cost (2500) deducted.
-    let balance = db.get_seals(178, crate::actor::gc::GC_MAELSTROM).await.unwrap();
+    let balance = db
+        .get_seals(178, crate::actor::gc::GC_MAELSTROM)
+        .await
+        .unwrap();
     assert_eq!(balance, 5_000 - 2_500);
 }
 
@@ -8562,7 +8923,9 @@ async fn retainer_bazaar_add_list_remove_round_trip() {
 
     // First listing: iron ingot x5 at 120 gil.
     let total_a = db
-        .add_retainer_bazaar_item(1001, /*item=*/ 5100, /*delta=*/ 5, /*quality=*/ 0, 120)
+        .add_retainer_bazaar_item(
+            1001, /*item=*/ 5100, /*delta=*/ 5, /*quality=*/ 0, 120,
+        )
         .await
         .unwrap();
     assert_eq!(total_a, 5, "fresh insert returns seed quantity");
@@ -8579,7 +8942,10 @@ async fn retainer_bazaar_add_list_remove_round_trip() {
         .add_retainer_bazaar_item(1001, 5100, 3, 0, 120)
         .await
         .unwrap();
-    assert_eq!(total_b, 8, "same (item, quality, price) should merge stacks");
+    assert_eq!(
+        total_b, 8,
+        "same (item, quality, price) should merge stacks"
+    );
     let rows = db.list_retainer_bazaar(1001).await.unwrap();
     assert_eq!(rows.len(), 1, "merge must not spawn a new slot");
     assert_eq!(rows[0].quantity, 8);
@@ -8614,9 +8980,15 @@ async fn retainer_bazaar_add_list_remove_round_trip() {
     // the backing server_items row (so `server_items` storage doesn't
     // leak for bought-out stacks).
     let target_sid = rows[0].server_item_id;
-    assert!(db.remove_retainer_bazaar_item(1001, target_sid).await.unwrap());
     assert!(
-        !db.remove_retainer_bazaar_item(1001, target_sid).await.unwrap(),
+        db.remove_retainer_bazaar_item(1001, target_sid)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !db.remove_retainer_bazaar_item(1001, target_sid)
+            .await
+            .unwrap(),
         "second remove on the same id should be a no-op",
     );
     let after = db.list_retainer_bazaar(1001).await.unwrap();
@@ -8628,12 +9000,16 @@ async fn retainer_bazaar_add_list_remove_round_trip() {
 
     // Ignore empty / zero-item no-ops without failing.
     assert_eq!(
-        db.add_retainer_bazaar_item(1001, 0, 1, 0, 10).await.unwrap(),
+        db.add_retainer_bazaar_item(1001, 0, 1, 0, 10)
+            .await
+            .unwrap(),
         0,
         "item_catalog_id=0 is a no-op",
     );
     assert_eq!(
-        db.add_retainer_bazaar_item(1001, 5100, 0, 0, 10).await.unwrap(),
+        db.add_retainer_bazaar_item(1001, 5100, 0, 0, 10)
+            .await
+            .unwrap(),
         0,
         "delta=0 is a no-op",
     );
@@ -8748,7 +9124,6 @@ async fn lua_retainer_add_bazaar_item_binding_queues_command() {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Regional leves — Tier 3 #13 (fieldcraft + battlecraft)
 // ---------------------------------------------------------------------------
@@ -8836,7 +9211,13 @@ async fn fieldcraft_leve_progress_ticks_on_add_item() {
     quest.clear_dirty();
     character.quest_journal.add(quest);
     registry
-        .insert(ActorHandle::new(71, ActorKindTag::Player, 180, 71, character))
+        .insert(ActorHandle::new(
+            71,
+            ActorKindTag::Player,
+            180,
+            71,
+            character,
+        ))
         .await;
 
     // Harvest 3 copper ore — progress should tick to 3.
@@ -8861,7 +9242,10 @@ async fn fieldcraft_leve_progress_ticks_on_add_item() {
         let q = c.quest_journal.get(130_003).expect("leve still present");
         q.get_counter(0)
     };
-    assert_eq!(c1_after_first, 3, "progress should tick by the AddItem quantity");
+    assert_eq!(
+        c1_after_first, 3,
+        "progress should tick by the AddItem quantity"
+    );
 
     // Second harvest of 2 ore — should saturate at the band-0 target
     // (5) and flip the COMPLETED_FLAG_BIT via `advance_progress`.
@@ -8883,7 +9267,10 @@ async fn fieldcraft_leve_progress_ticks_on_add_item() {
         let h = registry.get(71).await.unwrap();
         let c = h.character.read().await;
         let q = c.quest_journal.get(130_003).expect("leve still present");
-        (q.get_counter(0), q.get_flag(crate::leve::COMPLETED_FLAG_BIT))
+        (
+            q.get_counter(0),
+            q.get_flag(crate::leve::COMPLETED_FLAG_BIT),
+        )
     };
     assert_eq!(c1_after_second, 5, "progress saturates at objective");
     assert!(completed, "COMPLETED_FLAG_BIT should have flipped");
@@ -8953,7 +9340,13 @@ async fn fieldcraft_leve_progress_gated_on_accepted_flag() {
     quest.clear_dirty(); // ACCEPTED flag intentionally left unset
     character.quest_journal.add(quest);
     registry
-        .insert(ActorHandle::new(72, ActorKindTag::Player, 180, 72, character))
+        .insert(ActorHandle::new(
+            72,
+            ActorKindTag::Player,
+            180,
+            72,
+            character,
+        ))
         .await;
 
     let world = Arc::new(WorldManager::new());
@@ -9026,7 +9419,13 @@ async fn battlecraft_leve_progress_ticks_on_kill() {
     quest.clear_dirty();
     character.quest_journal.add(quest);
     registry
-        .insert(ActorHandle::new(73, ActorKindTag::Player, 180, 73, character))
+        .insert(ActorHandle::new(
+            73,
+            ActorKindTag::Player,
+            180,
+            73,
+            character,
+        ))
         .await;
 
     // Kill three drakes — three separate invocations, one per kill.
@@ -9035,13 +9434,20 @@ async fn battlecraft_leve_progress_ticks_on_kill() {
         let c = advance_battlecraft_leves(73, 5_000_091, &registry, &db, Some(&lua)).await;
         completions.extend(c);
     }
-    assert_eq!(completions, vec![140_003], "third kill should complete exactly once");
+    assert_eq!(
+        completions,
+        vec![140_003],
+        "third kill should complete exactly once"
+    );
 
     let (progress, completed) = {
         let h = registry.get(73).await.unwrap();
         let c = h.character.read().await;
         let q = c.quest_journal.get(140_003).expect("leve still present");
-        (q.get_counter(0), q.get_flag(crate::leve::COMPLETED_FLAG_BIT))
+        (
+            q.get_counter(0),
+            q.get_flag(crate::leve::COMPLETED_FLAG_BIT),
+        )
     };
     assert_eq!(progress, 3);
     assert!(completed);
@@ -9049,9 +9455,11 @@ async fn battlecraft_leve_progress_ticks_on_kill() {
     // Fourth kill after completion — the `is_completed` guard in
     // `RegionalLeveView::advance_progress` short-circuits and no
     // further DB write happens.
-    let completions_4 =
-        advance_battlecraft_leves(73, 5_000_091, &registry, &db, Some(&lua)).await;
-    assert!(completions_4.is_empty(), "post-completion calls must be idempotent");
+    let completions_4 = advance_battlecraft_leves(73, 5_000_091, &registry, &db, Some(&lua)).await;
+    assert!(
+        completions_4.is_empty(),
+        "post-completion calls must be idempotent"
+    );
 }
 
 /// Missing-catalog safety: when no resolver is installed (fresh DB
@@ -9145,7 +9553,10 @@ async fn apply_add_item_to_retainer_creates_and_merges_stack() {
         })
         .await
         .unwrap();
-    assert_eq!(rows_after_second, 1, "merge should not spill into a new row");
+    assert_eq!(
+        rows_after_second, 1,
+        "merge should not spill into a new row"
+    );
     assert_eq!(qty_after_second, 5);
 
     // Third add — different item — spills into a new slot.
@@ -9359,7 +9770,13 @@ async fn spawn_my_retainer_records_meeting_group_id_on_snapshot() {
     let registry = Arc::new(ActorRegistry::new());
     let character = Character::new(90);
     registry
-        .insert(ActorHandle::new(90, ActorKindTag::Player, 180, 90, character))
+        .insert(ActorHandle::new(
+            90,
+            ActorKindTag::Player,
+            180,
+            90,
+            character,
+        ))
         .await;
 
     // Wire a client so the spawn/meeting packets don't drop silently.
@@ -9400,7 +9817,10 @@ async fn spawn_my_retainer_records_meeting_group_id_on_snapshot() {
         .unwrap()
         .spawned_retainer
         .expect("retainer spawned");
-    assert_ne!(snap.group_id, 0, "meeting group id should be non-zero after spawn");
+    assert_ne!(
+        snap.group_id, 0,
+        "meeting group id should be non-zero after spawn"
+    );
 
     processor
         .apply_login_lua_command(&handle, LuaCommand::DespawnMyRetainer { player_id: 90 })
@@ -9540,7 +9960,10 @@ async fn rename_retainer_is_per_character() {
     // Bob's retainer should still read Wienta since Alice's rename
     // only touched row (93, 1001).
     let bobs = db.load_retainer(94, 1).await.unwrap().expect("exists");
-    assert_eq!(bobs.name, "Wienta", "Bob's retainer untouched by Alice's rename");
+    assert_eq!(
+        bobs.name, "Wienta",
+        "Bob's retainer untouched by Alice's rename"
+    );
 
     db.rename_retainer(94, 1001, "BobRetainer".to_string())
         .await
@@ -9589,7 +10012,13 @@ async fn processor_rename_retainer_persists() {
     let registry = Arc::new(ActorRegistry::new());
     let character = Character::new(95);
     registry
-        .insert(ActorHandle::new(95, ActorKindTag::Player, 180, 95, character))
+        .insert(ActorHandle::new(
+            95,
+            ActorKindTag::Player,
+            180,
+            95,
+            character,
+        ))
         .await;
     let (tx, _rx) = mpsc::channel::<Vec<u8>>(64);
     world.register_client(95, ClientHandle::new(95, tx)).await;
@@ -9709,7 +10138,10 @@ async fn hand_in_fieldcraft_leve_grants_gil_and_clears_journal() {
     let outcome = apply_regional_leve_hand_in(201, 130_001, &registry, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 200); // seed 048 band-0 gil
-    assert_eq!(outcome.item_granted, None, "scaffold seeds have no item reward");
+    assert_eq!(
+        outcome.item_granted, None,
+        "scaffold seeds have no item reward"
+    );
     assert_eq!(outcome.seals_granted, None, "fieldcraft never grants seals");
 
     // Journal cleared.
@@ -9744,7 +10176,10 @@ async fn hand_in_battlecraft_unenlisted_grants_gil_no_seals() {
     let outcome = apply_regional_leve_hand_in(202, 140_001, &registry, &db, Some(&lua)).await;
     assert!(outcome.applied);
     assert_eq!(outcome.gil_granted, 300); // seed 048 battlecraft band-0 gil
-    assert_eq!(outcome.seals_granted, None, "unenlisted battlecraft yields no seals");
+    assert_eq!(
+        outcome.seals_granted, None,
+        "unenlisted battlecraft yields no seals"
+    );
 }
 
 /// Battlecraft hand-in for an enlisted player: gil + GC seals.
@@ -9753,8 +10188,7 @@ async fn hand_in_battlecraft_enlisted_grants_gil_and_seals() {
     use crate::actor::gc::GC_MAELSTROM;
     use crate::runtime::quest_apply::apply_regional_leve_hand_in;
 
-    let (db, registry, lua) =
-        setup_completed_leve(203, 140_001, 0, GC_MAELSTROM).await;
+    let (db, registry, lua) = setup_completed_leve(203, 140_001, 0, GC_MAELSTROM).await;
 
     let outcome = apply_regional_leve_hand_in(203, 140_001, &registry, &db, Some(&lua)).await;
     assert!(outcome.applied);
@@ -9813,7 +10247,13 @@ async fn hand_in_incomplete_leve_is_noop() {
     quest.clear_dirty();
     character.quest_journal.add(quest);
     registry
-        .insert(ActorHandle::new(204, ActorKindTag::Player, 180, 204, character))
+        .insert(ActorHandle::new(
+            204,
+            ActorKindTag::Player,
+            180,
+            204,
+            character,
+        ))
         .await;
 
     let outcome = apply_regional_leve_hand_in(204, 130_001, &registry, &db, Some(&lua)).await;
@@ -9839,7 +10279,10 @@ async fn hand_in_is_idempotent_across_double_calls() {
     assert!(first.applied);
 
     let second = apply_regional_leve_hand_in(205, 130_001, &registry, &db, Some(&lua)).await;
-    assert!(!second.applied, "second hand-in on a cleared leve is a no-op");
+    assert!(
+        !second.applied,
+        "second hand-in on a cleared leve is a no-op"
+    );
     assert_eq!(second.gil_granted, 0);
 }
 
@@ -9867,7 +10310,10 @@ async fn runtime_drain_hand_in_regional_leve_routes_correctly() {
 
     let h = registry.get(206).await.unwrap();
     let c = h.character.read().await;
-    assert!(c.quest_journal.get(130_001).is_none(), "leve cleared from journal");
+    assert!(
+        c.quest_journal.get(130_001).is_none(),
+        "leve cleared from journal"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -9909,9 +10355,7 @@ async fn lua_get_regional_leve_resolver_surfaces_catalog() {
         reward_gil_b2,
         fc_for_copper,
         bc_for_drake,
-    ): (
-        i64, i64, i64, i64, bool, i64, i64, i64, i64, i64,
-    ) = lua
+    ): (i64, i64, i64, i64, bool, i64, i64, i64, i64, i64) = lua
         .load(
             r#"
             local r = GetRegionalLeveResolver()
@@ -10219,9 +10663,7 @@ async fn accept_regional_leve_is_idempotent_on_double_call() {
 #[tokio::test]
 async fn full_leve_loop_accept_progress_hand_in() {
     use crate::lua::LuaCommandKind;
-    use crate::runtime::quest_apply::{
-        apply_accept_regional_leve, apply_runtime_lua_commands,
-    };
+    use crate::runtime::quest_apply::{apply_accept_regional_leve, apply_runtime_lua_commands};
     use common::db::ConnCallExt;
 
     let db = Arc::new(
@@ -10719,9 +11161,10 @@ async fn apply_try_status_installs_effect_on_target() {
         ))
         .await;
 
-    let landed =
-        apply_try_status(0, 701, 253_000, /*dur*/ 30, /*mag*/ 1.0, 0, 0, &registry, &db, &world, None)
-            .await;
+    let landed = apply_try_status(
+        0, 701, 253_000, /*dur*/ 30, /*mag*/ 1.0, 0, 0, &registry, &db, &world, None,
+    )
+    .await;
     assert!(landed);
 
     let h = registry.get(701).await.unwrap();
@@ -10946,14 +11389,9 @@ async fn apply_login_lua_command_routes_run_event_function_through_outbox() {
     let mut chara = Character::new(1);
     {
         let mut ob = EventOutbox::new();
-        chara.event_session.start_event(
-            1,
-            99,
-            "quest_man0g0_seq005",
-            5,
-            vec![],
-            &mut ob,
-        );
+        chara
+            .event_session
+            .start_event(1, 99, "quest_man0g0_seq005", 5, vec![], &mut ob);
     }
     registry
         .insert(ActorHandle::new(1, ActorKindTag::Player, 0, 42, chara))
@@ -10999,10 +11437,11 @@ async fn apply_login_lua_command_routes_run_event_function_through_outbox() {
     let first = rx
         .try_recv()
         .expect("RunEventFunction must reach the client");
-    assert!(!first.is_empty(), "RunEventFunction packet must be non-empty");
-    let second = rx
-        .try_recv()
-        .expect("EndEvent must reach the client");
+    assert!(
+        !first.is_empty(),
+        "RunEventFunction packet must be non-empty"
+    );
+    let second = rx.try_recv().expect("EndEvent must reach the client");
     assert!(!second.is_empty(), "EndEvent packet must be non-empty");
     assert_ne!(first, second, "the two packets carry different opcodes");
 }

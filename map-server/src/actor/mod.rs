@@ -437,7 +437,6 @@ impl Character {
             quest_journal: crate::actor::quest::QuestJournal::default(),
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------

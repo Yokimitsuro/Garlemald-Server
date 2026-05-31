@@ -75,28 +75,28 @@ pub fn seal_item_id(gc: u8) -> Option<u32> {
 /// deposit.
 pub fn rank_seal_cap(rank: u8) -> i32 {
     match rank {
-        0 => 0,           // None
-        11 => 10_000,     // Private Third Class
-        13 => 15_000,     // Private Second Class
-        15 => 20_000,     // Private First Class
-        17 => 25_000,     // Corporal
-        21 => 30_000,     // Sergeant Third Class
-        23 => 35_000,     // Sergeant Second Class
-        25 => 40_000,     // Sergeant First Class
-        27 => 45_000,     // Chief Sergeant
-        31 => 50_000,     // Second Lieutenant
-        33 => 50_000,     // First Lieutenant
-        35 => 50_000,     // Captain
-        41 => 60_000,     // Second Commander
-        43 => 60_000,     // First Commander
-        45 => 60_000,     // High Commander
-        51 => 70_000,     // Rear Marshal
-        53 => 70_000,     // Vice Marshal
-        55 => 70_000,     // Marshal
-        57 => 70_000,     // Grand Marshal
-        100 => 100_000,   // Champion
-        111 => 0,         // Chief Admiral / Elder Seedseer / General (0-cap in source)
-        127 => 10_000,    // Recruit
+        0 => 0,         // None
+        11 => 10_000,   // Private Third Class
+        13 => 15_000,   // Private Second Class
+        15 => 20_000,   // Private First Class
+        17 => 25_000,   // Corporal
+        21 => 30_000,   // Sergeant Third Class
+        23 => 35_000,   // Sergeant Second Class
+        25 => 40_000,   // Sergeant First Class
+        27 => 45_000,   // Chief Sergeant
+        31 => 50_000,   // Second Lieutenant
+        33 => 50_000,   // First Lieutenant
+        35 => 50_000,   // Captain
+        41 => 60_000,   // Second Commander
+        43 => 60_000,   // First Commander
+        45 => 60_000,   // High Commander
+        51 => 70_000,   // Rear Marshal
+        53 => 70_000,   // Vice Marshal
+        55 => 70_000,   // Marshal
+        57 => 70_000,   // Grand Marshal
+        100 => 100_000, // Champion
+        111 => 0,       // Chief Admiral / Elder Seedseer / General (0-cap in source)
+        127 => 10_000,  // Recruit
         _ => 0,
     }
 }

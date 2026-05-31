@@ -48,7 +48,10 @@ impl SecurityHandshakePacket {
         c.seek(SeekFrom::Start(0x34))?;
         let ticket_phrase = read_fixed_string(&mut c, 0x40)?;
         let client_number = c.read_u32::<LittleEndian>()?;
-        Ok(Self { ticket_phrase, client_number })
+        Ok(Self {
+            ticket_phrase,
+            client_number,
+        })
     }
 }
 
@@ -67,7 +70,11 @@ impl SessionPacket {
         let _ = c.read_u32::<LittleEndian>()?;
         let session = read_fixed_string(&mut c, 0x40)?;
         let version = read_fixed_string(&mut c, 0x20)?;
-        Ok(Self { sequence, session, version })
+        Ok(Self {
+            sequence,
+            session,
+            version,
+        })
     }
 }
 
@@ -86,7 +93,12 @@ impl SelectCharacterPacket {
         let character_id = c.read_u32::<LittleEndian>()?;
         let unknown_id = c.read_u32::<LittleEndian>()?;
         let ticket = c.read_u64::<LittleEndian>()?;
-        Ok(Self { sequence, character_id, unknown_id, ticket })
+        Ok(Self {
+            sequence,
+            character_id,
+            unknown_id,
+            ticket,
+        })
     }
 }
 

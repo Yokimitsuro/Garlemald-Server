@@ -67,7 +67,8 @@ pub fn build_0x7_packet(actor_id: u32) -> SubPacket {
     let mut data = vec![0u8; 0x08];
     let mut c = Cursor::new(&mut data[..]);
     c.write_u32::<LittleEndian>(actor_id).unwrap();
-    c.write_u32::<LittleEndian>(utils::unix_timestamp()).unwrap();
+    c.write_u32::<LittleEndian>(utils::unix_timestamp())
+        .unwrap();
     SubPacket::new_with_flag(false, OP_CLIENT_0X7, 0, data)
 }
 
@@ -76,7 +77,8 @@ pub fn build_0x8_ping_packet(actor_id: u32) -> SubPacket {
     let mut data = vec![0u8; 0x08];
     let mut c = Cursor::new(&mut data[..]);
     c.write_u32::<LittleEndian>(actor_id).unwrap();
-    c.write_u32::<LittleEndian>(utils::unix_timestamp()).unwrap();
+    c.write_u32::<LittleEndian>(utils::unix_timestamp())
+        .unwrap();
     SubPacket::new_with_flag(false, OP_CLIENT_0X8, 0, data)
 }
 
@@ -163,8 +165,10 @@ pub fn build_game_message(source_actor_id: u32, opts: GameMessageOptions) -> Sub
     //   u32 receiver, u32 sender, u16 textId, u8 log, u8 pad, [optional u32 displayId
     //   or padded 0x20 custom-sender string], then luaparams.
     let mut body = Vec::<u8>::with_capacity(0x40 + opts.lua_params.len() * 8);
-    body.write_u32::<LittleEndian>(opts.receiver_actor_id).unwrap();
-    body.write_u32::<LittleEndian>(opts.sender_actor_id).unwrap();
+    body.write_u32::<LittleEndian>(opts.receiver_actor_id)
+        .unwrap();
+    body.write_u32::<LittleEndian>(opts.sender_actor_id)
+        .unwrap();
     body.write_u16::<LittleEndian>(opts.text_id).unwrap();
     body.write_u8(opts.log).unwrap();
     body.write_u8(0).unwrap();

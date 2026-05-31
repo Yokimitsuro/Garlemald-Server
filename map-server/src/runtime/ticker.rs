@@ -271,18 +271,16 @@ impl GameTicker {
                         crate::runtime::actor_registry::ActorKindTag::Player => {
                             // Skip the session-owner — already in
                             // players_vec from the by_session branch.
-                            if mid
-                                != players_vec.first().map(|p| p.actor_id).unwrap_or(0)
-                            {
+                            if mid != players_vec.first().map(|p| p.actor_id).unwrap_or(0) {
                                 players_vec.push(
                                     crate::processor::build_player_snapshot_from_character(&c),
                                 );
                             }
                         }
                         kind @ (crate::runtime::actor_registry::ActorKindTag::Ally
-                            | crate::runtime::actor_registry::ActorKindTag::BattleNpc
-                            | crate::runtime::actor_registry::ActorKindTag::Npc
-                            | crate::runtime::actor_registry::ActorKindTag::Pet) => {
+                        | crate::runtime::actor_registry::ActorKindTag::BattleNpc
+                        | crate::runtime::actor_registry::ActorKindTag::Npc
+                        | crate::runtime::actor_registry::ActorKindTag::Pet) => {
                             let actor = crate::lua::userdata::LuaActor {
                                 actor_id: mid,
                                 name: c.base.actor_name.clone(),
@@ -292,11 +290,7 @@ impl GameTicker {
                                 zone_id: handle.zone_id,
                                 zone_name: String::new(),
                                 state: c.base.current_main_state,
-                                pos: (
-                                    c.base.position_x,
-                                    c.base.position_y,
-                                    c.base.position_z,
-                                ),
+                                pos: (c.base.position_x, c.base.position_y, c.base.position_z),
                                 rotation: c.base.rotation,
                                 queue: placeholder_queue.clone(),
                                 is_engaged: c.is_engaged(),
@@ -422,8 +416,7 @@ impl GameTicker {
                         chara.chara.new_main_state = crate::actor::MAIN_STATE_PASSIVE;
                     } else {
                         chara.chara.rental_min_left =
-                            (((chara.chara.rental_expire_time - tick_utc) / 60) as u8)
-                                .min(255);
+                            (((chara.chara.rental_expire_time - tick_utc) / 60) as u8).min(255);
                     }
                 }
 
@@ -434,8 +427,8 @@ impl GameTicker {
                         // measure elapsed time from here.
                         chara.chara.last_rest_accrual_utc = tick_utc;
                     } else {
-                        let elapsed_since_last = tick_utc
-                            .saturating_sub(chara.chara.last_rest_accrual_utc);
+                        let elapsed_since_last =
+                            tick_utc.saturating_sub(chara.chara.last_rest_accrual_utc);
                         let earned = (elapsed_since_last / INN_REST_INTERVAL_SECS) as i32;
                         if earned > 0 {
                             chara.chara.rest_bonus_exp_rate =
@@ -504,8 +497,7 @@ impl GameTicker {
                     // brings the actor back where they fell.
                     if matches!(action, DeathTickAction::Respawn) {
                         let mut c = handle.character.write().await;
-                        let (sx, sy, sz) =
-                            (c.chara.spawn_x, c.chara.spawn_y, c.chara.spawn_z);
+                        let (sx, sy, sz) = (c.chara.spawn_x, c.chara.spawn_y, c.chara.spawn_z);
                         c.base.position_x = sx;
                         c.base.position_y = sy;
                         c.base.position_z = sz;
@@ -521,14 +513,8 @@ impl GameTicker {
             }
 
             for e in status_outbox.drain() {
-                dispatch_status_event(
-                    &e,
-                    &self.registry,
-                    &self.world,
-                    &self.db,
-                    &self.catalogs,
-                )
-                .await;
+                dispatch_status_event(&e, &self.registry, &self.world, &self.db, &self.catalogs)
+                    .await;
             }
             for e in battle_outbox.drain() {
                 dispatch_battle_event(
@@ -780,13 +766,7 @@ mod tests {
         player.chara.max_hp = 1000;
         player.chara.level = 10;
         registry
-            .insert(ActorHandle::new(
-                1,
-                ActorKindTag::Player,
-                100,
-                42,
-                player,
-            ))
+            .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, player))
             .await;
 
         let mut npc = Character::new(2);
@@ -795,13 +775,7 @@ mod tests {
         npc.chara.level = 10;
         npc.base.position_x = 3.0;
         registry
-            .insert(ActorHandle::new(
-                2,
-                ActorKindTag::BattleNpc,
-                100,
-                0,
-                npc,
-            ))
+            .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, npc))
             .await;
 
         let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry, db);
