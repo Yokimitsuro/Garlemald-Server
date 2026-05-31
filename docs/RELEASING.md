@@ -9,8 +9,9 @@ git tags. The **git tag `vX.Y.Z` is the source of truth**; the root
 
 - **`develop`** is the default branch and the integration branch for day-to-day
   work. Branch features off `develop` and PR back into it. `develop` is protected
-  and requires the CI checks (`fmt` / `clippy` / `build` / `test`) plus a pull
-  request before merging.
+  and requires the CI checks (`fmt` / `clippy` / `build` / `test`) plus an open
+  pull request before merging (no approving review is required, so you can merge
+  your own PR once CI is green).
 - **`main`** is the protected release branch. A release is cut by opening a PR
   from `develop` into `main`; when it merges, the push to `main` triggers
   `release.yml` (version bump + tag), which in turn triggers `release-binaries.yml`
