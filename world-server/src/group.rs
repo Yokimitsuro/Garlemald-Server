@@ -169,7 +169,15 @@ impl RetainerGroupMember {
         conditions: u8,
         level: u8,
     ) -> Self {
-        Self { id, name, actor_class_id, cd_id_offset, place_name, conditions, level }
+        Self {
+            id,
+            name,
+            actor_class_id,
+            cd_id_offset,
+            place_name,
+            conditions,
+            level,
+        }
     }
 }
 

@@ -323,7 +323,12 @@ pub fn build_text_sheet_no_source_auto(
     prefer_alt: bool,
 ) -> SubPacket {
     if lua_params.is_empty() {
-        return build_text_sheet_no_source_x28(receiver_actor_id, sender_actor_id, text_id, log_flag);
+        return build_text_sheet_no_source_x28(
+            receiver_actor_id,
+            sender_actor_id,
+            text_id,
+            log_flag,
+        );
     }
     // Probe param byte length by serializing into a temp buffer.
     let mut probe = Vec::<u8>::new();
@@ -526,6 +531,7 @@ pub fn build_text_sheet_dispid_x60(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_text_sheet_dispid_n(
     receiver_actor_id: u32,
     disp_id: u32,
@@ -593,10 +599,7 @@ mod tests {
     fn text_sheet_no_source_x28_matches_retail_capture() {
         let pkt = build_text_sheet_no_source_x28(0x029B_2941, 0xA0F4_E204, 0x0024, 0x20);
         assert_eq!(pkt.data.len(), 8);
-        assert_eq!(
-            pkt.data,
-            [0x04, 0xE2, 0xF4, 0xA0, 0x24, 0x00, 0x20, 0x00]
-        );
+        assert_eq!(pkt.data, [0x04, 0xE2, 0xF4, 0xA0, 0x24, 0x00, 0x20, 0x00]);
         assert_eq!(pkt.game_message.opcode, OP_TEXT_SHEET_NO_ACTOR_X28);
     }
 
@@ -662,8 +665,8 @@ mod tests {
             &[
                 0xFB, 0x4F, 0x12, 0x00, // disp_id LE
                 0x0A, 0x00, 0xD8, 0x44, // actor_id LE
-                0x0D, 0x00,             // text_id LE
-                0x23, 0x00,             // log_flag + pad
+                0x0D, 0x00, // text_id LE
+                0x23, 0x00, // log_flag + pad
             ],
         );
     }
@@ -698,26 +701,12 @@ mod tests {
         assert_eq!(p0.data.len(), 8);
 
         // One Int32 param → 0x0167 (38b)
-        let p1 = build_text_sheet_no_source_auto(
-            1,
-            2,
-            3,
-            0x20,
-            &[LuaParam::Int32(42)],
-            false,
-        );
+        let p1 = build_text_sheet_no_source_auto(1, 2, 3, 0x20, &[LuaParam::Int32(42)], false);
         assert_eq!(p1.game_message.opcode, OP_TEXT_SHEET_NO_ACTOR_X38);
         assert_eq!(p1.data.len(), 24);
 
         // prefer_alt swaps to 0x0168.
-        let p1a = build_text_sheet_no_source_auto(
-            1,
-            2,
-            3,
-            0x20,
-            &[LuaParam::Int32(42)],
-            true,
-        );
+        let p1a = build_text_sheet_no_source_auto(1, 2, 3, 0x20, &[LuaParam::Int32(42)], true);
         assert_eq!(p1a.game_message.opcode, OP_TEXT_SHEET_NO_ACTOR_X38_ALT);
 
         // Many params → 0x0169 (48b) or 0x016A (68b).

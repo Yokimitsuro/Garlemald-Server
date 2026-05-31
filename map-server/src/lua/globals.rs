@@ -297,14 +297,12 @@ pub fn install_globals(
     // functions of the input rank — no closure state needed, so they
     // share the catalogs Arc only nominally.
     {
-        let f = lua.create_function(|_, rank: u8| {
-            Ok(crate::actor::gc::next_rank(rank).unwrap_or(0))
-        })?;
+        let f =
+            lua.create_function(|_, rank: u8| Ok(crate::actor::gc::next_rank(rank).unwrap_or(0)))?;
         globals.set("GetNextGCRank", f)?;
     }
     {
-        let f =
-            lua.create_function(|_, rank: u8| Ok(crate::actor::gc::gc_promotion_cost(rank)))?;
+        let f = lua.create_function(|_, rank: u8| Ok(crate::actor::gc::gc_promotion_cost(rank)))?;
         globals.set("GetGCPromotionCost", f)?;
     }
     {

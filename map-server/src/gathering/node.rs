@@ -58,7 +58,12 @@ impl GatherNode {
     /// Build from the SQL column shape (`item1..item11` are `Option<i64>` in
     /// SQLite because every slot past the populated ones is NULL). `None`
     /// slots and explicit zero both collapse to the empty sentinel.
-    pub fn from_raw(id: u32, grade: u8, attempts: u8, items: [Option<i64>; NODE_ITEM_SLOTS]) -> Self {
+    pub fn from_raw(
+        id: u32,
+        grade: u8,
+        attempts: u8,
+        items: [Option<i64>; NODE_ITEM_SLOTS],
+    ) -> Self {
         let mut item_keys = [0u32; NODE_ITEM_SLOTS];
         for (i, v) in items.iter().enumerate() {
             item_keys[i] = v.and_then(|x| u32::try_from(x).ok()).unwrap_or(0);
@@ -183,9 +188,15 @@ mod tests {
             max_yield: 3,
         };
         assert_eq!(lo.aim_slot(), 1);
-        let mid = GatherNodeItem { aim: 50, ..lo.clone() };
+        let mid = GatherNodeItem {
+            aim: 50,
+            ..lo.clone()
+        };
         assert_eq!(mid.aim_slot(), 6);
-        let hi = GatherNodeItem { aim: 100, ..lo.clone() };
+        let hi = GatherNodeItem {
+            aim: 100,
+            ..lo.clone()
+        };
         assert_eq!(hi.aim_slot(), 11);
         let over = GatherNodeItem { aim: 120, ..lo };
         assert_eq!(over.aim_slot(), 11);

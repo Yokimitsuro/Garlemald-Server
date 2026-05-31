@@ -137,9 +137,7 @@ impl NpcAppearance {
             self.face_eyebrows,
         );
         // 3 HIGHLIGHT_HAIR = highlight | variation<<5 | style<<10
-        a[3] = self.hair_highlight_color
-            | (self.hair_variation << 5)
-            | (self.hair_style << 10);
+        a[3] = self.hair_highlight_color | (self.hair_variation << 5) | (self.hair_style << 10);
         // 4 VOICE
         a[4] = self.voice;
         // 5..11 weapons + bag
@@ -450,10 +448,7 @@ impl Database {
     /// Single-row variant of [`load_npc_appearances`] — used by
     /// runtime spawn paths (e.g. `apply_spawn_actor`) that need one
     /// row on demand without paying the full-table-load cost.
-    pub async fn load_npc_appearance(
-        &self,
-        actor_class_id: u32,
-    ) -> Result<Option<NpcAppearance>> {
+    pub async fn load_npc_appearance(&self, actor_class_id: u32) -> Result<Option<NpcAppearance>> {
         let row = self
             .conn
             .call_db(move |c| {
@@ -475,45 +470,45 @@ impl Database {
                 let row = stmt
                     .query_row([actor_class_id], |r| {
                         Ok(NpcAppearance {
-                            base:                   r.get(1).unwrap_or(0),
-                            size:                   r.get(2).unwrap_or(0),
-                            hair_style:             r.get(3).unwrap_or(0),
-                            hair_highlight_color:   r.get(4).unwrap_or(0),
-                            hair_variation:         r.get(5).unwrap_or(0),
-                            face_type:              r.get(6).unwrap_or(0),
-                            characteristics:        r.get(7).unwrap_or(0),
-                            characteristics_color:  r.get(8).unwrap_or(0),
-                            face_eyebrows:          r.get(9).unwrap_or(0),
-                            face_iris_size:         r.get(10).unwrap_or(0),
-                            face_eye_shape:         r.get(11).unwrap_or(0),
-                            face_nose:              r.get(12).unwrap_or(0),
-                            face_cheek:             r.get(13).unwrap_or(0),
-                            face_mouth:             r.get(14).unwrap_or(0),
-                            face_jaw:               r.get(15).unwrap_or(0),
-                            hair_color:             r.get(16).unwrap_or(0),
-                            skin_color:             r.get(17).unwrap_or(0),
-                            eye_color:              r.get(18).unwrap_or(0),
-                            voice:                  r.get(19).unwrap_or(0),
-                            main_hand:              r.get(20).unwrap_or(0),
-                            off_hand:               r.get(21).unwrap_or(0),
-                            sp_main_hand:           r.get(22).unwrap_or(0),
-                            sp_off_hand:            r.get(23).unwrap_or(0),
-                            throwing:               r.get(24).unwrap_or(0),
-                            pack:                   r.get(25).unwrap_or(0),
-                            pouch:                  r.get(26).unwrap_or(0),
-                            head:                   r.get(27).unwrap_or(0),
-                            body:                   r.get(28).unwrap_or(0),
-                            legs:                   r.get(29).unwrap_or(0),
-                            hands:                  r.get(30).unwrap_or(0),
-                            feet:                   r.get(31).unwrap_or(0),
-                            waist:                  r.get(32).unwrap_or(0),
-                            neck:                   r.get(33).unwrap_or(0),
-                            left_ear:               r.get(34).unwrap_or(0),
-                            right_ear:              r.get(35).unwrap_or(0),
-                            left_index:             r.get(36).unwrap_or(0),
-                            right_index:            r.get(37).unwrap_or(0),
-                            left_finger:            r.get(38).unwrap_or(0),
-                            right_finger:           r.get(39).unwrap_or(0),
+                            base: r.get(1).unwrap_or(0),
+                            size: r.get(2).unwrap_or(0),
+                            hair_style: r.get(3).unwrap_or(0),
+                            hair_highlight_color: r.get(4).unwrap_or(0),
+                            hair_variation: r.get(5).unwrap_or(0),
+                            face_type: r.get(6).unwrap_or(0),
+                            characteristics: r.get(7).unwrap_or(0),
+                            characteristics_color: r.get(8).unwrap_or(0),
+                            face_eyebrows: r.get(9).unwrap_or(0),
+                            face_iris_size: r.get(10).unwrap_or(0),
+                            face_eye_shape: r.get(11).unwrap_or(0),
+                            face_nose: r.get(12).unwrap_or(0),
+                            face_cheek: r.get(13).unwrap_or(0),
+                            face_mouth: r.get(14).unwrap_or(0),
+                            face_jaw: r.get(15).unwrap_or(0),
+                            hair_color: r.get(16).unwrap_or(0),
+                            skin_color: r.get(17).unwrap_or(0),
+                            eye_color: r.get(18).unwrap_or(0),
+                            voice: r.get(19).unwrap_or(0),
+                            main_hand: r.get(20).unwrap_or(0),
+                            off_hand: r.get(21).unwrap_or(0),
+                            sp_main_hand: r.get(22).unwrap_or(0),
+                            sp_off_hand: r.get(23).unwrap_or(0),
+                            throwing: r.get(24).unwrap_or(0),
+                            pack: r.get(25).unwrap_or(0),
+                            pouch: r.get(26).unwrap_or(0),
+                            head: r.get(27).unwrap_or(0),
+                            body: r.get(28).unwrap_or(0),
+                            legs: r.get(29).unwrap_or(0),
+                            hands: r.get(30).unwrap_or(0),
+                            feet: r.get(31).unwrap_or(0),
+                            waist: r.get(32).unwrap_or(0),
+                            neck: r.get(33).unwrap_or(0),
+                            left_ear: r.get(34).unwrap_or(0),
+                            right_ear: r.get(35).unwrap_or(0),
+                            left_index: r.get(36).unwrap_or(0),
+                            right_index: r.get(37).unwrap_or(0),
+                            left_finger: r.get(38).unwrap_or(0),
+                            right_finger: r.get(39).unwrap_or(0),
                         })
                     })
                     .optional()?;
@@ -543,47 +538,50 @@ impl Database {
                 let rows: Vec<(u32, NpcAppearance)> = stmt
                     .query_map([], |r| {
                         let id: u32 = r.get(0)?;
-                        Ok((id, NpcAppearance {
-                            base:                   r.get(1).unwrap_or(0),
-                            size:                   r.get(2).unwrap_or(0),
-                            hair_style:             r.get(3).unwrap_or(0),
-                            hair_highlight_color:   r.get(4).unwrap_or(0),
-                            hair_variation:         r.get(5).unwrap_or(0),
-                            face_type:              r.get(6).unwrap_or(0),
-                            characteristics:        r.get(7).unwrap_or(0),
-                            characteristics_color:  r.get(8).unwrap_or(0),
-                            face_eyebrows:          r.get(9).unwrap_or(0),
-                            face_iris_size:         r.get(10).unwrap_or(0),
-                            face_eye_shape:         r.get(11).unwrap_or(0),
-                            face_nose:              r.get(12).unwrap_or(0),
-                            face_cheek:             r.get(13).unwrap_or(0),  // SQL col `faceFeatures`
-                            face_mouth:             r.get(14).unwrap_or(0),
-                            face_jaw:               r.get(15).unwrap_or(0),  // SQL col `ears`
-                            hair_color:             r.get(16).unwrap_or(0),
-                            skin_color:             r.get(17).unwrap_or(0),
-                            eye_color:              r.get(18).unwrap_or(0),
-                            voice:                  r.get(19).unwrap_or(0),
-                            main_hand:              r.get(20).unwrap_or(0),
-                            off_hand:               r.get(21).unwrap_or(0),
-                            sp_main_hand:           r.get(22).unwrap_or(0),
-                            sp_off_hand:            r.get(23).unwrap_or(0),
-                            throwing:               r.get(24).unwrap_or(0),
-                            pack:                   r.get(25).unwrap_or(0),
-                            pouch:                  r.get(26).unwrap_or(0),
-                            head:                   r.get(27).unwrap_or(0),
-                            body:                   r.get(28).unwrap_or(0),
-                            legs:                   r.get(29).unwrap_or(0),
-                            hands:                  r.get(30).unwrap_or(0),
-                            feet:                   r.get(31).unwrap_or(0),
-                            waist:                  r.get(32).unwrap_or(0),
-                            neck:                   r.get(33).unwrap_or(0),
-                            left_ear:               r.get(34).unwrap_or(0),
-                            right_ear:              r.get(35).unwrap_or(0),
-                            left_index:             r.get(36).unwrap_or(0),
-                            right_index:            r.get(37).unwrap_or(0),
-                            left_finger:            r.get(38).unwrap_or(0),
-                            right_finger:           r.get(39).unwrap_or(0),
-                        }))
+                        Ok((
+                            id,
+                            NpcAppearance {
+                                base: r.get(1).unwrap_or(0),
+                                size: r.get(2).unwrap_or(0),
+                                hair_style: r.get(3).unwrap_or(0),
+                                hair_highlight_color: r.get(4).unwrap_or(0),
+                                hair_variation: r.get(5).unwrap_or(0),
+                                face_type: r.get(6).unwrap_or(0),
+                                characteristics: r.get(7).unwrap_or(0),
+                                characteristics_color: r.get(8).unwrap_or(0),
+                                face_eyebrows: r.get(9).unwrap_or(0),
+                                face_iris_size: r.get(10).unwrap_or(0),
+                                face_eye_shape: r.get(11).unwrap_or(0),
+                                face_nose: r.get(12).unwrap_or(0),
+                                face_cheek: r.get(13).unwrap_or(0), // SQL col `faceFeatures`
+                                face_mouth: r.get(14).unwrap_or(0),
+                                face_jaw: r.get(15).unwrap_or(0), // SQL col `ears`
+                                hair_color: r.get(16).unwrap_or(0),
+                                skin_color: r.get(17).unwrap_or(0),
+                                eye_color: r.get(18).unwrap_or(0),
+                                voice: r.get(19).unwrap_or(0),
+                                main_hand: r.get(20).unwrap_or(0),
+                                off_hand: r.get(21).unwrap_or(0),
+                                sp_main_hand: r.get(22).unwrap_or(0),
+                                sp_off_hand: r.get(23).unwrap_or(0),
+                                throwing: r.get(24).unwrap_or(0),
+                                pack: r.get(25).unwrap_or(0),
+                                pouch: r.get(26).unwrap_or(0),
+                                head: r.get(27).unwrap_or(0),
+                                body: r.get(28).unwrap_or(0),
+                                legs: r.get(29).unwrap_or(0),
+                                hands: r.get(30).unwrap_or(0),
+                                feet: r.get(31).unwrap_or(0),
+                                waist: r.get(32).unwrap_or(0),
+                                neck: r.get(33).unwrap_or(0),
+                                left_ear: r.get(34).unwrap_or(0),
+                                right_ear: r.get(35).unwrap_or(0),
+                                left_index: r.get(36).unwrap_or(0),
+                                right_index: r.get(37).unwrap_or(0),
+                                left_finger: r.get(38).unwrap_or(0),
+                                right_finger: r.get(39).unwrap_or(0),
+                            },
+                        ))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(rows)
@@ -814,15 +812,12 @@ impl Database {
                                 .ok()
                                 .flatten()
                                 .unwrap_or(-1);
-                            let val: i32 = r
-                                .get::<_, Option<i32>>(val_idx)
-                                .ok()
-                                .flatten()
-                                .unwrap_or(0);
-                            if let Some(mod_id) = decode_param_bonus_type(ty) {
-                                if val != 0 {
-                                    bonuses.push((mod_id, val));
-                                }
+                            let val: i32 =
+                                r.get::<_, Option<i32>>(val_idx).ok().flatten().unwrap_or(0);
+                            if let Some(mod_id) = decode_param_bonus_type(ty)
+                                && val != 0
+                            {
+                                bonuses.push((mod_id, val));
                             }
                         }
                         // Weapon columns: 33 (damageInterval), 34
@@ -833,18 +828,12 @@ impl Database {
                         // `ItemData.weapon` as None. A single non-NULL
                         // column counts — damageInterval 0.0 is still a
                         // valid (if useless) weapon row.
-                        let delay_s: Option<f64> =
-                            r.get::<_, Option<f64>>(33).ok().flatten();
-                        let attack_type: Option<i32> =
-                            r.get::<_, Option<i32>>(34).ok().flatten();
-                        let frequency: Option<i32> =
-                            r.get::<_, Option<i32>>(35).ok().flatten();
-                        let damage_power: Option<i32> =
-                            r.get::<_, Option<i32>>(36).ok().flatten();
-                        let attack: Option<i32> =
-                            r.get::<_, Option<i32>>(37).ok().flatten();
-                        let parry: Option<i32> =
-                            r.get::<_, Option<i32>>(38).ok().flatten();
+                        let delay_s: Option<f64> = r.get::<_, Option<f64>>(33).ok().flatten();
+                        let attack_type: Option<i32> = r.get::<_, Option<i32>>(34).ok().flatten();
+                        let frequency: Option<i32> = r.get::<_, Option<i32>>(35).ok().flatten();
+                        let damage_power: Option<i32> = r.get::<_, Option<i32>>(36).ok().flatten();
+                        let attack: Option<i32> = r.get::<_, Option<i32>>(37).ok().flatten();
+                        let parry: Option<i32> = r.get::<_, Option<i32>>(38).ok().flatten();
                         let weapon: Option<crate::data::WeaponAttributes> = if delay_s.is_none()
                             && attack_type.is_none()
                             && frequency.is_none()
@@ -855,16 +844,13 @@ impl Database {
                             None
                         } else {
                             Some(crate::data::WeaponAttributes {
-                                delay_ms: (delay_s.unwrap_or(0.0) * 1000.0).round().max(0.0)
-                                    as u32,
+                                delay_ms: (delay_s.unwrap_or(0.0) * 1000.0).round().max(0.0) as u32,
                                 attack_type: attack_type.unwrap_or(0).max(0) as u16,
                                 // HitCount defaults to 1 so a weapon
                                 // row with `frequency = 0` (bad data)
                                 // doesn't silently disable auto-attacks
                                 // when equipped.
-                                hit_count: frequency
-                                    .map(|f| f.max(1) as u16)
-                                    .unwrap_or(1),
+                                hit_count: frequency.map(|f| f.max(1) as u16).unwrap_or(1),
                                 damage_power: damage_power.unwrap_or(0).max(0) as u16,
                                 attack: attack.unwrap_or(0).max(0) as u16,
                                 parry: parry.unwrap_or(0).max(0) as u16,
@@ -1180,7 +1166,9 @@ impl Database {
                         for (i, slot) in items.iter_mut().enumerate() {
                             *slot = r.get::<_, Option<i64>>(3 + i).unwrap_or(None);
                         }
-                        Ok(crate::gathering::GatherNode::from_raw(id, grade, attempts, items))
+                        Ok(crate::gathering::GatherNode::from_raw(
+                            id, grade, attempts, items,
+                        ))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
                 let mut items_stmt = c.prepare(
@@ -1193,15 +1181,9 @@ impl Database {
                         Ok(crate::gathering::GatherNodeItem {
                             id: r.get::<_, u32>(0)?,
                             item_catalog_id: r.get::<_, u32>(1).unwrap_or_default(),
-                            remainder: r
-                                .get::<_, i64>(2)
-                                .unwrap_or(80)
-                                .clamp(0, 255) as u8,
+                            remainder: r.get::<_, i64>(2).unwrap_or(80).clamp(0, 255) as u8,
                             aim: r.get::<_, i64>(3).unwrap_or(50).clamp(0, 255) as u8,
-                            sweetspot: r
-                                .get::<_, i64>(4)
-                                .unwrap_or(30)
-                                .clamp(0, 255) as u8,
+                            sweetspot: r.get::<_, i64>(4).unwrap_or(30).clamp(0, 255) as u8,
                             max_yield: r.get::<_, u32>(5).unwrap_or(1),
                         })
                     })?
@@ -1217,9 +1199,7 @@ impl Database {
     /// without sorting. Each row is self-contained (private-area
     /// membership lives on the row, not in a join table) so this is a
     /// single SELECT.
-    pub async fn load_gather_node_spawns(
-        &self,
-    ) -> Result<Vec<crate::gathering::GatherNodeSpawn>> {
+    pub async fn load_gather_node_spawns(&self) -> Result<Vec<crate::gathering::GatherNodeSpawn>> {
         let rows = self
             .conn
             .call_db(|c| {
@@ -1247,9 +1227,9 @@ impl Database {
                             ),
                             rotation: r.get::<_, f32>(9).unwrap_or_default(),
                             harvest_node_id: r.get::<_, u32>(10)?,
-                            harvest_type: r.get::<_, u32>(11).unwrap_or(
-                                crate::gathering::HARVEST_TYPE_MINE,
-                            ),
+                            harvest_type: r
+                                .get::<_, u32>(11)
+                                .unwrap_or(crate::gathering::HARVEST_TYPE_MINE),
                         })
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -1267,9 +1247,7 @@ impl Database {
     /// Rows with an unknown `leveType` discriminator are skipped (not
     /// silently corrupted into the default), so the resolver never
     /// misroutes progress events.
-    pub async fn load_regional_leve_resolver(
-        &self,
-    ) -> Result<crate::leve::RegionalLeveResolver> {
+    pub async fn load_regional_leve_resolver(&self) -> Result<crate::leve::RegionalLeveResolver> {
         let rows = self
             .conn
             .call_db(|c| {
@@ -1421,12 +1399,14 @@ impl Database {
                             ":iid": item_catalog_id,
                             ":q": quality as i64,
                         },
-                        |r| Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i32>(1)?,
-                            r.get::<_, i32>(2)?,
-                            r.get::<_, i32>(3).unwrap_or(99),
-                        )),
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i32>(1)?,
+                                r.get::<_, i32>(2)?,
+                                r.get::<_, i32>(3).unwrap_or(99),
+                            ))
+                        },
                     )
                     .optional()?;
                 let new_total = match existing {
@@ -1521,11 +1501,13 @@ impl Database {
                             ":iid": item_catalog_id,
                             ":q": quality as i64,
                         },
-                        |r| Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i32>(1)?,
-                            r.get::<_, i32>(2)?,
-                        )),
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i32>(1)?,
+                                r.get::<_, i32>(2)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 let new_total = match existing {
@@ -1967,9 +1949,9 @@ impl Database {
                                 characteristics: r.get::<_, u8>(9).unwrap_or_default(),
                                 characteristics_color: r.get::<_, u8>(10).unwrap_or_default(),
                                 face_type: r.get::<_, u8>(11).unwrap_or_default(),
-                                ears: r.get::<_, u8>(12).unwrap_or_default(),           // SQL col `ears`
+                                ears: r.get::<_, u8>(12).unwrap_or_default(), // SQL col `ears`
                                 face_mouth: r.get::<_, u8>(13).unwrap_or_default(),
-                                face_features: r.get::<_, u8>(14).unwrap_or_default(),  // SQL col `faceFeatures`
+                                face_features: r.get::<_, u8>(14).unwrap_or_default(), // SQL col `faceFeatures`
                                 face_nose: r.get::<_, u8>(15).unwrap_or_default(),
                                 face_eye_shape: r.get::<_, u8>(16).unwrap_or_default(),
                                 face_iris_size: r.get::<_, u8>(17).unwrap_or_default(),
@@ -2057,8 +2039,8 @@ impl Database {
                 let v = c
                     .query_row(&sql, named_params! { ":cid": chara_id }, |r| {
                         let mut out = [0u32; 20];
-                        for i in 0..20 {
-                            out[i] = r.get::<_, u32>(i).unwrap_or_default();
+                        for (i, slot) in out.iter_mut().enumerate() {
+                            *slot = r.get::<_, u32>(i).unwrap_or_default();
                         }
                         Ok(out)
                     })
@@ -3388,10 +3370,7 @@ impl Database {
         self.conn
             .call_db(move |c| {
                 let sql = format!("UPDATE characters SET {col} = :r WHERE id = :cid");
-                c.execute(
-                    &sql,
-                    named_params! { ":r": rank as i64, ":cid": chara_id },
-                )?;
+                c.execute(&sql, named_params! { ":r": rank as i64, ":cid": chara_id })?;
                 Ok(())
             })
             .await?;
@@ -3503,11 +3482,7 @@ impl Database {
 
     /// Rename the chocobo. Only updates `chocoboName`; appearance
     /// and ownership flags are untouched.
-    pub async fn change_player_chocobo_name(
-        &self,
-        chara_id: u32,
-        name: &str,
-    ) -> Result<()> {
+    pub async fn change_player_chocobo_name(&self, chara_id: u32, name: &str) -> Result<()> {
         let name = name.to_owned();
         self.conn
             .call_db(move |c| {
@@ -3662,17 +3637,9 @@ impl Database {
                                 id: r.get::<_, u32>(0)?,
                                 name: r.get::<_, String>(1)?,
                                 actor_class_id: r.get::<_, u32>(2)?,
-                                cd_id_offset: r
-                                    .get::<_, i64>(3)
-                                    .unwrap_or(0)
-                                    .clamp(0, 255)
-                                    as u8,
+                                cd_id_offset: r.get::<_, i64>(3).unwrap_or(0).clamp(0, 255) as u8,
                                 place_name: r.get::<_, u32>(4).unwrap_or(0),
-                                conditions: r
-                                    .get::<_, i64>(5)
-                                    .unwrap_or(0)
-                                    .clamp(0, 255)
-                                    as u8,
+                                conditions: r.get::<_, i64>(5).unwrap_or(0).clamp(0, 255) as u8,
                                 level: r.get::<_, i64>(6).unwrap_or(0).clamp(0, 255) as u8,
                                 class_path: r.get::<_, String>(7).unwrap_or_default(),
                             })
@@ -3711,17 +3678,9 @@ impl Database {
                             id: r.get::<_, u32>(0)?,
                             name: r.get::<_, String>(1)?,
                             actor_class_id: r.get::<_, u32>(2)?,
-                            cd_id_offset: r
-                                .get::<_, i64>(3)
-                                .unwrap_or(0)
-                                .clamp(0, 255)
-                                as u8,
+                            cd_id_offset: r.get::<_, i64>(3).unwrap_or(0).clamp(0, 255) as u8,
                             place_name: r.get::<_, u32>(4).unwrap_or(0),
-                            conditions: r
-                                .get::<_, i64>(5)
-                                .unwrap_or(0)
-                                .clamp(0, 255)
-                                as u8,
+                            conditions: r.get::<_, i64>(5).unwrap_or(0).clamp(0, 255) as u8,
                             level: r.get::<_, i64>(6).unwrap_or(0).clamp(0, 255) as u8,
                             class_path: r.get::<_, String>(7).unwrap_or_default(),
                         })
@@ -3738,11 +3697,7 @@ impl Database {
     /// (matches the C# idempotent-hire behaviour). Drives
     /// `PopulaceRetainerManager.lua`'s `eventTalkStepFinalAnswer`
     /// confirmation.
-    pub async fn hire_retainer(
-        &self,
-        chara_id: u32,
-        retainer_id: u32,
-    ) -> Result<bool> {
+    pub async fn hire_retainer(&self, chara_id: u32, retainer_id: u32) -> Result<bool> {
         let affected = self
             .conn
             .call_db(move |c| {
@@ -3761,11 +3716,7 @@ impl Database {
     /// Remove a retainer ownership row. Returns `Ok(true)` if a row
     /// was actually deleted. Used by `player:DismissMyRetainer(id)`
     /// once the rename / bazaar flow is wound down.
-    pub async fn dismiss_retainer(
-        &self,
-        chara_id: u32,
-        retainer_id: u32,
-    ) -> Result<bool> {
+    pub async fn dismiss_retainer(&self, chara_id: u32, retainer_id: u32) -> Result<bool> {
         let affected = self
             .conn
             .call_db(move |c| {
@@ -3840,17 +3791,9 @@ impl Database {
                                 id: r.get::<_, u32>(0)?,
                                 name: r.get::<_, String>(1)?,
                                 actor_class_id: r.get::<_, u32>(2)?,
-                                cd_id_offset: r
-                                    .get::<_, i64>(3)
-                                    .unwrap_or(0)
-                                    .clamp(0, 255)
-                                    as u8,
+                                cd_id_offset: r.get::<_, i64>(3).unwrap_or(0).clamp(0, 255) as u8,
                                 place_name: r.get::<_, u32>(4).unwrap_or(0),
-                                conditions: r
-                                    .get::<_, i64>(5)
-                                    .unwrap_or(0)
-                                    .clamp(0, 255)
-                                    as u8,
+                                conditions: r.get::<_, i64>(5).unwrap_or(0).clamp(0, 255) as u8,
                                 level: r.get::<_, i64>(6).unwrap_or(0).clamp(0, 255) as u8,
                                 class_path: r.get::<_, String>(7).unwrap_or_default(),
                             })
@@ -3931,11 +3874,13 @@ impl Database {
                             ":iid": item_catalog_id,
                             ":q": quality as i64,
                         },
-                        |r| Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, i32>(1)?,
-                            r.get::<_, i32>(2)?,
-                        )),
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, i32>(1)?,
+                                r.get::<_, i32>(2)?,
+                            ))
+                        },
                     )
                     .optional()?;
                 let new_total = match existing {
@@ -4104,13 +4049,15 @@ impl Database {
                             ":rid": retainer_id,
                             ":sid": server_item_id as i64,
                         },
-                        |r| Ok((
-                            r.get::<_, i32>(0)?,
-                            r.get::<_, i64>(1).unwrap_or(0) as i32,
-                            r.get::<_, i64>(2)?,
-                            r.get::<_, i32>(3).unwrap_or(0),
-                            r.get::<_, i32>(4).unwrap_or(0),
-                        )),
+                        |r| {
+                            Ok((
+                                r.get::<_, i32>(0)?,
+                                r.get::<_, i64>(1).unwrap_or(0) as i32,
+                                r.get::<_, i64>(2)?,
+                                r.get::<_, i32>(3).unwrap_or(0),
+                                r.get::<_, i32>(4).unwrap_or(0),
+                            ))
+                        },
                     )
                     .optional()?;
                 let Some((qty, quality_raw, item_id_i64, price_per_unit, _slot)) = listing else {
@@ -4121,8 +4068,7 @@ impl Database {
                 }
                 let quality = quality_raw.clamp(0, 255) as u8;
                 let item_id = item_id_i64 as u32;
-                let total_price = price_per_unit
-                    .saturating_mul(qty);
+                let total_price = price_per_unit.saturating_mul(qty);
 
                 // Buyer's current gil — single-stack currency row
                 // under `characters_inventory.itemPackage = 99`.
@@ -4368,10 +4314,7 @@ pub enum PurchaseOutcome {
     /// previous call succeeded or a race took the listing, we no-op.
     ListingGone,
     /// Buyer's gil balance is below the stack total.
-    InsufficientGil {
-        have: i32,
-        need: i32,
-    },
+    InsufficientGil { have: i32, need: i32 },
 }
 
 /// One row of the retainer bazaar — surfaces through `list_retainer_bazaar`
@@ -4484,10 +4427,7 @@ mod battle_npc_spawn_tests {
     async fn load_actor_class_yda() {
         let path = tempdb("class-yda");
         let db = Database::open(&path).await.expect("open db");
-        let class = db
-            .load_actor_class(2_290_005)
-            .await
-            .expect("query");
+        let class = db.load_actor_class(2_290_005).await.expect("query");
         // Class id is in the gamedata seed; if it isn't, this test
         // surfaces the mismatch rather than silently falling back to
         // a Phase-A "synthetic" pretend-spawn.

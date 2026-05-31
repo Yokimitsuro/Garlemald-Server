@@ -192,13 +192,8 @@ impl PacketProcessor {
                 "Here is a test Message of the Day from the World Server!",
             ];
             for line in motd_lines {
-                let packet = tx::build_send_message(
-                    target,
-                    target,
-                    tx::MESSAGE_TYPE_GENERAL_INFO,
-                    "",
-                    line,
-                );
+                let packet =
+                    tx::build_send_message(target, target, tx::MESSAGE_TYPE_GENERAL_INFO, "", line);
                 session.client.send_bytes(packet.to_bytes()).await;
             }
             // Final step of C# `WorldMaster.DoLogin`: tell the client
@@ -259,8 +254,12 @@ impl PacketProcessor {
                             session.state.lock().await.routing1 = Some(handle);
                         }
                     } else {
-                        self.sessions.remove(SessionChannel::Zone, p.session_id).await;
-                        self.sessions.remove(SessionChannel::Chat, p.session_id).await;
+                        self.sessions
+                            .remove(SessionChannel::Zone, p.session_id)
+                            .await;
+                        self.sessions
+                            .remove(SessionChannel::Chat, p.session_id)
+                            .await;
                     }
                 }
             }
@@ -349,7 +348,10 @@ impl PacketProcessor {
         let source = sub.header.source_id;
         let _ = self.world.party_manager.ensure_party(source).await;
         if p.command == 1 && p.actor_id != 0 {
-            self.world.party_manager.add_member(source, p.actor_id).await;
+            self.world
+                .party_manager
+                .add_member(source, p.actor_id)
+                .await;
         }
         Ok(())
     }
@@ -368,7 +370,11 @@ impl PacketProcessor {
         let p = rx::CreateLinkshellPacket::parse(&sub.data)?;
         let source = sub.header.source_id;
 
-        let err = self.world.linkshell_manager.can_create_linkshell(&self.db, &p.name).await;
+        let err = self
+            .world
+            .linkshell_manager
+            .can_create_linkshell(&self.db, &p.name)
+            .await;
         let mut final_err = err;
         if err == 0
             && let Err(e) = self
@@ -409,14 +415,23 @@ impl PacketProcessor {
 
     async fn handle_delete_linkshell(&self, sub: &SubPacket) -> Result<()> {
         let p = rx::DeleteLinkshellPacket::parse(&sub.data)?;
-        self.world.linkshell_manager.delete_linkshell(&p.name).await?;
+        self.world
+            .linkshell_manager
+            .delete_linkshell(&p.name)
+            .await?;
         Ok(())
     }
 
     async fn handle_linkshell_change(&self, sub: &SubPacket) -> Result<()> {
         let p = rx::LinkshellChangePacket::parse(&sub.data)?;
-        if let Some(session) = self.sessions.get(SessionChannel::Zone, sub.header.source_id).await {
-            self.db.set_active_ls(session.session_id, &p.ls_name).await?;
+        if let Some(session) = self
+            .sessions
+            .get(SessionChannel::Zone, sub.header.source_id)
+            .await
+        {
+            self.db
+                .set_active_ls(session.session_id, &p.ls_name)
+                .await?;
             session.state.lock().await.active_linkshell_name = p.ls_name;
         }
         Ok(())
@@ -447,7 +462,8 @@ impl PacketProcessor {
         // ids 25157 (to joiner: "You join %s") + 25284 (to others:
         // "%s has joined %s"). Mirrors `Linkshell.OnPlayerJoin` in
         // `World Server/DataObjects/Group/Linkshell.cs`.
-        self.notify_linkshell_join(ls.db_id, p.actor_id, &p.ls_name).await;
+        self.notify_linkshell_join(ls.db_id, p.actor_id, &p.ls_name)
+            .await;
         let _ = sub;
         Ok(())
     }

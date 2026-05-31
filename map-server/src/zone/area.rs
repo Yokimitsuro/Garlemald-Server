@@ -260,12 +260,8 @@ impl AreaCore {
         script_path: impl Into<String>,
         has_content_group: bool,
     ) -> u32 {
-        let director = crate::director::Director::new(
-            local_id,
-            self.actor_id,
-            script_path,
-            has_content_group,
-        );
+        let director =
+            crate::director::Director::new(local_id, self.actor_id, script_path, has_content_group);
         let id = director.actor_id;
         self.directors.entry(id).or_insert(director);
         // Keep the allocator walking forward so future

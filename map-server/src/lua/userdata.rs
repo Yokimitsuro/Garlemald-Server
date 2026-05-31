@@ -307,10 +307,7 @@ impl UserData for LuaActor {
                 let owner_actor_id = this.actor_id;
                 return lua
                     .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
-                        let target_actor_id = args
-                            .last()
-                            .map(lua_target_to_actor_id)
-                            .unwrap_or(0);
+                        let target_actor_id = args.last().map(lua_target_to_actor_id).unwrap_or(0);
                         push(
                             &queue,
                             LuaCommand::ActorEngage {
@@ -612,11 +609,7 @@ impl From<&crate::actor::Player> for PlayerSnapshot {
                 quest_id: q.quest_id(),
                 sequence: q.get_sequence(),
                 flags: q.get_flags(),
-                counters: [
-                    q.get_counter(0),
-                    q.get_counter(1),
-                    q.get_counter(2),
-                ],
+                counters: [q.get_counter(0), q.get_counter(1), q.get_counter(2)],
                 npc_ls_from: q.get_npc_ls_from(),
                 npc_ls_msg_step: q.get_npc_ls_msg_step(),
             })
@@ -772,12 +765,8 @@ impl UserData for LuaPlayer {
     // here. New scripts should prefer the method form when adding a
     // binding.
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("hasChocobo", |_, this| {
-            Ok(this.snapshot.has_chocobo)
-        });
-        fields.add_field_method_get("mountState", |_, this| {
-            Ok(this.snapshot.mount_state)
-        });
+        fields.add_field_method_get("hasChocobo", |_, this| Ok(this.snapshot.has_chocobo));
+        fields.add_field_method_get("mountState", |_, this| Ok(this.snapshot.mount_state));
         fields.add_field_method_get("chocoboAppearance", |_, this| {
             Ok(this.snapshot.chocobo_appearance)
         });
@@ -793,9 +782,7 @@ impl UserData for LuaPlayer {
         fields.add_field_method_get("gcRankGridania", |_, this| {
             Ok(this.snapshot.gc_rank_gridania)
         });
-        fields.add_field_method_get("gcRankUldah", |_, this| {
-            Ok(this.snapshot.gc_rank_uldah)
-        });
+        fields.add_field_method_get("gcRankUldah", |_, this| Ok(this.snapshot.gc_rank_uldah));
         // `player.CurrentArea` — pmeteor exposes Player.CurrentArea as a
         // public Area field, which Lua reaches through dot syntax in
         // `man0g0::doContentArea`:
@@ -1148,25 +1135,22 @@ impl UserData for LuaPlayer {
             );
             Ok(())
         });
-        methods.add_method(
-            "SwapAbilities",
-            |_, this, (slot_1, slot_2): (u16, u16)| {
-                push(
-                    &this.queue,
-                    LuaCommand::SwapAbilities {
-                        player_id: this.snapshot.actor_id,
-                        class_id: if this.snapshot.current_job != 0 {
-                            this.snapshot.current_job
-                        } else {
-                            this.snapshot.current_class
-                        },
-                        hotbar_slot_1: slot_1,
-                        hotbar_slot_2: slot_2,
+        methods.add_method("SwapAbilities", |_, this, (slot_1, slot_2): (u16, u16)| {
+            push(
+                &this.queue,
+                LuaCommand::SwapAbilities {
+                    player_id: this.snapshot.actor_id,
+                    class_id: if this.snapshot.current_job != 0 {
+                        this.snapshot.current_job
+                    } else {
+                        this.snapshot.current_class
                     },
-                );
-                Ok(())
-            },
-        );
+                    hotbar_slot_1: slot_1,
+                    hotbar_slot_2: slot_2,
+                },
+            );
+            Ok(())
+        });
         methods.add_method(
             "EquipAbilityInFirstOpenSlot",
             |_, this, (class_id, command_id): (u8, u32)| {
@@ -1197,29 +1181,26 @@ impl UserData for LuaPlayer {
         // still falls through to the not-found sentinel — that's the
         // path transient quest_apply / quest_hook snapshots take, and
         // matches the original "newly-equipping" branch behavior.
-        methods.add_method(
-            "FindFirstCommandSlotById",
-            |_, this, command_id: u32| {
-                let border = this.snapshot.command_border as u16;
-                let needle = if command_id != 0 {
-                    command_id | 0xA0F00000
-                } else {
-                    0
-                };
-                for entry in &this.snapshot.hotbar {
-                    if entry.command_id == needle {
-                        // DB stores 0-based slot; client-facing index
-                        // is `slot + commandBorder`.
-                        return Ok(entry.hotbar_slot + border);
-                    }
+        methods.add_method("FindFirstCommandSlotById", |_, this, command_id: u32| {
+            let border = this.snapshot.command_border as u16;
+            let needle = if command_id != 0 {
+                command_id | 0xA0F00000
+            } else {
+                0
+            };
+            for entry in &this.snapshot.hotbar {
+                if entry.command_id == needle {
+                    // DB stores 0-based slot; client-facing index
+                    // is `slot + commandBorder`.
+                    return Ok(entry.hotbar_slot + border);
                 }
-                // Not found → return the past-end sentinel that
-                // EquipAbilityCommand.lua's `isEquipped = oldSlot <
-                // commandBorder + 30` check uses to short-circuit
-                // the swap path.
-                Ok(border + 30)
-            },
-        );
+            }
+            // Not found → return the past-end sentinel that
+            // EquipAbilityCommand.lua's `isEquipped = oldSlot <
+            // commandBorder + 30` check uses to short-circuit
+            // the swap path.
+            Ok(border + 30)
+        });
         // `player:DoClassChange(classId)` / `:PrepareClassChange(classId)`
         // — promoted from log-stubs to real apply paths. Per the
         // principle (`feedback_meteor_decomp_authoritative_for_engine_bindings.md`)
@@ -1297,17 +1278,14 @@ impl UserData for LuaPlayer {
         // `gm/giveexp.lua` + `gm/ba.lua`. Real impl needs the
         // BattleAction packet path (BattleEvent dispatch); logged
         // stub keeps the GM commands non-fatal.
-        methods.add_method(
-            "DoBattleAction",
-            |_, this, args: mlua::MultiValue| {
-                tracing::debug!(
-                    player = this.snapshot.actor_id,
-                    arg_count = args.len(),
-                    "DoBattleAction captured (BattleEvent dispatch path not wired)",
-                );
-                Ok(())
-            },
-        );
+        methods.add_method("DoBattleAction", |_, this, args: mlua::MultiValue| {
+            tracing::debug!(
+                player = this.snapshot.actor_id,
+                arg_count = args.len(),
+                "DoBattleAction captured (BattleEvent dispatch path not wired)",
+            );
+            Ok(())
+        });
         // `player:GetActorInInstance(actorId)` — find an actor in
         // the player's current zone/instance by actor id. 2 sites
         // (CheckCommand.lua, PlaceDrivenCommand.lua). Both
@@ -1363,9 +1341,7 @@ impl UserData for LuaPlayer {
         // computation. 2 sites in man200.lua.
         methods.add_method(
             "SetSNpc",
-            |_,
-             this,
-             (nickname, actor_class_id, personality): (String, u32, u32)| {
+            |_, this, (nickname, actor_class_id, personality): (String, u32, u32)| {
                 push(
                     &this.queue,
                     LuaCommand::SetSNpc {
@@ -1386,31 +1362,25 @@ impl UserData for LuaPlayer {
         // dispatches a SetActorProperty packet keyed by the
         // path; defer until property-path registry covers all
         // the workName values used here.
-        methods.add_method(
-            "SetWorkValue",
-            |_, this, args: mlua::MultiValue| {
-                tracing::debug!(
-                    player = this.snapshot.actor_id,
-                    arg_count = args.len(),
-                    "SetWorkValue captured (SetActorProperty fan-out for arbitrary paths not wired)",
-                );
-                Ok(())
-            },
-        );
+        methods.add_method("SetWorkValue", |_, this, args: mlua::MultiValue| {
+            tracing::debug!(
+                player = this.snapshot.actor_id,
+                arg_count = args.len(),
+                "SetWorkValue captured (SetActorProperty fan-out for arbitrary paths not wired)",
+            );
+            Ok(())
+        });
         // `player:examinePlayer(targetActor)` — open the examine
         // (gear-inspection) UI on `targetActor`. 1 site
         // (CheckCommand.lua). Real impl emits the
         // ExamineActorPacket; logged stub for now.
-        methods.add_method(
-            "examinePlayer",
-            |_, this, _target: mlua::AnyUserData| {
-                tracing::debug!(
-                    player = this.snapshot.actor_id,
-                    "examinePlayer captured (ExamineActorPacket not wired)",
-                );
-                Ok(())
-            },
-        );
+        methods.add_method("examinePlayer", |_, this, _target: mlua::AnyUserData| {
+            tracing::debug!(
+                player = this.snapshot.actor_id,
+                "examinePlayer captured (ExamineActorPacket not wired)",
+            );
+            Ok(())
+        });
 
         // --- Guildleve trio ---------------------------------------
         // GM-side leve management (gm/addguildleve.lua,
@@ -1464,20 +1434,18 @@ impl UserData for LuaPlayer {
             );
             Ok(())
         });
-        let set_npc_ls_handler = |_: &mlua::Lua,
-                                  this: &LuaPlayer,
-                                  (npc_ls_id, state): (u32, u8)|
-         -> mlua::Result<()> {
-            push(
-                &this.queue,
-                LuaCommand::PlayerSetNpcLs {
-                    player_id: this.snapshot.actor_id,
-                    npc_ls_id,
-                    state,
-                },
-            );
-            Ok(())
-        };
+        let set_npc_ls_handler =
+            |_: &mlua::Lua, this: &LuaPlayer, (npc_ls_id, state): (u32, u8)| -> mlua::Result<()> {
+                push(
+                    &this.queue,
+                    LuaCommand::PlayerSetNpcLs {
+                        player_id: this.snapshot.actor_id,
+                        npc_ls_id,
+                        state,
+                    },
+                );
+                Ok(())
+            };
         methods.add_method("SetNpcLs", set_npc_ls_handler);
         methods.add_method("SetNpcLS", set_npc_ls_handler);
 
@@ -1734,9 +1702,7 @@ impl UserData for LuaPlayer {
             );
             Ok(())
         });
-        methods.add_method("HasChocobo", |_, this, _: ()| {
-            Ok(this.snapshot.has_chocobo)
-        });
+        methods.add_method("HasChocobo", |_, this, _: ()| Ok(this.snapshot.has_chocobo));
         methods.add_method("IsChocoboRentalActive", |_, this, _: ()| {
             Ok(this.snapshot.rental_expire_time != 0)
         });
@@ -1887,9 +1853,7 @@ impl UserData for LuaPlayer {
         methods.add_method("GetDreamId", |_, this, _: ()| {
             Ok(this.snapshot.current_dream_id.unwrap_or(0))
         });
-        methods.add_method("IsSleeping", |_, this, _: ()| {
-            Ok(this.snapshot.is_sleeping)
-        });
+        methods.add_method("IsSleeping", |_, this, _: ()| Ok(this.snapshot.is_sleeping));
         // Returns `LuaRetainer | nil`. The snapshot already has the
         // retainer fields; we copy them into a userdata with a no-op
         // `GetItemPackage` binding (matches the existing
@@ -1897,19 +1861,15 @@ impl UserData for LuaPlayer {
         // isn't wired yet, so the chain resolves but emits AddItem
         // commands that currently log-only for retainer-owned bags).
         methods.add_method("GetSpawnedRetainer", |_, this, _: ()| {
-            Ok(this
-                .snapshot
-                .spawned_retainer
-                .clone()
-                .map(|r| LuaRetainer {
-                    retainer_id: r.retainer_id,
-                    actor_class_id: r.actor_class_id,
-                    name: r.name,
-                    position: r.position,
-                    rotation: r.rotation,
-                    queue: this.queue.clone(),
-                    player_actor_id: this.snapshot.actor_id,
-                }))
+            Ok(this.snapshot.spawned_retainer.clone().map(|r| LuaRetainer {
+                retainer_id: r.retainer_id,
+                actor_class_id: r.actor_class_id,
+                name: r.name,
+                position: r.position,
+                rotation: r.rotation,
+                queue: this.queue.clone(),
+                player_actor_id: this.snapshot.actor_id,
+            }))
         });
 
         // --- Play time -------------------------------------------------------
@@ -2094,9 +2054,7 @@ impl UserData for LuaPlayer {
                         .borrow::<LuaDirectorHandle>()
                         .ok()
                         .map(|h| h.actor_id)
-                        .or_else(|| {
-                            ud.borrow::<LuaActor>().ok().map(|a| a.actor_id)
-                        })
+                        .or_else(|| ud.borrow::<LuaActor>().ok().map(|a| a.actor_id))
                         .unwrap_or(this.snapshot.current_event_owner),
                     _ => this.snapshot.current_event_owner,
                 };
@@ -2282,32 +2240,30 @@ impl UserData for LuaPlayer {
         // (lowercase) is the legacy alias used by the etc/etc5*
         // quests; both share the same handler. 7 lowercase + many
         // UpperCamel call sites.
-        let get_item_package_handler = |lua: &mlua::Lua,
-                                        this: &LuaPlayer,
-                                        pkg_code: u16|
-         -> mlua::Result<mlua::AnyUserData> {
-            // Returning nil here made `onLogin`'s `initClassItems` /
-            // `initRaceItems` path immediately abort on the first
-            // `GetItemPackage(0):AddItems(...)` call (nil is not
-            // indexable). Return a real `LuaItemPackage` userdata that
-            // routes `AddItem`/`AddItems` into the command queue so the
-            // hook traverses its full class/race branches and the
-            // subsequent `SavePlayTime` etc. run to completion.
-            //
-            // Inventory snapshot is cloned through so `HasItem` /
-            // `GetItemQuantity` calls on the returned package can
-            // answer locally — `gcseals.lua` and
-            // `PopulaceCompanyOfficer.lua` both chain
-            // `:GetItemPackage(99):HasItem(seal, cost)`.
-            let pkg = LuaItemPackage {
-                owner_actor_id: this.snapshot.actor_id,
-                package_code: pkg_code,
-                queue: this.queue.clone(),
-                inventory_snapshot: this.snapshot.inventory.clone(),
-                is_retainer: false,
+        let get_item_package_handler =
+            |lua: &mlua::Lua, this: &LuaPlayer, pkg_code: u16| -> mlua::Result<mlua::AnyUserData> {
+                // Returning nil here made `onLogin`'s `initClassItems` /
+                // `initRaceItems` path immediately abort on the first
+                // `GetItemPackage(0):AddItems(...)` call (nil is not
+                // indexable). Return a real `LuaItemPackage` userdata that
+                // routes `AddItem`/`AddItems` into the command queue so the
+                // hook traverses its full class/race branches and the
+                // subsequent `SavePlayTime` etc. run to completion.
+                //
+                // Inventory snapshot is cloned through so `HasItem` /
+                // `GetItemQuantity` calls on the returned package can
+                // answer locally — `gcseals.lua` and
+                // `PopulaceCompanyOfficer.lua` both chain
+                // `:GetItemPackage(99):HasItem(seal, cost)`.
+                let pkg = LuaItemPackage {
+                    owner_actor_id: this.snapshot.actor_id,
+                    package_code: pkg_code,
+                    queue: this.queue.clone(),
+                    inventory_snapshot: this.snapshot.inventory.clone(),
+                    is_retainer: false,
+                };
+                lua.create_userdata(pkg)
             };
-            lua.create_userdata(pkg)
-        };
         methods.add_method("GetItemPackage", get_item_package_handler);
         methods.add_method("getItemPackage", get_item_package_handler);
         // `player:getInventory(location)` — third alias for the
@@ -2389,9 +2345,7 @@ impl UserData for LuaPlayer {
                                     let _ = s;
                                     None
                                 })
-                                .unwrap_or_else(|| {
-                                    common::utils::murmur_hash2(other, 0)
-                                })
+                                .unwrap_or_else(|| common::utils::murmur_hash2(other, 0))
                         }
                     }
                 }
@@ -3081,7 +3035,9 @@ impl UserData for LuaZone {
         // standard NPC neighbour loop.
         methods.add_method(
             "SpawnActor",
-            |lua, this, (class_id, unique_id, x, y, z, rotation): (
+            |lua,
+             this,
+             (class_id, unique_id, x, y, z, rotation): (
                 u32,
                 String,
                 f32,
@@ -3153,13 +3109,13 @@ impl UserData for LuaZone {
             "CreateContentArea",
             |lua,
              this,
-             (
-                player_arg,
-                area_class_path,
-                area_name,
-                content_script,
-                director_name,
-            ): (mlua::Value, String, String, String, String)| {
+             (player_arg, area_class_path, area_name, content_script, director_name): (
+                mlua::Value,
+                String,
+                String,
+                String,
+                String,
+            )| {
                 let parent_zone_id = this.snapshot.zone_id;
                 let director_actor_id = crate::director::director::encode_director_actor_id(
                     parent_zone_id,
@@ -3176,10 +3132,8 @@ impl UserData for LuaZone {
                 // (0x40000) that survives the mask and won't collide
                 // with normal sequential directors. Synthetic but
                 // stable across calls.
-                let content_area_actor_id = crate::director::director::encode_director_actor_id(
-                    parent_zone_id,
-                    0x40000,
-                );
+                let content_area_actor_id =
+                    crate::director::director::encode_director_actor_id(parent_zone_id, 0x40000);
                 // Extract the player's actor id from the first arg so
                 // the runtime handler can look up the player snapshot
                 // and fire the content script's `onCreate` hook
@@ -3293,34 +3247,28 @@ impl UserData for LuaHateContainer {
         // applied to `hc` would return `0`, breaking it. To support
         // both styles, the closure accepts a variadic and uses the
         // last userdata-shaped arg as the target).
-        methods.add_meta_method(
-            mlua::MetaMethod::Index,
-            |lua, this, key: String| {
-                if key == "AddBaseHate" {
-                    let queue = this.queue.clone();
-                    let owner_actor_id = this.owner_actor_id;
-                    return lua
-                        .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
-                            // Last arg is the target — colon-syntax
-                            // shoves self in first, dot-syntax doesn't.
-                            let target_actor_id = args
-                                .last()
-                                .map(lua_target_to_actor_id)
-                                .unwrap_or(0);
-                            push(
-                                &queue,
-                                LuaCommand::HateContainerAddBaseHate {
-                                    actor_id: owner_actor_id,
-                                    target_actor_id,
-                                },
-                            );
-                            Ok(())
-                        })
-                        .map(Value::Function);
-                }
-                Ok(Value::Nil)
-            },
-        );
+        methods.add_meta_method(mlua::MetaMethod::Index, |lua, this, key: String| {
+            if key == "AddBaseHate" {
+                let queue = this.queue.clone();
+                let owner_actor_id = this.owner_actor_id;
+                return lua
+                    .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                        // Last arg is the target — colon-syntax
+                        // shoves self in first, dot-syntax doesn't.
+                        let target_actor_id = args.last().map(lua_target_to_actor_id).unwrap_or(0);
+                        push(
+                            &queue,
+                            LuaCommand::HateContainerAddBaseHate {
+                                actor_id: owner_actor_id,
+                                target_actor_id,
+                            },
+                        );
+                        Ok(())
+                    })
+                    .map(Value::Function);
+            }
+            Ok(Value::Nil)
+        });
     }
 }
 
@@ -3356,9 +3304,7 @@ impl UserData for LuaParty {
         // `currentParty:GetLeader()` — return the leader actor id.
         // Some scripts read this to gate behaviour. Safe to implement
         // on the snapshot.
-        methods.add_method("GetLeader", |_, this, _: ()| {
-            Ok(this.leader_actor_id)
-        });
+        methods.add_method("GetLeader", |_, this, _: ()| Ok(this.leader_actor_id));
     }
 }
 
@@ -3375,7 +3321,7 @@ pub struct LuaContentArea {
     /// LuaPlayer / LuaActor userdata to the script's onUpdate loop.
     /// Populated by the ticker from `session.transient_director_members`
     /// + the live `ActorRegistry`. Empty for onCreate / quest-hook
-    /// paths that don't need iteration.
+    ///   paths that don't need iteration.
     pub players: Vec<PlayerSnapshot>,
     pub allies: Vec<LuaActor>,
     pub monsters: Vec<LuaActor>,
@@ -3411,7 +3357,9 @@ impl UserData for LuaContentArea {
         // assignment idiom).
         methods.add_method(
             "SpawnActor",
-            |lua, this, (class_id, unique_id, x, y, z, rotation): (
+            |lua,
+             this,
+             (class_id, unique_id, x, y, z, rotation): (
                 u32,
                 String,
                 f32,
@@ -3785,7 +3733,9 @@ impl UserData for LuaWorldManager {
             methods.add_method(name, move |_, this, _: mlua::MultiValue| {
                 push(
                     &this.queue,
-                    LuaCommand::LogError(format!("WorldManager:{name} (stub — needs world-server round-trip)")),
+                    LuaCommand::LogError(format!(
+                        "WorldManager:{name} (stub — needs world-server round-trip)"
+                    )),
                 );
                 Ok(())
             });
@@ -3807,15 +3757,7 @@ impl UserData for LuaWorldManager {
         // man1l0).
         methods.add_method(
             "WarpToPosition",
-            |_,
-             this,
-             (player, x, y, z, rotation): (
-                mlua::AnyUserData,
-                f32,
-                f32,
-                f32,
-                f32,
-            )| {
+            |_, this, (player, x, y, z, rotation): (mlua::AnyUserData, f32, f32, f32, f32)| {
                 let p = player.borrow::<LuaPlayer>()?;
                 push(
                     &this.queue,
@@ -3901,6 +3843,7 @@ impl UserData for LuaWorldManager {
         // quest scripts (24 call sites — `man0l1`, `man1g0`, `man2l0`,
         // etc.) to instance the player into a `PrivateAreaMasterPast`
         // replica. Cross-zone flow not wired; logs + skips.
+        #[allow(clippy::type_complexity)]
         methods.add_method(
             "WarpToPrivateArea",
             |_,
@@ -3945,20 +3888,17 @@ impl UserData for LuaWorldManager {
             // (mostly NPC scripts cross-referencing each other).
             Ok(Value::Nil)
         });
-        methods.add_method(
-            "GetActorInWorldByUniqueId",
-            |_, _, _unique_id: String| {
-                // TODO: resolve to LuaActor / LuaNpc by unique_id.
-                // Heavy use (12 call sites) — most NPC interaction
-                // scripts under unique/ use this pattern:
-                //     other = GetWorldManager():GetActorInWorldByUniqueId("name")
-                //     if other then other:DoSomething() end
-                // Returning Nil keeps the `if other then` guard
-                // working; concrete impl needs to scan the actor
-                // registry by unique_id for an NPC match.
-                Ok(Value::Nil)
-            },
-        );
+        methods.add_method("GetActorInWorldByUniqueId", |_, _, _unique_id: String| {
+            // TODO: resolve to LuaActor / LuaNpc by unique_id.
+            // Heavy use (12 call sites) — most NPC interaction
+            // scripts under unique/ use this pattern:
+            //     other = GetWorldManager():GetActorInWorldByUniqueId("name")
+            //     if other then other:DoSomething() end
+            // Returning Nil keeps the `if other then` guard
+            // working; concrete impl needs to scan the actor
+            // registry by unique_id for an NPC match.
+            Ok(Value::Nil)
+        });
         methods.add_method("GetBattleCommand", |_, _, _id: u32| {
             // TODO: return LuaBattleCommand by id (1 call site).
             Ok(Value::Nil)
@@ -4243,34 +4183,28 @@ impl UserData for LuaDirectorHandle {
             );
             Ok(())
         });
-        methods.add_method(
-            "UpdateAimNumNow",
-            |_, this, (index, value): (u8, i8)| {
-                push(
-                    &this.queue,
-                    LuaCommand::UpdateAimNumNow {
-                        director_actor_id: this.actor_id,
-                        index,
-                        value,
-                    },
-                );
-                Ok(())
-            },
-        );
-        methods.add_method(
-            "UpdateUIState",
-            |_, this, (index, value): (u8, i8)| {
-                push(
-                    &this.queue,
-                    LuaCommand::UpdateUiState {
-                        director_actor_id: this.actor_id,
-                        index,
-                        value,
-                    },
-                );
-                Ok(())
-            },
-        );
+        methods.add_method("UpdateAimNumNow", |_, this, (index, value): (u8, i8)| {
+            push(
+                &this.queue,
+                LuaCommand::UpdateAimNumNow {
+                    director_actor_id: this.actor_id,
+                    index,
+                    value,
+                },
+            );
+            Ok(())
+        });
+        methods.add_method("UpdateUIState", |_, this, (index, value): (u8, i8)| {
+            push(
+                &this.queue,
+                LuaCommand::UpdateUiState {
+                    director_actor_id: this.actor_id,
+                    index,
+                    value,
+                },
+            );
+            Ok(())
+        });
         methods.add_method(
             "UpdateMarkers",
             |_, this, (index, x, y, z): (u8, f32, f32, f32)| {
@@ -4330,9 +4264,7 @@ impl UserData for LuaRetainer {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("GetName", |_, this, _: ()| Ok(this.name.clone()));
         methods.add_method("GetRetainerId", |_, this, _: ()| Ok(this.retainer_id));
-        methods.add_method("GetActorClassId", |_, this, _: ()| {
-            Ok(this.actor_class_id)
-        });
+        methods.add_method("GetActorClassId", |_, this, _: ()| Ok(this.actor_class_id));
         methods.add_method("GetPos", |_, this, _: ()| {
             Ok((
                 this.position.0,
@@ -4919,7 +4851,7 @@ impl UserData for LuaQuestHandle {
                 _ => return Ok(()),
             };
             let flag_type = match iter.next() {
-                Some(Value::Integer(i)) => (i.max(0).min(255)) as u8,
+                Some(Value::Integer(i)) => i.clamp(0, 255) as u8,
                 _ => 0,
             };
             fn bool_or(v: Option<Value>, default: bool) -> bool {
@@ -5036,21 +4968,18 @@ impl UserData for LuaQuestDataHandle {
             );
             Ok(())
         });
-        methods.add_method(
-            "SetCounter",
-            |_, this, (idx, value): (u32, u32)| {
-                push(
-                    &this.queue,
-                    LuaCommand::QuestSetCounter {
-                        player_id: this.player_id,
-                        quest_id: this.quest_id,
-                        idx: idx as u8,
-                        value: value.min(u16::MAX as u32) as u16,
-                    },
-                );
-                Ok(())
-            },
-        );
+        methods.add_method("SetCounter", |_, this, (idx, value): (u32, u32)| {
+            push(
+                &this.queue,
+                LuaCommand::QuestSetCounter {
+                    player_id: this.player_id,
+                    quest_id: this.quest_id,
+                    idx: idx as u8,
+                    value: value.min(u16::MAX as u32) as u16,
+                },
+            );
+            Ok(())
+        });
         methods.add_method("IncCounter", |_, this, idx: u32| {
             push(
                 &this.queue,
@@ -5223,6 +5152,7 @@ impl UserData for LuaRecipeResolver {
         // arg of the closure is the invoking userdata — Lua still passes
         // it through the dot-indexed metamethod lookup; we pull the Arc
         // out of it so callers don't need to supply the resolver again.
+        #[allow(clippy::type_complexity)]
         methods.add_function(
             "GetRecipeFromMats",
             |lua,
@@ -5273,7 +5203,9 @@ impl UserData for LuaRecipeResolver {
                     for i in 0..8 {
                         let val = recipes.raw_get::<Option<AnyUserData>>(i as i64 + 1)?;
                         let item_id = val
-                            .and_then(|u| u.borrow::<LuaRecipe>().ok().map(|r| r.inner.result_item_id))
+                            .and_then(|u| {
+                                u.borrow::<LuaRecipe>().ok().map(|r| r.inner.result_item_id)
+                            })
                             .unwrap_or(0);
                         tbl.raw_set(i as i64 + 1, item_id)?;
                     }
@@ -5290,13 +5222,13 @@ impl UserData for LuaRecipeResolver {
             "RecipeToMatIdTable",
             |lua, args: (AnyUserData, Option<AnyUserData>)| {
                 let tbl = lua.create_table()?;
-                if let Some(ud) = args.1 {
-                    if let Ok(recipe) = ud.borrow::<LuaRecipe>() {
-                        for (i, m) in recipe.inner.materials.iter().enumerate() {
-                            tbl.raw_set(i as i64 + 1, *m)?;
-                        }
-                        return Ok(tbl);
+                if let Some(ud) = args.1
+                    && let Ok(recipe) = ud.borrow::<LuaRecipe>()
+                {
+                    for (i, m) in recipe.inner.materials.iter().enumerate() {
+                        tbl.raw_set(i as i64 + 1, *m)?;
                     }
+                    return Ok(tbl);
                 }
                 for i in 0..8 {
                     tbl.raw_set(i as i64 + 1, 0u32)?;
@@ -5335,10 +5267,8 @@ impl UserData for LuaGatherNode {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
         methods.add_method("GetItemKeys", |lua, this, _: ()| {
             let tbl = lua.create_table()?;
-            let mut i = 1i64;
-            for key in this.inner.active_item_keys() {
+            for (i, key) in (1i64..).zip(this.inner.active_item_keys()) {
                 tbl.raw_set(i, key)?;
-                i += 1;
             }
             Ok(tbl)
         });
@@ -5439,7 +5369,6 @@ impl UserData for LuaGatherResolver {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // LuaRegionalLeve / LuaRegionalLeveResolver — fieldcraft + battlecraft
 // leve catalog (Tier 3 #13 Lua bindings).
@@ -5466,9 +5395,7 @@ pub struct LuaRegionalLeve {
 impl UserData for LuaRegionalLeve {
     fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
         fields.add_field_method_get("id", |_, this| Ok(this.inner.id));
-        fields.add_field_method_get("leveType", |_, this| {
-            Ok(this.inner.leve_type as u8 as u32)
-        });
+        fields.add_field_method_get("leveType", |_, this| Ok(this.inner.leve_type as u8 as u32));
         fields.add_field_method_get("isFieldcraft", |_, this| {
             Ok(this.inner.leve_type == LeveType::Fieldcraft)
         });
@@ -5480,12 +5407,8 @@ impl UserData for LuaRegionalLeve {
         fields.add_field_method_get("recommendedClass", |_, this| {
             Ok(this.inner.recommended_class)
         });
-        fields.add_field_method_get("issuingLocation", |_, this| {
-            Ok(this.inner.issuing_location)
-        });
-        fields.add_field_method_get("leveLocation", |_, this| {
-            Ok(this.inner.leve_location)
-        });
+        fields.add_field_method_get("issuingLocation", |_, this| Ok(this.inner.issuing_location));
+        fields.add_field_method_get("leveLocation", |_, this| Ok(this.inner.leve_location));
         fields.add_field_method_get("deliveryDisplayName", |_, this| {
             Ok(this.inner.delivery_display_name)
         });
@@ -5498,28 +5421,22 @@ impl UserData for LuaRegionalLeve {
         // so scripts that pass a raw player-picked band index
         // can't panic.
         methods.add_method("GetObjectiveTargetId", |_, this, band: i32| {
-            Ok(this.inner.objective_target_id
-                [RegionalLeveData::clamp_difficulty(band)])
+            Ok(this.inner.objective_target_id[RegionalLeveData::clamp_difficulty(band)])
         });
         methods.add_method("GetObjectiveQuantity", |_, this, band: i32| {
-            Ok(this.inner.objective_quantity
-                [RegionalLeveData::clamp_difficulty(band)])
+            Ok(this.inner.objective_quantity[RegionalLeveData::clamp_difficulty(band)])
         });
         methods.add_method("GetRecommendedLevel", |_, this, band: i32| {
-            Ok(this.inner.recommended_level
-                [RegionalLeveData::clamp_difficulty(band)])
+            Ok(this.inner.recommended_level[RegionalLeveData::clamp_difficulty(band)])
         });
         methods.add_method("GetRewardItemId", |_, this, band: i32| {
-            Ok(this.inner.reward_item_id
-                [RegionalLeveData::clamp_difficulty(band)])
+            Ok(this.inner.reward_item_id[RegionalLeveData::clamp_difficulty(band)])
         });
         methods.add_method("GetRewardQuantity", |_, this, band: i32| {
-            Ok(this.inner.reward_quantity
-                [RegionalLeveData::clamp_difficulty(band)])
+            Ok(this.inner.reward_quantity[RegionalLeveData::clamp_difficulty(band)])
         });
         methods.add_method("GetRewardGil", |_, this, band: i32| {
-            Ok(this.inner.reward_gil
-                [RegionalLeveData::clamp_difficulty(band)])
+            Ok(this.inner.reward_gil[RegionalLeveData::clamp_difficulty(band)])
         });
     }
 }

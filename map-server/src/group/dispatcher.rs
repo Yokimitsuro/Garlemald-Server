@@ -211,7 +211,7 @@ async fn broadcast_member_list(
         location_code,
         sequence_id,
         group_id,
-        type_id.bits() as u32,
+        type_id.bits(),
         // C# `GroupHeaderPacket` uses -1 as the localized-name id
         // whenever a custom name is present (including the empty
         // placeholder name a solo party uses). Sending 0 makes the

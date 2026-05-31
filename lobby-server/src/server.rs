@@ -36,7 +36,9 @@ const BUFFER_SIZE: usize = 0xFFFF;
 
 pub async fn run(config: Config, processor: PacketProcessor) -> Result<()> {
     let addr = format!("{}:{}", config.bind_ip(), config.port());
-    let listener = TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
     tracing::info!(%addr, "lobby server listening");
 
     let processor = Arc::new(processor);
@@ -80,7 +82,9 @@ async fn handle_connection(
         tracing::trace!(%peer, bytes = n, total = bytes_in, "socket read");
 
         let mut offset = 0usize;
-        while let Some(packet) = BasePacket::try_from_buffer(&buffer[..bytes_in], &mut offset, bytes_in) {
+        while let Some(packet) =
+            BasePacket::try_from_buffer(&buffer[..bytes_in], &mut offset, bytes_in)
+        {
             tracing::debug!(
                 %peer,
                 size = packet.header.packet_size,
@@ -104,11 +108,7 @@ async fn handle_connection(
     }
 }
 
-async fn send_reply(
-    socket: &mut TcpStream,
-    session: &LobbySession,
-    reply: Reply,
-) -> Result<()> {
+async fn send_reply(socket: &mut TcpStream, session: &LobbySession, reply: Reply) -> Result<()> {
     let bytes = match reply {
         Reply::Raw(bytes) => bytes,
         Reply::Encrypted(subs) => {
@@ -120,10 +120,7 @@ async fn send_reply(
                 && let Ok(peer) = socket.peer_addr()
             {
                 let plain = packet.to_bytes();
-                common::packet_log::log_outbound_named(
-                    &format!("plaintext {peer}"),
-                    &plain,
-                );
+                common::packet_log::log_outbound_named(&format!("plaintext {peer}"), &plain);
             }
             if let Some(bf) = session.blowfish.as_ref() {
                 packet.encrypt(bf)?;

@@ -23,8 +23,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, named_params};
 use common::db::ConnCallExt;
+use rusqlite::{OptionalExtension, named_params};
 use tokio_rusqlite::Connection;
 
 use crate::character_creator::class_name_for_id;
@@ -82,7 +82,8 @@ impl Database {
     ) -> Result<(bool, u32, u32)> {
         tracing::debug!(user_id, slot, server_id, name, "db: reserve_character");
         let name = name.to_owned();
-        let out = self.conn
+        let out = self
+            .conn
             .call_db(move |c| {
                 let existing: Option<u32> = c
                     .query_row(
@@ -257,9 +258,16 @@ impl Database {
         server_id: u32,
         new_name: &str,
     ) -> Result<bool> {
-        tracing::debug!(user_id, character_id, server_id, new_name, "db: rename_character");
+        tracing::debug!(
+            user_id,
+            character_id,
+            server_id,
+            new_name,
+            "db: rename_character"
+        );
         let new_name = new_name.to_owned();
-        let taken = self.conn
+        let taken = self
+            .conn
             .call_db(move |c| {
                 let existing: Option<u32> = c
                     .query_row(
@@ -302,7 +310,8 @@ impl Database {
     }
 
     pub async fn get_servers(&self) -> Result<Vec<World>> {
-        let rows = self.conn
+        let rows = self
+            .conn
             .call_db(|c| {
                 let mut stmt = c.prepare(
                     "SELECT id, address, port, listPosition, name, isActive
@@ -328,7 +337,8 @@ impl Database {
     }
 
     pub async fn get_server(&self, server_id: u32) -> Result<Option<World>> {
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -355,7 +365,8 @@ impl Database {
     }
 
     pub async fn get_characters(&self, user_id: u32) -> Result<Vec<Character>> {
-        let rows = self.conn
+        let rows = self
+            .conn
             .call_db(move |c| {
                 let mut stmt = c.prepare(
                     r"SELECT c.id, c.slot, c.serverId, c.name, c.isLegacy, c.doRename,
@@ -377,7 +388,8 @@ impl Database {
     }
 
     pub async fn get_character(&self, _user_id: u32, char_id: u32) -> Result<Option<Character>> {
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -399,7 +411,8 @@ impl Database {
     }
 
     pub async fn get_appearance(&self, chara_id: u32) -> Result<Appearance> {
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -423,7 +436,8 @@ impl Database {
     }
 
     pub async fn get_reserved_names(&self, user_id: u32) -> Result<Vec<String>> {
-        let rows = self.conn
+        let rows = self
+            .conn
             .call_db(move |c| {
                 let mut stmt = c.prepare("SELECT name FROM reserved_names WHERE userId = :uid")?;
                 let rows: Vec<String> = stmt

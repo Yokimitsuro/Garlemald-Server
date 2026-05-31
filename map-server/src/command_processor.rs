@@ -149,10 +149,10 @@ impl CommandProcessor {
 
     /// `home <name>` — server-driven home-point revive. Restores HP/MP
     /// + state via `apply_revive`, then warps the player to their
-    /// stored homepoint aetheryte. Mirrors the "bandaid fix for
-    /// returning while dead" branch in `TeleportCommand.lua` so we
-    /// can verify the death/revive flow without standing up the
-    /// client's death-overlay menu network.
+    ///   stored homepoint aetheryte. Mirrors the "bandaid fix for
+    ///   returning while dead" branch in `TeleportCommand.lua` so we
+    ///   can verify the death/revive flow without standing up the
+    ///   client's death-overlay menu network.
     async fn handle_home(&self, args: &Args<'_>) -> String {
         let Some(name) = args.rest_joined(0) else {
             return "usage: home <name>".into();
@@ -298,9 +298,7 @@ impl CommandProcessor {
             .unwrap_or(0);
         let new_exp = current.saturating_add(qty).max(0);
         match self.db.set_exp(chara_id, class_id, new_exp).await {
-            Ok(()) => format!(
-                "gave {qty} exp to {name} (class {class_id}; total now {new_exp})"
-            ),
+            Ok(()) => format!("gave {qty} exp to {name} (class {class_id}; total now {new_exp})"),
             Err(e) => format!("giveexp failed: {e}"),
         }
     }
@@ -395,7 +393,10 @@ impl CommandProcessor {
         };
         let inn_code = crate::actor::inn::inn_code_from_position((x, y, z), true);
         let Some(bed) = crate::actor::inn::sleeping_position_for_inn(inn_code) else {
-            return format!("{name} is in zone {} but not in any known inn room", handle.zone_id);
+            return format!(
+                "{name} is in zone {} but not in any known inn room",
+                handle.zone_id
+            );
         };
         {
             let mut c = handle.character.write().await;
@@ -404,7 +405,10 @@ impl CommandProcessor {
             c.base.position_z = bed.2;
             c.base.rotation = bed.3;
         }
-        format!("snapped {name} to inn-room {inn_code} bed ({:.2}, {:.2}, {:.2})", bed.0, bed.1, bed.2)
+        format!(
+            "snapped {name} to inn-room {inn_code} bed ({:.2}, {:.2}, {:.2})",
+            bed.0, bed.1, bed.2
+        )
     }
 
     async fn handle_dream(&self, args: &Args<'_>) -> String {
@@ -429,7 +433,10 @@ impl CommandProcessor {
             s.current_dream_id = Some(dream_id);
             self.world.upsert_session(s).await;
         }
-        format!("set dream id {dream_id} on {name} (actor {})", handle.actor_id)
+        format!(
+            "set dream id {dream_id} on {name} (actor {})",
+            handle.actor_id
+        )
     }
 
     async fn handle_wake(&self, args: &Args<'_>) -> String {
@@ -490,9 +497,7 @@ impl CommandProcessor {
             c.chara.chocobo_appearance = appearance;
             c.chara.chocobo_name = chocobo_name.to_string();
         }
-        format!(
-            "issued chocobo (appearance={appearance}, name={chocobo_name}) to {player_name}"
-        )
+        format!("issued chocobo (appearance={appearance}, name={chocobo_name}) to {player_name}")
     }
 
     async fn handle_rent_chocobo(&self, args: &Args<'_>) -> String {
@@ -608,24 +613,22 @@ impl CommandProcessor {
         // `spawn_type=2` matches the retail "warp-by-GM" spawn code;
         // `is_zoning_player=false` because we're not going through the
         // loading screen. (Cross-zone variant left as a follow-up.)
-        if current_zone_id == zone_id {
-            if let Some(client) = self.world.client(session_id).await {
-                let pkt = crate::packets::send::build_set_actor_position(
-                    actor_id,
-                    actor_id as i32,
-                    x,
-                    y,
-                    z,
-                    rotation,
-                    2,
-                    false,
-                );
-                client.send_bytes(pkt.to_bytes()).await;
-            }
+        if current_zone_id == zone_id
+            && let Some(client) = self.world.client(session_id).await
+        {
+            let pkt = crate::packets::send::build_set_actor_position(
+                actor_id,
+                actor_id as i32,
+                x,
+                y,
+                z,
+                rotation,
+                2,
+                false,
+            );
+            client.send_bytes(pkt.to_bytes()).await;
         }
-        format!(
-            "warped {name} to zone {zone_id} at ({x:.2}, {y:.2}, {z:.2})"
-        )
+        format!("warped {name} to zone {zone_id} at ({x:.2}, {y:.2}, {z:.2})")
     }
 
     async fn handle_join_gc(&self, args: &Args<'_>) -> String {
@@ -661,7 +664,11 @@ impl CommandProcessor {
                 _ => 0,
             })
             .unwrap_or(0);
-        let rank = if existing == 0 { crate::actor::gc::RANK_RECRUIT } else { existing };
+        let rank = if existing == 0 {
+            crate::actor::gc::RANK_RECRUIT
+        } else {
+            existing
+        };
         if let Err(e) = self.db.set_gc_rank(chara_id, gc, rank).await {
             return format!("joingc: set_gc_rank failed: {e}");
         }
@@ -732,9 +739,7 @@ impl CommandProcessor {
             return format!("unknown character: {name}");
         };
         match self.db.add_seals(chara_id, gc, amount).await {
-            Ok(total) => format!(
-                "granted {amount} GC {gc} seals to {name} (total now {total})"
-            ),
+            Ok(total) => format!("granted {amount} GC {gc} seals to {name} (total now {total})"),
             Err(e) => format!("addgcseals failed: {e}"),
         }
     }
@@ -750,11 +755,7 @@ impl CommandProcessor {
         let Some(chara_id) = self.lookup_character_id(&name).await else {
             return format!("unknown character: {name}");
         };
-        let current = self
-            .db
-            .get_rest_bonus_exp_rate(chara_id)
-            .await
-            .unwrap_or(0);
+        let current = self.db.get_rest_bonus_exp_rate(chara_id).await.unwrap_or(0);
         // 1.x rest bonus: +1% per minute at an inn, capped at +100%.
         // The cap is Meteor's observed max (`Player.restBonus = restBonus`
         // assignments never exceed 100 in the commit history). A
@@ -831,9 +832,7 @@ impl CommandProcessor {
             }
         }
         let Some(npc_handle) = npc_handle else {
-            return format!(
-                "no NPC with actor_class_id={actor_class_id} in zone {zone_id}",
-            );
+            return format!("no NPC with actor_class_id={actor_class_id} in zone {zone_id}",);
         };
         let owner_actor_id = npc_handle.actor_id;
         let npc_name = {
@@ -993,9 +992,7 @@ impl CommandProcessor {
             }
         }
         let Some(npc_handle) = npc_handle else {
-            return format!(
-                "no NPC with actor_class_id={actor_class_id} in zone {zone_id}",
-            );
+            return format!("no NPC with actor_class_id={actor_class_id} in zone {zone_id}",);
         };
 
         let active_quests: Vec<u32> = {
@@ -1203,7 +1200,6 @@ mod tests {
                     [],
                     |r| r.get(0),
                 )
-                .map_err(Into::into)
             })
             .await
             .unwrap();
@@ -1246,11 +1242,11 @@ mod tests {
         let (gc, l): (i64, i64) = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT gcCurrent, gcLimsaRank FROM characters WHERE id = 300",
                     [],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1262,11 +1258,11 @@ mod tests {
         let l2: i64 = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT gcLimsaRank FROM characters WHERE id = 300",
                     [],
                     |r| r.get::<_, i64>(0),
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1300,16 +1296,13 @@ mod tests {
             .unwrap();
 
         // issuechocobo <appearance> <chocobo_name> <player_name>
-        let out = cmd
-            .run("issuechocobo 5 Boco Chocobo Get")
-            .await
-            .unwrap();
+        let out = cmd.run("issuechocobo 5 Boco Chocobo Get").await.unwrap();
         assert!(out.contains("issued chocobo"), "got {out}");
         // DB persistence:
         let (has, app, name): (i64, i64, String) = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT hasChocobo, chocoboAppearance, chocoboName
                       FROM characters_chocobo WHERE characterId = 200",
                     [],
@@ -1320,7 +1313,7 @@ mod tests {
                             r.get::<_, String>(2)?,
                         ))
                     },
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1338,12 +1331,12 @@ mod tests {
         let (app2, name2): (i64, String) = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
+                c.query_row(
                     r"SELECT chocoboAppearance, chocoboName
                       FROM characters_chocobo WHERE characterId = 200",
                     [],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
-                )?)
+                )
             })
             .await
             .unwrap();
@@ -1410,9 +1403,15 @@ mod tests {
         assert!(listed.contains("name=Wienta"), "got {listed}");
 
         // Dismiss succeeds, second dismiss is a no-op.
-        let dismissed = cmd.run("dismissretainer 1001 Retainer Hirer").await.unwrap();
+        let dismissed = cmd
+            .run("dismissretainer 1001 Retainer Hirer")
+            .await
+            .unwrap();
         assert!(dismissed.contains("dismissed"), "got {dismissed}");
-        let again = cmd.run("dismissretainer 1001 Retainer Hirer").await.unwrap();
+        let again = cmd
+            .run("dismissretainer 1001 Retainer Hirer")
+            .await
+            .unwrap();
         assert!(again.contains("does not own"), "got {again}");
     }
 
@@ -1447,11 +1446,9 @@ mod tests {
         let stored: u32 = db
             .conn_for_test()
             .call_db(|c| {
-                Ok(c.query_row(
-                    "SELECT homepoint FROM characters WHERE id = 12",
-                    [],
-                    |r| r.get(0),
-                )?)
+                c.query_row("SELECT homepoint FROM characters WHERE id = 12", [], |r| {
+                    r.get(0)
+                })
             })
             .await
             .unwrap();

@@ -184,8 +184,7 @@ pub async fn dispatch_battle_event(
                 *target_actor_id,
                 100,
             );
-            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
-                .await;
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
         }
         BattleEvent::Disengage { owner_actor_id } => {
             tracing::debug!(owner = owner_actor_id, kind = ?event_tag(event), "battle event");
@@ -195,16 +194,14 @@ pub async fn dispatch_battle_event(
                 tx::actor_battle::NO_ENMITY_TARGET,
                 0,
             );
-            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
-                .await;
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
             // 0x00DE ResetHead — stop the mob's head from continuing
             // to track the player's last position. Captured retail
             // pairs this with the gem clear at disengage. Project
             // Meteor leaves the head locked indefinitely; emitting
             // ResetHead returns the mob to its neutral pose.
             let head = tx::actor::build_reset_head(*owner_actor_id);
-            broadcast_around_actor(world, registry, zone, *owner_actor_id, head.to_bytes())
-                .await;
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, head.to_bytes()).await;
         }
         BattleEvent::Spawn { owner_actor_id }
         | BattleEvent::Despawn { owner_actor_id }
@@ -228,14 +225,13 @@ pub async fn dispatch_battle_event(
             tracing::debug!(owner = owner_actor_id, "battle: target change");
             // Re-lock the hate gem onto the new target.
             let target = new_target_actor_id.unwrap_or(tx::actor_battle::NO_ENMITY_TARGET);
-            let hate = if new_target_actor_id.is_some() { 100 } else { 0 };
-            let sub = tx::actor_battle::build_set_enmity_indicator(
-                *owner_actor_id,
-                target,
-                hate,
-            );
-            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
-                .await;
+            let hate = if new_target_actor_id.is_some() {
+                100
+            } else {
+                0
+            };
+            let sub = tx::actor_battle::build_set_enmity_indicator(*owner_actor_id, target, hate);
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
         }
         BattleEvent::DoBattleAction {
             owner_actor_id,
@@ -497,6 +493,7 @@ async fn resolve_auto_attack(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn resolve_action(
     attacker_actor_id: u32,
     defender_actor_id: u32,
@@ -610,7 +607,9 @@ async fn resolve_action(
             && dr.amount > 0
         {
             d_write.add_hp(-(dr.amount as i32));
-            d_write.hate.update_hate(attacker_actor_id, dr.enmity as i32);
+            d_write
+                .hate
+                .update_hate(attacker_actor_id, dr.enmity as i32);
         }
     }
 
@@ -893,10 +892,9 @@ pub async fn dispatch_inventory_event(
             let Some(client) = resolve_client(registry, world, *owner_actor_id).await else {
                 return;
             };
-            for sub in tx::actor_inventory::build_mass_set_item_modifier_frame(
-                *owner_actor_id,
-                items,
-            ) {
+            for sub in
+                tx::actor_inventory::build_mass_set_item_modifier_frame(*owner_actor_id, items)
+            {
                 client.send_bytes(sub.to_bytes()).await;
             }
         }
@@ -1577,10 +1575,7 @@ pub async fn award_leve_completion_seals(
     if cap == 0 {
         return;
     }
-    let current = db
-        .get_seals(member_handle.actor_id, gc)
-        .await
-        .unwrap_or(0);
+    let current = db.get_seals(member_handle.actor_id, gc).await.unwrap_or(0);
     if current >= cap {
         return;
     }
@@ -1702,11 +1697,7 @@ pub(crate) async fn apply_revive(
         // raise / respawn window for this actor.
         c.chara.time_of_death_utc = 0;
     }
-    let sub = tx::build_set_actor_state(
-        owner_actor_id,
-        crate::actor::MAIN_STATE_PASSIVE as u8,
-        0,
-    );
+    let sub = tx::build_set_actor_state(owner_actor_id, crate::actor::MAIN_STATE_PASSIVE as u8, 0);
     let bytes = sub.to_bytes();
     send_to_self_if_player(registry, world, owner_actor_id, bytes.clone()).await;
     broadcast_around_actor(world, registry, zone, owner_actor_id, bytes).await;
@@ -1876,9 +1867,11 @@ mod home_point_revive_tests {
         registry.insert(handle.clone()).await;
 
         // Pre-seat a session so destination_* can be updated.
-        let mut session = Session::default();
-        session.id = 42;
-        session.current_zone_id = source_zone;
+        let session = Session {
+            id: 42,
+            current_zone_id: source_zone,
+            ..Default::default()
+        };
         world.upsert_session(session).await;
 
         let zone_arc = world.zone(source_zone).await.expect("zone registered");
@@ -1886,9 +1879,7 @@ mod home_point_revive_tests {
 
         match outcome {
             HomePointReviveOutcome::Warped {
-                homepoint,
-                zone_id,
-                ..
+                homepoint, zone_id, ..
             } => {
                 assert_eq!(homepoint, 1_280_001);
                 assert_eq!(zone_id, 230);

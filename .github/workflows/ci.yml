@@ -1,0 +1,73 @@
+name: CI
+
+# Build + test + fmt/clippy gate on every push and PR to ALL branches, so no
+# merge lands without a green build + passing tests. See issue #14.
+on:
+  pull_request:
+    branches: ['**']
+
+# Cancel superseded in-flight runs for the same ref so a fresh push doesn't
+# leave stale runs burning runner minutes. push and PR refs differ, so a PR's
+# run is not cancelled by pushes to its source branch.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the gate only needs to read the repo.
+permissions:
+  contents: read
+
+# The four gates are independent jobs (no `needs:` between them) so they run in
+# parallel and ALL signals surface even when one fails — there is no fail-fast
+# coupling across separate jobs.
+#
+# Every job uses actions-rust-lang/setup-rust-toolchain@v1, which:
+#   * installs the toolchain pinned in rust-toolchain.toml (1.95.0 + the rustfmt
+#     and clippy components) because no `toolchain:` input is given, and
+#   * caches the cargo registry + target/ by default (Swatinem/rust-cache under
+#     the hood), keyed per job, so the vendored-Lua / bundled-SQLite C builds are
+#     not recompiled every run.
+# `rustflags: ""` neutralizes that action's default RUSTFLAGS=-D warnings, which
+# would otherwise turn ordinary build/test warnings into hard errors. Deny-warnings
+# is enforced ONLY in the clippy job, via the explicit `-- -D warnings` below.
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      # --locked fails if Cargo.lock is stale or missing (Cargo.lock is committed).
+      - run: cargo build --workspace --all-targets --locked
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - run: cargo test --workspace --locked

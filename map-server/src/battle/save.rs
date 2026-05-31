@@ -120,7 +120,7 @@ pub const LEVEL_THRESHOLDS: [i32; 50] = [
     96_000,  // 47 → 48
     100_000, // 48 → 49
     100_000, // 49 → 50 (Meteor intentionally repeats — the retail
-             //          curve levels off at the end)
+    //          curve levels off at the end)
     110_000, // 50 → 51 placeholder — never consumed because the
              //          level-up loop clamps at MAX_LEVEL.
 ];

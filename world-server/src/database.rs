@@ -26,8 +26,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{OptionalExtension, named_params};
 use common::db::ConnCallExt;
+use rusqlite::{OptionalExtension, named_params};
 use tokio_rusqlite::Connection;
 
 use crate::data::DBWorld;
@@ -59,7 +59,8 @@ impl Database {
     }
 
     pub async fn get_server(&self, server_id: u32) -> Result<Option<DBWorld>> {
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -88,7 +89,8 @@ impl Database {
         &self,
         session_id: u32,
     ) -> Result<Option<SessionDbSnapshot>> {
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -114,7 +116,8 @@ impl Database {
     /// Read `server_zones` for zones that have a map-server endpoint
     /// configured. Returns `(zone_id, server_ip, server_port)` tuples.
     pub async fn get_server_zones(&self) -> Result<Vec<(u32, String, u16)>> {
-        let rows = self.conn
+        let rows = self
+            .conn
             .call_db(|c| {
                 let mut stmt = c.prepare(
                     r"SELECT id, serverIp, serverPort
@@ -137,7 +140,8 @@ impl Database {
     }
 
     pub async fn get_all_chara_names(&self) -> Result<Vec<(u32, String)>> {
-        let rows = self.conn
+        let rows = self
+            .conn
             .call_db(|c| {
                 let mut stmt = c.prepare("SELECT id, name FROM characters")?;
                 let rows: Vec<(u32, String)> = stmt
@@ -150,7 +154,8 @@ impl Database {
     }
 
     pub async fn current_zone_for_session(&self, chara_id: u32) -> Result<u32> {
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -170,7 +175,8 @@ impl Database {
     }
 
     pub async fn get_retainers(&self, chara_id: u32) -> Result<Vec<RetainerGroupMember>> {
-        let rows = self.conn
+        let rows = self
+            .conn
             .call_db(move |c| {
                 let mut stmt = c.prepare(
                     r"SELECT sr.id, sr.name, sr.actorClassId, sr.cdIDOffset,
@@ -205,7 +211,8 @@ impl Database {
         ls_name: &str,
     ) -> Result<Option<Linkshell>> {
         let ls_name = ls_name.to_owned();
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -234,7 +241,8 @@ impl Database {
         group_index: u64,
         ls_id: u64,
     ) -> Result<Option<Linkshell>> {
-        let row = self.conn
+        let row = self
+            .conn
             .call_db(move |c| {
                 let v = c
                     .query_row(
@@ -253,7 +261,14 @@ impl Database {
             })
             .await?;
         Ok(row.map(|(name, crest, master)| {
-            Linkshell::new(ls_id, group_index, name, crest, master, Linkshell::RANK_MASTER)
+            Linkshell::new(
+                ls_id,
+                group_index,
+                name,
+                crest,
+                master,
+                Linkshell::RANK_MASTER,
+            )
         }))
     }
 
@@ -302,7 +317,8 @@ impl Database {
 
     pub async fn create_linkshell(&self, name: &str, crest: u16, master: u32) -> Result<u64> {
         let name = name.to_owned();
-        let id = self.conn
+        let id = self
+            .conn
             .call_db(move |c| {
                 c.execute(
                     r"INSERT INTO server_linkshells (name, crestIcon, master, rank)
@@ -320,12 +336,7 @@ impl Database {
         Ok(id)
     }
 
-    pub async fn linkshell_add_player(
-        &self,
-        ls_id: u64,
-        chara_id: u32,
-        rank: u8,
-    ) -> Result<()> {
+    pub async fn linkshell_add_player(&self, ls_id: u64, chara_id: u32, rank: u8) -> Result<()> {
         self.conn
             .call_db(move |c| {
                 c.execute(
@@ -367,12 +378,7 @@ impl Database {
         Ok(())
     }
 
-    pub async fn linkshell_change_rank(
-        &self,
-        ls_id: u64,
-        chara_id: u32,
-        rank: u8,
-    ) -> Result<()> {
+    pub async fn linkshell_change_rank(&self, ls_id: u64, chara_id: u32, rank: u8) -> Result<()> {
         self.conn
             .call_db(move |c| {
                 c.execute(
@@ -420,7 +426,8 @@ impl Database {
 
     pub async fn linkshell_exists(&self, name: &str) -> Result<bool> {
         let name = name.to_owned();
-        let v = self.conn
+        let v = self
+            .conn
             .call_db(move |c| {
                 let row: Option<i64> = c
                     .query_row(

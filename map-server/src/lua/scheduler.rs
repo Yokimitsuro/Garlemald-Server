@@ -182,9 +182,7 @@ pub fn value_to_command_arg(value: &Value) -> LuaCommandArg {
             LuaCommandArg::String(s.to_str().map(|c| c.to_string()).unwrap_or_default())
         }
         Value::UserData(ud) => {
-            use super::userdata::{
-                LuaActor, LuaDirectorHandle, LuaNpc, LuaPlayer, LuaQuestHandle,
-            };
+            use super::userdata::{LuaActor, LuaDirectorHandle, LuaNpc, LuaPlayer, LuaQuestHandle};
             // Use `borrow_scoped` rather than `borrow`: the latter conflicts
             // with the mlua method binding's outer borrow when a script
             // passes `self` back into the call as a vararg
@@ -201,7 +199,9 @@ pub fn value_to_command_arg(value: &Value) -> LuaCommandArg {
                 LuaCommandArg::ActorId(id)
             } else if let Ok(id) = ud.borrow_scoped::<LuaDirectorHandle, _>(|d| d.actor_id) {
                 LuaCommandArg::ActorId(id)
-            } else if let Ok(id) = ud.borrow_scoped::<LuaQuestHandle, _>(|q| 0xA0F0_0000 | q.quest_id) {
+            } else if let Ok(id) =
+                ud.borrow_scoped::<LuaQuestHandle, _>(|q| 0xA0F0_0000 | q.quest_id)
+            {
                 // Meteor's CreateLuaParamList encodes a quest as
                 // `0xA0F00000 | quest.GetQuestId()` (the same masking
                 // StaticActors uses), then writes it as an Actor

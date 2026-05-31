@@ -178,6 +178,10 @@ pub trait ConnCallExt {
 }
 
 impl ConnCallExt for Connection {
+    // The explicit `-> impl Future + Send` return (rather than `async fn`) is
+    // deliberate: it pins the `Send` bound the trait promises, which `async fn`
+    // in a trait impl cannot express. Hence the `manual_async_fn` allow.
+    #[allow(clippy::manual_async_fn)]
     fn call_db<F, R>(&self, f: F) -> impl Future<Output = Result<R>> + Send
     where
         F: FnOnce(&mut rusqlite::Connection) -> rusqlite::Result<R> + Send + 'static,

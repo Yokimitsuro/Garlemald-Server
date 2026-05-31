@@ -363,9 +363,9 @@ pub fn build_0x132(actor_id: u32, number: u16, function: &str) -> SubPacket {
 /// * 0x00..0x04: u32 enabled (Meteor writes `UInt32`, NOT `Byte`)
 /// * 0x04:       u8 type (1=talk, 2=push, 3=emote, 5=notice)
 /// * 0x05..0x29: ASCII condition name, max 0x24 bytes (no padding past
-///               the bytes actually written, but our `write_padded_ascii`
-///               zero-fills to 0x20 which is fine — the condition-name
-///               compare on the client stops at the NUL terminator).
+///   the bytes actually written, but our `write_padded_ascii`
+///   zero-fills to 0x20 which is fine — the condition-name
+///   compare on the client stops at the NUL terminator).
 ///
 /// Previous garlemald port wrote `enabled` as a single byte, which
 /// shifted `type` and `condition_name` left by 3 bytes. The 1.x client
@@ -382,7 +382,8 @@ pub fn build_set_event_status(
 ) -> SubPacket {
     let mut data = body(0x48);
     let mut c = Cursor::new(&mut data[..]);
-    c.write_u32::<LittleEndian>(if enabled { 1 } else { 0 }).unwrap();
+    c.write_u32::<LittleEndian>(if enabled { 1 } else { 0 })
+        .unwrap();
     c.write_u8(ty).unwrap();
     write_padded_ascii(&mut c, condition_name, 0x20);
     SubPacket::new(OP_SET_EVENT_STATUS, actor_id, data)

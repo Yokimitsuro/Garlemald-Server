@@ -24,7 +24,7 @@
 //!     every Lua VM shares one copy,
 //!   * exposes a single "build aim slots" pivot that converts a node id
 //!     + its items into the 11-slot table the DummyCommand minigame
-//!     feeds through `callClientFunction`.
+//!       feeds through `callClientFunction`.
 
 #![allow(dead_code)]
 
@@ -138,7 +138,10 @@ mod tests {
 
     #[test]
     fn resolver_round_trips_node_and_item() {
-        let r = GatherResolver::from_parts([mk_node(1001, &[1, 2, 3])], [mk_item(1, 0), mk_item(2, 50), mk_item(3, 100)]);
+        let r = GatherResolver::from_parts(
+            [mk_node(1001, &[1, 2, 3])],
+            [mk_item(1, 0), mk_item(2, 50), mk_item(3, 100)],
+        );
         assert_eq!(r.num_nodes(), 1);
         assert_eq!(r.num_items(), 3);
         assert!(r.get_node(1001).is_some());
@@ -183,10 +186,8 @@ mod tests {
         // Two items both landing on slot 1 — iteration order in a
         // HashMap is nondeterministic but for deterministic test
         // coverage we assert that exactly one slot is filled.
-        let r = GatherResolver::from_parts(
-            [mk_node(1001, &[1, 2])],
-            [mk_item(1, 0), mk_item(2, 5)],
-        );
+        let r =
+            GatherResolver::from_parts([mk_node(1001, &[1, 2])], [mk_item(1, 0), mk_item(2, 5)]);
         let slots = r.build_aim_slots(1001).unwrap();
         let filled: usize = slots.iter().filter(|s| !s.empty).count();
         assert_eq!(filled, 1, "overlapping aim slots collapse to one entry");

@@ -46,7 +46,9 @@ pub struct PartyManager {
 
 impl PartyManager {
     pub fn new() -> Self {
-        Self { parties: Mutex::new(HashMap::new()) }
+        Self {
+            parties: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn get_party(&self, session_id: u32) -> Option<Party> {
@@ -55,7 +57,9 @@ impl PartyManager {
 
     pub async fn ensure_party(&self, owner: u32) -> Party {
         let mut map = self.parties.lock().await;
-        map.entry(owner).or_insert_with(|| Party::new(owner)).clone()
+        map.entry(owner)
+            .or_insert_with(|| Party::new(owner))
+            .clone()
     }
 
     pub async fn add_member(&self, owner: u32, new_member: u32) {
@@ -100,7 +104,10 @@ impl LinkshellManager {
     pub const RANK_MEMBER: u8 = 0x01;
 
     pub fn new() -> Self {
-        Self { cache: Mutex::new(HashMap::new()), by_name: Mutex::new(HashMap::new()) }
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            by_name: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Verify a linkshell name can be created. Returns 0 on success; matching
@@ -127,7 +134,8 @@ impl LinkshellManager {
         if db_id == 0 {
             return Ok(None);
         }
-        db.linkshell_add_player(db_id, master, Self::RANK_MASTER).await?;
+        db.linkshell_add_player(db_id, master, Self::RANK_MASTER)
+            .await?;
         let mut ls = Linkshell::new(
             db_id,
             alloc_group_id(),
@@ -193,7 +201,11 @@ impl LinkshellManager {
     /// Cache-through lookup: if `name` isn't in the in-memory map, hydrate
     /// from DB (including the member roster) so ops that landed via
     /// another process become visible.
-    pub async fn get_or_load_linkshell(&self, db: &Database, name: &str) -> Result<Option<Linkshell>> {
+    pub async fn get_or_load_linkshell(
+        &self,
+        db: &Database,
+        name: &str,
+    ) -> Result<Option<Linkshell>> {
         if let Some(ls) = self.get_linkshell(name).await {
             return Ok(Some(ls));
         }
@@ -249,10 +261,10 @@ impl LinkshellManager {
         rank: u8,
     ) -> Result<()> {
         db.linkshell_change_rank(ls_id, chara_id, rank).await?;
-        if let Some(ls) = self.cache.lock().await.get_mut(&ls_id) {
-            if let Some(m) = ls.members.iter_mut().find(|m| m.character_id == chara_id) {
-                m.rank = rank;
-            }
+        if let Some(ls) = self.cache.lock().await.get_mut(&ls_id)
+            && let Some(m) = ls.members.iter_mut().find(|m| m.character_id == chara_id)
+        {
+            m.rank = rank;
         }
         Ok(())
     }
@@ -274,7 +286,9 @@ pub struct RelationGroupManager {
 
 impl RelationGroupManager {
     pub fn new() -> Self {
-        Self { relations: Mutex::new(HashMap::new()) }
+        Self {
+            relations: Mutex::new(HashMap::new()),
+        }
     }
 
     pub async fn create(&self, host: u32, guest: u32) -> Relation {
@@ -308,14 +322,12 @@ pub struct RetainerGroupManager {
 
 impl RetainerGroupManager {
     pub fn new() -> Self {
-        Self { groups: Mutex::new(HashMap::new()) }
+        Self {
+            groups: Mutex::new(HashMap::new()),
+        }
     }
 
-    pub async fn load_for_player(
-        &self,
-        db: &Database,
-        chara_id: u32,
-    ) -> Result<RetainerGroup> {
+    pub async fn load_for_player(&self, db: &Database, chara_id: u32) -> Result<RetainerGroup> {
         let members = db.get_retainers(chara_id).await.unwrap_or_default();
         let group = RetainerGroup::new(chara_id, members);
         self.groups.lock().await.insert(chara_id, group.clone());

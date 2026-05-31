@@ -356,8 +356,8 @@ pub fn build_linked_item_list_x32(
 /// (body = 0x174 / 372 bytes), which only fits 62 of the advertised 64
 /// entries and throws on a full batch. We size the body to fit 64 × 6 bytes
 /// + the 0x20 header (0x1A0) so a full batch doesn't truncate. Client-side
-/// compat with 1.23b here is untested because this path effectively never
-/// fires — equipment tops out at ~35 slots.
+///   compat with 1.23b here is untested because this path effectively never
+///   fires — equipment tops out at ~35 slots.
 pub fn build_linked_item_list_x64(
     actor_id: u32,
     entries: &[(u16, InventoryItem)],
@@ -434,8 +434,7 @@ pub fn build_set_initial_equipment(actor_id: u32, slots: &[(u16, u32)]) -> Vec<S
                 c.write_u32::<LittleEndian>(*item_id).unwrap();
             }
         }
-        data[COUNT_OFFSET..COUNT_OFFSET + 4]
-            .copy_from_slice(&(chunk.len() as u32).to_le_bytes());
+        data[COUNT_OFFSET..COUNT_OFFSET + 4].copy_from_slice(&(chunk.len() as u32).to_le_bytes());
         SubPacket::new(0x014E, actor_id, data)
     };
 
@@ -666,9 +665,18 @@ mod tests {
     #[test]
     fn mass_set_item_modifier_frame_emits_begin_body_end() {
         let items = vec![
-            InventoryItem { unique_id: 1, ..Default::default() },
-            InventoryItem { unique_id: 2, ..Default::default() },
-            InventoryItem { unique_id: 3, ..Default::default() },
+            InventoryItem {
+                unique_id: 1,
+                ..Default::default()
+            },
+            InventoryItem {
+                unique_id: 2,
+                ..Default::default()
+            },
+            InventoryItem {
+                unique_id: 3,
+                ..Default::default()
+            },
         ];
         let frame = build_mass_set_item_modifier_frame(0x029B_2941, &items);
         assert_eq!(frame.len(), 5);
@@ -676,12 +684,11 @@ mod tests {
             frame[0].game_message.opcode,
             OP_MASS_SET_ITEM_MODIFIER_BEGIN
         );
-        assert!(frame[1..4]
-            .iter()
-            .all(|p| p.game_message.opcode == OP_MASS_SET_ITEM_MODIFIER));
-        assert_eq!(
-            frame[4].game_message.opcode,
-            OP_MASS_SET_ITEM_MODIFIER_END
+        assert!(
+            frame[1..4]
+                .iter()
+                .all(|p| p.game_message.opcode == OP_MASS_SET_ITEM_MODIFIER)
         );
+        assert_eq!(frame[4].game_message.opcode, OP_MASS_SET_ITEM_MODIFIER_END);
     }
 }

@@ -121,7 +121,10 @@ async fn main() -> Result<()> {
     match db.get_item_gamedata().await {
         Ok(items) => {
             let count = items.len();
-            let with_bonuses = items.values().filter(|i| !i.gear_bonuses.is_empty()).count();
+            let with_bonuses = items
+                .values()
+                .filter(|i| !i.gear_bonuses.is_empty())
+                .count();
             lua.catalogs().install_items(items);
             tracing::info!(
                 count,
@@ -225,7 +228,12 @@ async fn main() -> Result<()> {
             let field = resolver.num_fieldcraft();
             let battle = resolver.num_battlecraft();
             lua.catalogs().install_regional_leve_resolver(resolver);
-            tracing::info!(total, fieldcraft = field, battlecraft = battle, "regional-leve catalog loaded");
+            tracing::info!(
+                total,
+                fieldcraft = field,
+                battlecraft = battle,
+                "regional-leve catalog loaded"
+            );
         }
         Err(e) => {
             tracing::warn!(

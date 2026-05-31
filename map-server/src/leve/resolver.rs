@@ -182,17 +182,13 @@ mod tests {
 
     #[test]
     fn fieldcraft_target_does_not_appear_in_battlecraft_index() {
-        let r = RegionalLeveResolver::from_rows([
-            mk(130_001, LeveType::Fieldcraft, 10_001_006),
-        ]);
+        let r = RegionalLeveResolver::from_rows([mk(130_001, LeveType::Fieldcraft, 10_001_006)]);
         assert!(r.battlecraft_leves_for_class(10_001_006).is_empty());
     }
 
     #[test]
     fn zero_target_is_skipped_in_indexing() {
-        let r = RegionalLeveResolver::from_rows([
-            mk(130_001, LeveType::Fieldcraft, 0),
-        ]);
+        let r = RegionalLeveResolver::from_rows([mk(130_001, LeveType::Fieldcraft, 0)]);
         assert_eq!(r.num_leves(), 1);
         assert!(r.fieldcraft_leves_for_item(0).is_empty());
     }

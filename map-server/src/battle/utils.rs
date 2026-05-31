@@ -714,7 +714,7 @@ pub fn attack_calculate_base_damage(attacker: &CombatView<'_>, rng: &mut dyn Rng
     let weapon_dmg = attacker.get_mod(Modifier::WeaponDamagePower);
     let base = weapon_dmg + 0.85 * str_v + attack_v;
     let dev = 0.96 + rng.next_f64() * 0.08;
-    ((base * dev).round() as i32).max(1).min(9999)
+    ((base * dev).round() as i32).clamp(1, 9999)
 }
 
 pub fn attack_calculate_damage(

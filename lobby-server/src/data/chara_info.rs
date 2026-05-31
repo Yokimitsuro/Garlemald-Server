@@ -22,11 +22,11 @@
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
 use anyhow::Result;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 
-use super::{get_tribe_model, Appearance, CharaInfo, Character, FaceInfo};
+use super::{Appearance, CharaInfo, Character, FaceInfo, get_tribe_model};
 
 pub fn parse_new_char_request(encoded: &str) -> Result<CharaInfo> {
     // Mirror the C# `encoded.Replace('-', '+').Replace('_', '/')` URL-safe
@@ -120,11 +120,13 @@ pub fn build_for_chara_list(chara: &Character, appearance: &Appearance) -> Strin
             v.push(0);
             v
         };
-        c.write_u32::<LittleEndian>(name_bytes.len() as u32).unwrap();
+        c.write_u32::<LittleEndian>(name_bytes.len() as u32)
+            .unwrap();
         c.write_all(&name_bytes).unwrap();
         c.write_u32::<LittleEndian>(0x1c).unwrap();
         c.write_u32::<LittleEndian>(0x04).unwrap();
-        c.write_u32::<LittleEndian>(get_tribe_model(chara.tribe)).unwrap();
+        c.write_u32::<LittleEndian>(get_tribe_model(chara.tribe))
+            .unwrap();
         c.write_u32::<LittleEndian>(appearance.size as u32).unwrap();
 
         let color_val = appearance.skin_color as u32
@@ -138,7 +140,8 @@ pub fn build_for_chara_list(chara: &Character, appearance: &Appearance) -> Strin
             | ((appearance.hair_variation as u32) << 5)
             | ((appearance.hair_style as u32) << 10);
         c.write_u32::<LittleEndian>(hair_val).unwrap();
-        c.write_u32::<LittleEndian>(appearance.voice as u32).unwrap();
+        c.write_u32::<LittleEndian>(appearance.voice as u32)
+            .unwrap();
         c.write_u32::<LittleEndian>(appearance.main_hand).unwrap();
         c.write_u32::<LittleEndian>(appearance.off_hand).unwrap();
 
@@ -158,7 +161,8 @@ pub fn build_for_chara_list(chara: &Character, appearance: &Appearance) -> Strin
         c.write_u32::<LittleEndian>(appearance.left_ear).unwrap();
         c.write_u32::<LittleEndian>(appearance.right_index).unwrap();
         c.write_u32::<LittleEndian>(appearance.left_index).unwrap();
-        c.write_u32::<LittleEndian>(appearance.right_finger).unwrap();
+        c.write_u32::<LittleEndian>(appearance.right_finger)
+            .unwrap();
         c.write_u32::<LittleEndian>(appearance.left_finger).unwrap();
 
         for _ in 0..8 {
@@ -169,7 +173,8 @@ pub fn build_for_chara_list(chara: &Character, appearance: &Appearance) -> Strin
         c.write_u32::<LittleEndian>(1).unwrap();
 
         c.write_u8(chara.current_class as u8).unwrap();
-        c.write_u16::<LittleEndian>(chara.current_level as u16).unwrap();
+        c.write_u16::<LittleEndian>(chara.current_level as u16)
+            .unwrap();
         c.write_u8(chara.current_job as u8).unwrap();
         c.write_u16::<LittleEndian>(1).unwrap();
         c.write_u8(chara.tribe).unwrap();
@@ -191,8 +196,10 @@ pub fn build_for_chara_list(chara: &Character, appearance: &Appearance) -> Strin
 
         c.seek(SeekFrom::Current(0x10)).unwrap();
 
-        c.write_u32::<LittleEndian>(chara.initial_town as u32).unwrap();
-        c.write_u32::<LittleEndian>(chara.initial_town as u32).unwrap();
+        c.write_u32::<LittleEndian>(chara.initial_town as u32)
+            .unwrap();
+        c.write_u32::<LittleEndian>(chara.initial_town as u32)
+            .unwrap();
     }
 
     // Match .NET MemoryStream.GetBuffer(): capacity is a power of two and at
@@ -214,7 +221,11 @@ mod tests {
 
     #[test]
     fn build_for_chara_list_is_stable_shape() {
-        let chara = Character { name: "Test".to_string(), tribe: 2, ..Default::default() };
+        let chara = Character {
+            name: "Test".to_string(),
+            tribe: 2,
+            ..Default::default()
+        };
         let out = build_for_chara_list(&chara, &Appearance::default());
         // For this input the logical blob is 228 bytes; rounded up to .NET's
         // 256-byte minimum MemoryStream backing array, base64 is 344 chars.

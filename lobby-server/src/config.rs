@@ -30,6 +30,7 @@ use serde::Deserialize;
 /// localhost without any config file at all.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct Config {
     pub server: ServerSection,
     pub database: DatabaseSection,
@@ -50,15 +51,6 @@ pub struct ServerSection {
 pub struct DatabaseSection {
     /// Path to the SQLite file, created on first run if missing.
     pub path: PathBuf,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerSection::default(),
-            database: DatabaseSection::default(),
-        }
-    }
 }
 
 impl Default for ServerSection {
@@ -96,10 +88,10 @@ impl Config {
             tracing::warn!(?path, "lobby config not found, using defaults");
             return Ok(Self::default());
         }
-        let raw = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let cfg: Config = toml::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
         Ok(cfg)
     }
 

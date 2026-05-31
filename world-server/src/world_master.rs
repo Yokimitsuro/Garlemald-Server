@@ -28,9 +28,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::data::ZoneServerHandle;
-use crate::managers::{
-    LinkshellManager, PartyManager, RelationGroupManager, RetainerGroupManager,
-};
+use crate::managers::{LinkshellManager, PartyManager, RelationGroupManager, RetainerGroupManager};
 
 pub struct WorldMaster {
     pub party_manager: PartyManager,

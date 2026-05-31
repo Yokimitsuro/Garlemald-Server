@@ -81,9 +81,7 @@ impl PacketProcessor {
     ) -> Result<Vec<Reply>> {
         // Special-case: the client's initial "Test Ticket" packet is 0x288
         // bytes with 'T' at offset 0x34 and is NOT blowfish-encrypted.
-        if packet.header.packet_size == 0x288
-            && packet.data.get(0x34) == Some(&b'T')
-        {
+        if packet.header.packet_size == 0x288 && packet.data.get(0x34) == Some(&b'T') {
             return self.process_start_session(session, &packet);
         }
 
@@ -134,7 +132,10 @@ impl PacketProcessor {
         let handshake = SecurityHandshakePacket::parse(&packet.data)?;
         let key = generate_blowfish_key(&handshake.ticket_phrase, handshake.client_number);
         session.blowfish = Some(Blowfish::new(&key));
-        tracing::info!(client_number = format!("0x{:X}", handshake.client_number), "handshake");
+        tracing::info!(
+            client_number = format!("0x{:X}", handshake.client_number),
+            "handshake"
+        );
 
         let mut ack = BasePacket::from_bytes(&SECURE_CONNECTION_ACKNOWLEDGMENT)?;
         if let Some(bf) = session.blowfish.as_ref() {
@@ -156,13 +157,22 @@ impl PacketProcessor {
         session.current_session_token = s.session.clone();
 
         if user_id == 0 {
-            let mut err = error_packet(s.sequence, 0, 0, 13001, "Your session has expired, please login again.");
+            let mut err = error_packet(
+                s.sequence,
+                0,
+                0,
+                13001,
+                "Your session has expired, please login again.",
+            );
             err.set_target_id(0xe0006868);
             tracing::info!("invalid session, kicking");
             return Ok(vec![Reply::Encrypted(vec![err])]);
         }
 
-        let accounts = vec![Account { id: 1, name: "FINAL FANTASY XIV".to_string() }];
+        let accounts = vec![Account {
+            id: 1,
+            name: "FINAL FANTASY XIV".to_string(),
+        }];
         Ok(vec![Reply::Encrypted(account_list_packets(1, &accounts))])
     }
 
@@ -211,8 +221,7 @@ impl PacketProcessor {
         }
 
         let world_lookup = |id: u16| world_index.get(&id).cloned();
-        let appearance_lookup =
-            |id: u32| appearance_cache.get(&id).cloned().unwrap_or_default();
+        let appearance_lookup = |id: u32| appearance_cache.get(&id).cloned().unwrap_or_default();
 
         let replies = vec![
             Reply::Encrypted(world_list_packets(0, &worlds)),
@@ -234,7 +243,11 @@ impl PacketProcessor {
         sub: &SubPacket,
     ) -> Result<Vec<Reply>> {
         let req = SelectCharacterPacket::parse(&sub.data)?;
-        tracing::info!(user_id = session.current_user_id, character_id = req.character_id, "select_character");
+        tracing::info!(
+            user_id = session.current_user_id,
+            character_id = req.character_id,
+            "select_character"
+        );
 
         let chara = self
             .db
@@ -252,7 +265,13 @@ impl PacketProcessor {
                 character_id = req.character_id,
                 "select_character rejected: world inactive or missing"
             );
-            let mut err = error_packet(req.sequence, 0, 0, 13001, "World Does not exist or is inactive.");
+            let mut err = error_packet(
+                req.sequence,
+                0,
+                0,
+                13001,
+                "World Does not exist or is inactive.",
+            );
             err.set_target_id(0xe0006868);
             return Ok(vec![Reply::Encrypted(vec![err])]);
         };
@@ -290,20 +309,35 @@ impl PacketProcessor {
         if world_id == 0 {
             world_id = session.new_chara_world_id;
         }
-        if world_id == 0 && req.character_id != 0
+        if world_id == 0
+            && req.character_id != 0
             && let Ok(Some(chara)) = self
                 .db
                 .get_character(session.current_user_id, req.character_id)
                 .await
-            {
-                world_id = chara.server_id;
-            }
+        {
+            world_id = chara.server_id;
+        }
 
-        let world = self.db.get_server(world_id as u32).await.unwrap_or_default();
+        let world = self
+            .db
+            .get_server(world_id as u32)
+            .await
+            .unwrap_or_default();
         let Some(world) = world else {
-            let mut err = error_packet(req.sequence, 0, 0, 13001, "World Does not exist or is inactive.");
+            let mut err = error_packet(
+                req.sequence,
+                0,
+                0,
+                13001,
+                "World Does not exist or is inactive.",
+            );
             err.set_target_id(0xe0006868);
-            tracing::info!(user_id = session.current_user_id, world_id, "invalid server id");
+            tracing::info!(
+                user_id = session.current_user_id,
+                world_id,
+                "invalid server id"
+            );
             return Ok(vec![Reply::Encrypted(vec![err])]);
         };
         let world_name = world.name.clone();
@@ -329,7 +363,8 @@ impl PacketProcessor {
                 tracing::info!(user_id = session.current_user_id, name = %name, "character reserved");
             }
             CharacterModifyPacket::CMD_MAKE => {
-                let mut info: CharaInfo = chara_info::parse_new_char_request(&req.character_info_encoded)?;
+                let mut info: CharaInfo =
+                    chara_info::parse_new_char_request(&req.character_info_encoded)?;
 
                 if let Some(gear) = character_creator::get_equipment_for_class(info.current_class) {
                     assert_eq!(gear.len(), EQUIPMENT_SLOT_COUNT);

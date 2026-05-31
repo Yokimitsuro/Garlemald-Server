@@ -163,7 +163,10 @@ mod integration_tests {
             sender_name: "Sender".to_string(),
             message: "hello world".to_string(),
         };
-        { let db = open_test_db().await; dispatch_social_event(&event, &registry, &world, &db).await };
+        {
+            let db = open_test_db().await;
+            dispatch_social_event(&event, &registry, &world, &db).await
+        };
         let got = rx.recv().await.expect("chat should reach nearby player");
         assert!(!got.is_empty());
     }
@@ -189,7 +192,10 @@ mod integration_tests {
             name: "Griefer".to_string(),
             success: true,
         };
-        { let db = open_test_db().await; dispatch_social_event(&event, &registry, &world, &db).await };
+        {
+            let db = open_test_db().await;
+            dispatch_social_event(&event, &registry, &world, &db).await
+        };
         let got = rx.recv().await.expect("blacklist-added packet on queue");
         assert!(!got.is_empty());
     }
@@ -214,7 +220,10 @@ mod integration_tests {
             actor_id: 1,
             faqs: vec!["Faq 1".into(), "Faq 2".into()],
         };
-        { let db = open_test_db().await; dispatch_social_event(&event, &registry, &world, &db).await };
+        {
+            let db = open_test_db().await;
+            dispatch_social_event(&event, &registry, &world, &db).await
+        };
         let got = rx.recv().await.expect("faq-list packet on queue");
         assert!(!got.is_empty());
     }

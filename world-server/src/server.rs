@@ -109,7 +109,9 @@ impl Default for SessionRegistry {
 
 pub async fn run(config: Config, db: Arc<Database>, world: Arc<WorldMaster>) -> Result<()> {
     let addr = format!("{}:{}", config.bind_ip(), config.port());
-    let listener = TcpListener::bind(&addr).await.with_context(|| format!("bind {addr}"))?;
+    let listener = TcpListener::bind(&addr)
+        .await
+        .with_context(|| format!("bind {addr}"))?;
     tracing::info!(%addr, "world server listening");
 
     let sessions = Arc::new(SessionRegistry::new());
@@ -124,7 +126,11 @@ pub async fn run(config: Config, db: Arc<Database>, world: Arc<WorldMaster>) -> 
     // `WorldMaster.ConnectToZoneServers()` startup step.
     connect_zone_servers(&db, &world, &sessions).await;
 
-    let processor = Arc::new(PacketProcessor { db: db.clone(), world, sessions: sessions.clone() });
+    let processor = Arc::new(PacketProcessor {
+        db: db.clone(),
+        world,
+        sessions: sessions.clone(),
+    });
 
     loop {
         let (socket, peer) = match listener.accept().await {
