@@ -18,10 +18,10 @@ on:
   pull_request_target:
     types: [opened, reopened, closed]
 
-# Reused maintainer/announce role — the SAME role the issue notifier pings.
-# Defined once here so it's easy to change in a single place.
+# Maintainer role pinged for PR announcements. Defined once here so it's
+# easy to change in a single place.
 env:
-  MAINTAINER_ROLE_ID: "1510380634349109440"
+  MAINTAINER_ROLE_ID: "1510751664347283556"
 
 # Serialize duplicate events for the same PR + action so we never double-post.
 concurrency:
