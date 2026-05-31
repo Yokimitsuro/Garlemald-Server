@@ -385,6 +385,45 @@ pub async fn apply_runtime_lua_command(
             apply_actor_engage(actor_id, target_actor_id, registry).await;
             true
         }
+        LC::ChangeState {
+            actor_id,
+            main_state,
+        } => {
+            apply_change_state(actor_id, main_state, registry, world).await;
+            true
+        }
+        LC::DirectorAddMember {
+            director_actor_id,
+            member_actor_id,
+        } => {
+            apply_director_add_member(director_actor_id, member_actor_id, world).await;
+            true
+        }
+        LC::PartyAddMember {
+            leader_actor_id,
+            member_actor_id,
+        } => {
+            apply_party_add_member(leader_actor_id, member_actor_id, registry, world).await;
+            true
+        }
+        LC::PlayAnimation {
+            actor_id,
+            animation_id,
+        } => {
+            apply_play_animation(actor_id, animation_id, registry, world).await;
+            true
+        }
+        LC::ChangeMusic {
+            player_id,
+            music_id,
+        } => {
+            apply_change_music(player_id, music_id, registry, world).await;
+            true
+        }
+        LC::DespawnActor { zone_id, actor_id } => {
+            apply_despawn_actor(zone_id, actor_id, registry, world).await;
+            true
+        }
         LC::HateContainerAddBaseHate {
             actor_id,
             target_actor_id,
@@ -464,6 +503,378 @@ async fn apply_actor_engage(
         delay,
         started,
         "ActorEngage applied",
+    );
+}
+
+/// `actor:ChangeState(main_state)` — port of pmeteor `Actor.cs::ChangeState`.
+/// Updates the actor's stored `current_main_state` AND broadcasts the
+/// `0x0134 SetActorState` packet to nearby players so the client renders
+/// the new pose (e.g. main_state 2 = active/combat stance — Yda + tutorial
+/// wolves in `SimpleContent30010` need this to stand up instead of lying in
+/// the default passive state). Without this applier the LuaCommand falls
+/// through to the unhandled-tag log and the actor stays in its spawn pose.
+async fn apply_change_state(
+    actor_id: u32,
+    main_state: u16,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            main_state,
+            "ChangeState skipped — actor not in registry",
+        );
+        return;
+    };
+    // 1. Update the actor's stored main_state so subsequent reads see it.
+    {
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = main_state;
+    }
+    // 2. Broadcast 0x0134 SetActorState (main_state | sub_state<<8).
+    let Some(zone_arc) = world.zone(handle.zone_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            zone = handle.zone_id,
+            "ChangeState skipped — zone not loaded",
+        );
+        return;
+    };
+    let sub = crate::packets::send::actor::build_set_actor_state(
+        actor_id,
+        (main_state & 0xFF) as u8,
+        0,
+    );
+    let recipients = crate::runtime::broadcast::broadcast_around_actor(
+        world,
+        registry,
+        &zone_arc,
+        actor_id,
+        sub.to_bytes(),
+    )
+    .await;
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        main_state,
+        recipients,
+        "ChangeState applied",
+    );
+}
+
+/// `director:AddMember(actor)` — populates the director's transient
+/// roster (`session.transient_director_members[director_actor_id]`).
+/// The runtime ticker reads this roster to build the script's
+/// `area:GetPlayers() / :GetAllies() / :GetMonsters()` iterators —
+/// without this applier the iterators yield empty tables and the
+/// content script's ally/enemy AI loops never fire (e.g.
+/// `SimpleContent30010.lua::onUpdate`'s `EngageTarget` branch never
+/// runs, so Yda/Papalymo never engage the wolves).
+///
+/// The Lua command doesn't carry a session_id; we resolve it by
+/// scanning sessions for the one whose active content script targets
+/// this director. Each player has at most one active content script,
+/// so the scan terminates quickly.
+async fn apply_director_add_member(
+    director_actor_id: u32,
+    member_actor_id: u32,
+    world: &WorldManager,
+) {
+    if director_actor_id == 0 || member_actor_id == 0 {
+        return;
+    }
+    let sessions = world.all_sessions().await;
+    let mut target = None;
+    for snap in sessions {
+        if let Some(active) = snap.active_content_script.as_ref()
+            && active.director_actor_id == director_actor_id
+        {
+            target = Some(snap);
+            break;
+        }
+    }
+    let Some(mut snap) = target else {
+        tracing::debug!(
+            director = format!("0x{director_actor_id:08X}"),
+            member = format!("0x{member_actor_id:08X}"),
+            "DirectorAddMember skipped — no session with this content director",
+        );
+        return;
+    };
+    let session_id = snap.id;
+    let roster = snap
+        .transient_director_members
+        .entry(director_actor_id)
+        .or_default();
+    if !roster.contains(&member_actor_id) {
+        roster.push(member_actor_id);
+    }
+    let count = roster.len();
+    world.upsert_session(snap).await;
+    tracing::debug!(
+        session = session_id,
+        director = format!("0x{director_actor_id:08X}"),
+        member = format!("0x{member_actor_id:08X}"),
+        roster_size = count,
+        "DirectorAddMember applied",
+    );
+}
+
+/// `currentParty:AddMember(actor)` — appends `member_actor_id` to the
+/// leader's transient party roster (`session.transient_party_members`)
+/// and re-emits the GroupHeader / GroupMembersBegin / X08 / End trio to
+/// the leader's client so the in-game party panel shows the new member.
+/// Used by `SimpleContent30010.lua::onCreate` to add Yda + Papalymo
+/// (battle-NPC allies) to the player's party UI — without this they
+/// never appear in the party panel even though they spawn fine in the
+/// world.
+async fn apply_party_add_member(
+    leader_actor_id: u32,
+    member_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    if leader_actor_id == 0 || member_actor_id == 0 {
+        return;
+    }
+    let Some(leader_handle) = registry.get(leader_actor_id).await else {
+        tracing::debug!(
+            leader = format!("0x{leader_actor_id:08X}"),
+            "PartyAddMember skipped — leader not in registry",
+        );
+        return;
+    };
+    let session_id = leader_handle.session_id;
+    if session_id == 0 {
+        tracing::debug!(
+            leader = format!("0x{leader_actor_id:08X}"),
+            "PartyAddMember skipped — leader has no session",
+        );
+        return;
+    }
+    let Some(mut snap) = world.session(session_id).await else {
+        tracing::debug!(
+            session = session_id,
+            "PartyAddMember skipped — session not found",
+        );
+        return;
+    };
+    if !snap.transient_party_members.contains(&member_actor_id) {
+        snap.transient_party_members.push(member_actor_id);
+    }
+    let roster_ids: Vec<u32> = snap.transient_party_members.clone();
+    world.upsert_session(snap).await;
+
+    // Build the roster: leader first, then the transient members.
+    // Names come from each actor's `character.base.display_name()`.
+    let leader_name = {
+        let c = leader_handle.character.read().await;
+        c.base.display_name().to_string()
+    };
+    let mut members: Vec<crate::packets::send::groups::GroupMember> = Vec::new();
+    members.push(crate::packets::send::groups::GroupMember {
+        actor_id: leader_actor_id,
+        localized_name: -1,
+        unknown2: 0,
+        flag1: false,
+        is_online: true,
+        name: leader_name,
+    });
+    for &mid in &roster_ids {
+        let name = if let Some(h) = registry.get(mid).await {
+            let c = h.character.read().await;
+            c.base.display_name().to_string()
+        } else {
+            format!("bnpc_{mid:08X}")
+        };
+        members.push(crate::packets::send::groups::GroupMember {
+            actor_id: mid,
+            localized_name: -1,
+            unknown2: 0,
+            flag1: false,
+            is_online: true,
+            name,
+        });
+    }
+
+    // Emit the trio. Mirrors the solo-party block in
+    // `world_manager.rs::send_zone_in_bundle` (lines ~1885-1942):
+    // group_index = SOLO_FLAG | leader_actor_id, GROUP_TYPE_PARTY=0x2711.
+    const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
+    const GROUP_TYPE_PARTY: u32 = 0x2711;
+    let group_index: u64 = PARTY_SOLO_SELF_FLAG | (leader_actor_id as u64);
+    let location_code = leader_handle.zone_id as u64;
+    let sequence_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+
+    let mut offset = 0usize;
+    let pkts = vec![
+        crate::packets::send::groups::build_group_header(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            group_index,
+            GROUP_TYPE_PARTY,
+            -1,
+            "",
+            members.len() as u32,
+        ),
+        crate::packets::send::groups::build_group_members_begin(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            group_index,
+            members.len() as u32,
+        ),
+        crate::packets::send::groups::build_group_members_x08(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            &members,
+            &mut offset,
+        ),
+        crate::packets::send::groups::build_group_members_end(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            group_index,
+        ),
+    ];
+
+    let Some(client) = world.client(session_id).await else {
+        tracing::debug!(
+            session = session_id,
+            "PartyAddMember: roster updated but client gone — wire emit skipped",
+        );
+        return;
+    };
+    for mut sub in pkts {
+        sub.set_target_id(session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+
+    tracing::debug!(
+        leader = format!("0x{leader_actor_id:08X}"),
+        member = format!("0x{member_actor_id:08X}"),
+        roster_size = members.len(),
+        "PartyAddMember applied (transient roster updated + party trio re-emitted)",
+    );
+}
+
+/// `actor:PlayAnimation(animation_id)` — port of C#
+/// `Actor::PlayAnimation`. Broadcasts the `0x00E0`
+/// PlayAnimationOnActor packet to nearby players so the client triggers
+/// the actor's animation sequence (used by cinematics and quest events).
+async fn apply_play_animation(
+    actor_id: u32,
+    animation_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            animation_id,
+            "PlayAnimation skipped — actor not in registry",
+        );
+        return;
+    };
+    let Some(zone_arc) = world.zone(handle.zone_id).await else {
+        return;
+    };
+    let sub = crate::packets::send::actor::build_play_animation_on_actor(actor_id, animation_id);
+    let recipients = crate::runtime::broadcast::broadcast_around_actor(
+        world,
+        registry,
+        &zone_arc,
+        actor_id,
+        sub.to_bytes(),
+    )
+    .await;
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        animation_id,
+        recipients,
+        "PlayAnimation applied",
+    );
+}
+
+/// `player:ChangeMusic(music_id)` — port of C# `Player::ChangeMusic`.
+/// Sends `0x006D SetMusic` to the player's client to override the zone's
+/// background music (used for combat themes, scripted scenes, etc.).
+/// Music track mode is 0 (immediate switch); MUSIC_CROSSFADE etc. are
+/// available constants but not currently parameterised — pmeteor's Lua
+/// API takes a single id.
+async fn apply_change_music(
+    player_id: u32,
+    music_id: u16,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            music_id,
+            "ChangeMusic skipped — player not in registry",
+        );
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let mut sub = crate::packets::send::misc::build_set_music(player_id, music_id, 0);
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        player = format!("0x{player_id:08X}"),
+        music_id,
+        "ChangeMusic applied",
+    );
+}
+
+/// `zone:DespawnActor(actor_id)` — port of C# `Zone::DespawnActor`.
+/// Broadcasts `0x00CB RemoveActor` to nearby players and removes the
+/// actor from the registry. Used by cinematics and content cleanup.
+async fn apply_despawn_actor(
+    _zone_id: u32,
+    actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            "DespawnActor skipped — actor not in registry",
+        );
+        return;
+    };
+    let zone = handle.zone_id;
+    let Some(zone_arc) = world.zone(zone).await else {
+        return;
+    };
+    let sub = crate::packets::send::actor::build_remove_actor(actor_id);
+    let recipients = crate::runtime::broadcast::broadcast_around_actor(
+        world,
+        registry,
+        &zone_arc,
+        actor_id,
+        sub.to_bytes(),
+    )
+    .await;
+    // Remove from registry after the broadcast so spatial-grid lookups
+    // during fan-out still see it.
+    registry.remove(actor_id).await;
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        zone,
+        recipients,
+        "DespawnActor applied",
     );
 }
 

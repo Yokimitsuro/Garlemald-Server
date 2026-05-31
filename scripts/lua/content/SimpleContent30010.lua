@@ -10,10 +10,18 @@ function onCreate(starterPlayer, contentArea, director)
 	--mob3 = contentArea:SpawnActor(2201407, "mob3", 375.125, 4.4, -703.591, -1.54);
     yda = GetWorldManager().SpawnBattleNpcById(6, contentArea);
     papalymo = GetWorldManager().SpawnBattleNpcById(7, contentArea);
-    --yda:ChangeState(2);
 	mob1 = GetWorldManager().SpawnBattleNpcById(3, contentArea);
 	mob2 = GetWorldManager().SpawnBattleNpcById(4, contentArea);
     mob3 = GetWorldManager().SpawnBattleNpcById(5, contentArea);
+    -- Per pmeteor quest_system SimpleContent30010.lua: put Yda + the 3
+    -- wolves in MainState 2 (active/engaged) so they stand up and are
+    -- rendered as hostile/combat. Without this they spawn in the
+    -- default passive state and lie down / aren't visible as enemies.
+    -- Papalymo (caster) is intentionally left at the default state.
+    yda:ChangeState(2);
+    mob1:ChangeState(2);
+    mob2:ChangeState(2);
+    mob3:ChangeState(2);
 	-- Pmeteor's SimpleContent30010.lua does NOT add NPCs to the player's
 	-- party (only to the content director group via director:AddMember
 	-- below). Garlemald's variant previously called
