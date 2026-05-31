@@ -8,7 +8,7 @@ name: Release
 #      `release:minor` / `release:major` label,
 #   3. rewrites [workspace.package].version in the root Cargo.toml (members
 #      inherit it via version.workspace = true) and syncs Cargo.lock,
-#   4. commits that back to `main` as `chore(release): vX.Y.Z [skip ci]`,
+#   4. commits that back to `main` as `chore(release): vX.Y.Z`,
 #   5. pushes the matching annotated vX.Y.Z tag, and
 #   6. publishes a GitHub Release with auto-generated notes.
 #
@@ -19,9 +19,10 @@ name: Release
 # bypasses the required checks because `enforce_admins` is off. Keep enforce_admins
 # off, or the bump push will be rejected.
 #
-# Loop guard: a PAT push DOES re-trigger workflows (unlike GITHUB_TOKEN), so the
-# bump commit carries `[skip ci]` (skips this run) and the job also has an `if`
-# guard that ignores our own release commits as a backstop.
+# Loop guard: a PAT push DOES re-trigger workflows (unlike GITHUB_TOKEN). The bump
+# commit is deliberately NOT marked `[skip ci]` — that would also suppress the
+# tag-push run that fires the binary-release workflow (release-binaries.yml, issue
+# #15). Instead the bump loop is broken by the bot-identity `if` guard on the job.
 on:
   push:
     branches: [main]
@@ -42,9 +43,11 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    # Backstop loop guard (the primary guard is [skip ci] on the bump commit, which
-    # skips the run entirely). Gate on the bot IDENTITY rather than a message prefix
-    # so a human commit that happens to start with "chore(release):" still releases.
+    # Loop guard: the bump commit is authored by github-actions[bot] and its push to
+    # main re-triggers this workflow (PAT push). This `if` skips those bot commits so
+    # we don't loop — gating on bot IDENTITY (not a message prefix) so a human commit
+    # that happens to start with "chore(release):" still releases. (We intentionally
+    # avoid [skip ci], which would also block the tag-push that fires release-binaries.yml.)
     if: ${{ github.event.head_commit.author.email != '41898282+github-actions[bot]@users.noreply.github.com' }}
     steps:
       - name: Checkout main (full history + tags; PAT can push to protected main)
@@ -146,7 +149,10 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): ${tag} [skip ci]"
+          # NOT marked [skip ci] on purpose: the tag pushed below must trigger
+          # release-binaries.yml (issue #15), and [skip ci] would suppress that
+          # tag-push run. The bump loop is broken by the bot-identity `if` guard.
+          git commit -m "chore(release): ${tag}"
           git tag -a "${tag}" -m "${tag}"
           # All-or-nothing: never leave a tag without its bump commit (or vice versa).
           git push --atomic origin HEAD:main "refs/tags/${tag}" || {

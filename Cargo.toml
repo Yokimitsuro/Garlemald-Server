@@ -47,3 +47,4 @@ percent-encoding = "2"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = "symbols"        # shrink shipped release binaries (issue #15)

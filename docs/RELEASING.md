@@ -13,9 +13,13 @@ git tags. The **git tag `vX.Y.Z` is the source of truth**; the root
 2. picks a bump level (see below),
 3. rewrites `[workspace.package].version` in `Cargo.toml` and runs
    `cargo update --workspace` to sync `Cargo.lock`,
-4. commits that back to `main` as `chore(release): vX.Y.Z [skip ci]`,
+4. commits that back to `main` as `chore(release): vX.Y.Z`,
 5. pushes an annotated `vX.Y.Z` tag, and
 6. publishes a GitHub Release with auto-generated notes.
+
+That tag push then triggers **`release-binaries.yml`** (issue #15), which
+cross-compiles the four server binaries per platform and attaches the archives
++ SHA-256 checksums to the same Release — see [Binary releases](#binary-releases).
 
 After a release, `git describe --tags` on `main` and `[workspace.package].version`
 report the same `X.Y.Z`, and `cargo build` stamps every server binary with it.
@@ -74,10 +78,33 @@ part of issue #13).
 
 ## Loop prevention
 
-The bump commit message contains `[skip ci]`, which stops the PAT push from
-re-triggering this workflow (PAT pushes *do* re-trigger workflows, unlike the
-default token). The job also has an `if` guard that ignores commits whose message
-starts with `chore(release):`, as a backstop.
+A PAT push re-triggers workflows (unlike the default token), so the bump commit's
+push to `main` would re-run this workflow. That loop is broken by the job's `if`
+guard, which skips commits authored by `github-actions[bot]` (the release bot).
+
+The bump commit is **deliberately not** marked `[skip ci]`. `[skip ci]` would
+suppress not just this workflow but also the **tag-push** event — and the binary
+release (`release-binaries.yml`) triggers on that tag push, so a skip marker would
+silently prevent the per-platform binaries from ever building.
+
+## Binary releases
+
+When the SemVer step pushes a `vX.Y.Z` tag, **`.github/workflows/release-binaries.yml`**
+fires (`on: push: tags: ['v*.*.*']`, plus a manual `workflow_dispatch`). It:
+
+1. builds the four server binaries (`lobby-server`, `map-server`, `web-server`,
+   `world-server`) in `--release --locked` across a platform matrix
+   (`x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`,
+   `x86_64-pc-windows-msvc`),
+2. packages each platform into `garlemald-server-vX.Y.Z-<target>.tar.gz` (`.zip`
+   on Windows) with a matching `.sha256`,
+3. and attaches all archives + checksums to the existing `vX.Y.Z` Release
+   (idempotently, so re-runs replace assets rather than duplicating them).
+
+This only works because the SemVer step pushes the tag with `RELEASE_PAT` (a PAT
+push triggers downstream workflows) and the tagged commit is **not** `[skip ci]`.
+To (re)build assets for an existing tag, run the workflow manually via
+`workflow_dispatch` with the tag name.
 
 ## Seeding
 
