@@ -136,8 +136,8 @@ cargo test --workspace --locked
 
 1. **AGPL header on every new `.rs` file** (above).
 2. **Never cross-commit between repos.** This repo is one of several independent
-   git repositories in a shared workspace (`Garlemald-Client`, `ffxiv-actor-cli`,
-   …). Only ever commit here.
+   git repositories in a shared workspace (e.g. `Garlemald-Client`). Only ever
+   commit here.
 3. **Keep CI green** before raising a PR.
 4. **Branch off `develop`, PR into `develop`.**
 5. **Don't invent Lua engine bindings** — verify against `map-server/src/lua/`.

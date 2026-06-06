@@ -150,61 +150,22 @@ GARLEMALD_PACKET_LOG_PLAINTEXT=1 \
 
 ---
 
-## Booting into a known game state
-
-Getting from a cold server to "standing in a starting city, logged in" by hand is
-tedious. The **`fresh-start-*` orchestrator scripts** automate it end to end.
-
-> **These scripts live in the sibling [`ffxiv-actor-cli`](https://github.com/swstegall/Garlemald-Server)
-> repo, not in this one** — under `ffxiv-actor-cli/scripts/`. They drive the
-> whole stack (server + Garlemald Client + the Wine game) via the macOS UI
-> automation in that repo. Run them from the `ffxiv-actor-cli` checkout.
-
-| Script                      | End state                                                        |
-|-----------------------------|-----------------------------------------------------------------|
-| `fresh_start.sh`            | A brand-new character created from scratch (end of char creation) |
-| `fresh-start-limsa.sh`      | A pre-built character at the start of **Limsa Lominsa**          |
-| `fresh-start-gridania.sh`   | A pre-built character at the start of **Gridania**               |
-| `fresh-start-uldah.sh`      | A pre-built character at the start of **Ul'dah**                 |
-
-Each one: archives the current `data/` to a timestamped zip, restores the chosen
-seed state (or wipes for a from-scratch run), kills any running stack, rebuilds +
-starts the four servers, launches the client, mints a session via the web
-`/signup` or `/login` endpoint, drives the launcher's dev-session field, and runs
-the automation phases to reach the target state.
-
-Common env knobs (see the script headers for the full set):
-
-| Variable                          | Effect                                                       |
-|-----------------------------------|-------------------------------------------------------------|
-| `PROFILE=debug`                   | Build/run debug instead of release                          |
-| `SKIP_CLIENT=1`                   | Bring the servers up but don't launch the game client       |
-| `SKIP_AUTOMATION=1`               | Boot servers + client but don't drive signup/login          |
-| `GARLEMALD_PACKET_LOG_DIR=<dir>`  | Route packet logs into a capture directory                  |
-| `GARLEMALD_PACKET_LOG_PLAINTEXT=1`| Also capture pre-encryption bytes                           |
-
-```sh
-cd ../ffxiv-actor-cli
-./scripts/fresh-start-limsa.sh
-```
-
----
-
-## Resetting save state
+## Resetting save state and booting into a known city
 
 The server's entire live state is the SQLite **`data/`** directory
 (`garlemald.db` plus its `-wal`/`-shm` sidecars). "Saving" and "restoring" the
-server is just zipping and unzipping that directory.
+server — and dropping straight into a specific starting city — is just zipping and
+unzipping that directory.
 
 `data-backups/` holds two kinds of zip:
 
-- **Timestamped snapshots** — `data-YYYYMMDD-HHMMSS.zip`, written automatically by
-  the fresh-start scripts before they wipe/restore. These are your undo history.
+- **Timestamped snapshots** — `data-YYYYMMDD-HHMMSS.zip`: point-in-time archives of
+  `data/`. Your undo history.
 - **Canonical seed states** — `data-limsaStart.zip`, `data-gridaniaStart.zip`,
-  `data-ulDahStart.zip`: a known account + character placed at the start of each
-  city. The fresh-start scripts restore from these. A byte-identical copy lives
-  at the workspace root in `data-backups-backup/` in case `data-backups/` is ever
-  blown away.
+  `data-ulDahStart.zip`: a known account with a character placed at the start of
+  each starting city. Restore one to boot straight into that city. A
+  byte-identical copy lives at the workspace root in `data-backups-backup/` in
+  case `data-backups/` is ever blown away.
 
 ### Checkpoint the current state
 
@@ -218,16 +179,18 @@ zip -rq -X data-backups/data-$(date +%Y%m%d-%H%M%S).zip data
 
 ### Restore a snapshot or seed
 
-Delete the live state and unzip the archive you want (each zip contains a
-top-level `data/` directory, so unzip from the repo root):
+Delete the live state, unzip the archive you want (each zip contains a top-level
+`data/` directory, so unzip from the repo root), then start the stack:
 
 ```sh
 rm -rf data
 unzip -q -o data-backups/data-limsaStart.zip -x '__MACOSX/*'
+./scripts/run-all.sh
 ```
 
-The next server boot picks up the restored database. (The `fresh-start-*` scripts
-do exactly this: snapshot → `rm -rf data` → unzip the chosen seed → boot.)
+The server boots against the restored database — for the seed states above, that
+puts a character at the start of the chosen city; log in with the seed's account
+and connect a client.
 
 > Deleting `data/` with **no** restore is also fine — the next boot recreates an
 > empty database from the bundled schema, giving you a clean server with no

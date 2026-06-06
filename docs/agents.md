@@ -110,8 +110,8 @@ agent already knows them, but you should verify the agent honoured them:
   verbatim from an existing sibling file. Markdown docs do **not** carry the
   header. If the change ports code from a new upstream, extend `NOTICE.md`.
 - **Never cross-commit between repos.** Garlemald Server lives in a multi-repo
-  workspace alongside `Garlemald-Client`, `ffxiv-actor-cli`, and others. Each is
-  an independent git repository — an agent must only commit to this one.
+  workspace alongside `Garlemald-Client` and others. Each is an independent git
+  repository — an agent must only commit to this one.
 - **Keep CI green before raising a PR.** No PR with a failing gate.
 - **Don't invent engine bindings.** When touching the Lua runtime, confirm a
   binding really exists in the engine before relying on it — the upstream C#
