@@ -156,6 +156,33 @@ garlemald-server/
 └── logs/              # Per-server log files
 ```
 
+## Documentation
+
+New contributor? These docs take you from zero to running the stack to opening a
+pull request:
+
+- **[Contributing guide](CONTRIBUTING.md)** — request access, pick an issue, fork,
+  and open a PR (start here).
+- **[Architecture](docs/architecture.md)** — what each binary owns, how the
+  servers talk to each other, and the client wire protocol.
+- **[Lua runtime](docs/lua-runtime.md)** — the `map-server` content engine:
+  scripts, the coroutine scheduler, the hook surface, and the command pipeline.
+- **[Developer environment](docs/dev-environment.md)** — build/run, ports,
+  `RUST_LOG` and packet-log toggles, and resetting save state.
+- **[Working an issue with an AI agent](docs/agents.md)** — Claude / OpenAI setup;
+  the in-repo [`CLAUDE.md`](CLAUDE.md) / [`AGENTS.md`](AGENTS.md) tell the agent
+  the house rules.
+- **[Releasing](docs/RELEASING.md)** — the `develop` → `main` branching model and
+  release automation.
+
+## Contributing
+
+Contributions are welcome. The short version: ask for collaborator + project-board
+access on [Discord](https://discord.gg/CVjwWs6jnX), pick an issue from the board's
+**Ready** column, branch off **`develop`**, keep CI green
+(`fmt` / `clippy` / `build` / `test`), and open a PR into **`develop`**. The full
+walkthrough is in **[`CONTRIBUTING.md`](CONTRIBUTING.md)**.
+
 ## Attribution and licensing
 
 Garlemald Server stands on the shoulders of
