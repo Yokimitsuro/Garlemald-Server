@@ -7779,6 +7779,38 @@ impl PacketProcessor {
         };
         let actor_id = handle.actor_id;
 
+        // Resume a parked director coroutine waiting on the cinematic's
+        // `_WAIT_EVENT` yield (a `callClientFunction(...)` in the director's
+        // `onEventStarted`). The 1.x client posts `0x012E EventUpdate` when the
+        // cinematic finishes; pmeteor resumes the coroutine here (`Player.
+        // UpdateEvent` → `LuaEngine.OnEventUpdate` → `coroutine.Resume`), which
+        // runs the director's continuation — its own `player:EndEvent()`,
+        // `kickEventContinue`, the tutorial widgets, and crucially the steps
+        // that hand movement + the active-mode/F command back to the player.
+        // garlemald previously only faked the EndEvent via the event-session
+        // echo below and NEVER resumed the coroutine (the referenced
+        // `dispatch_event_updated` never existed), so the SEQ_005 director
+        // parked forever after the first cinematic → softlock (can't move, F
+        // inert). When a coroutine IS resumed it emits its own EndEvent, so we
+        // skip the event-session echo to avoid a double EndEvent.
+        // (Garlemald-Server #28.)
+        let resumed = self
+            .lua
+            .as_ref()
+            .and_then(|lua| lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new()))
+            .filter(|cmds| !cmds.is_empty());
+        if let Some(cmds) = resumed {
+            tracing::debug!(
+                player = actor_id,
+                commands = cmds.len(),
+                "EventUpdate resumed parked director coroutine",
+            );
+            Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
+            return Ok(());
+        }
+
+        // No parked coroutine — fall back to the event-session echo (the prior
+        // behaviour, kept for non-director EventUpdates).
         let mut outbox = EventOutbox::new();
         {
             let chara = handle.character.read().await;
