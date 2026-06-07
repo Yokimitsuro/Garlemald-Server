@@ -467,6 +467,10 @@ pub async fn apply_runtime_lua_command(
             apply_change_music(player_id, music_id, registry, world).await;
             true
         }
+        LC::SendDataPacket { player_id, params } => {
+            apply_send_data_packet(player_id, &params, registry, world).await;
+            true
+        }
         LC::DespawnActor { zone_id, actor_id } => {
             apply_despawn_actor(zone_id, actor_id, registry, world).await;
             true
@@ -881,6 +885,56 @@ async fn apply_change_music(
         player = format!("0x{player_id:08X}"),
         music_id,
         "ChangeMusic applied",
+    );
+}
+
+/// `player:SendDataPacket(dataType, ...)` — port of C#
+/// `Player::SendDataPacket` (emits a 0x0133 GenericDataPacket). Marshals the
+/// Lua args to a LuaParam list and ships them to the player's client. This is
+/// what `tutorial.lua`'s `startTutorialMode` / `openTutorialWidget` /
+/// `showTutorialSuccessWidget` / `closeTutorialWidget` and `"attention"`
+/// messages ride on. The SEQ_005 director's first action is
+/// `startTutorialMode(player)` = `SendDataPacket(9)`, which arms the client's
+/// active-mode (F / draw-weapon) toggle; without it the client never lets the
+/// player press F and the director hangs on `waitForSignal("playerActive")`.
+///
+/// IMPORTANT — target_id MUST be the player's ACTOR id, not the session id.
+/// The 1.x client silently drops 0x0133 subpackets whose
+/// `SubPacketHeader.target_id` != the receiving actor's id (the same gotcha
+/// `send_quest_journal_data` documents for the qtdata 0x0133). `build_set_music`
+/// above gets away with `set_target_id(session_id)` because 0x006D isn't gated
+/// that way; 0x0133 is. (Garlemald-Server #28.)
+async fn apply_send_data_packet(
+    player_id: u32,
+    params: &[crate::lua::command::LuaCommandArg],
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            "SendDataPacket skipped — player not in registry",
+        );
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let lua_params: Vec<common::luaparam::LuaParam> = params
+        .iter()
+        .map(crate::event::lua_bridge::arg_to_lua_param)
+        .collect();
+    let mut sub = crate::packets::send::player::build_generic_data(player_id, &lua_params);
+    sub.set_target_id(player_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        player = format!("0x{player_id:08X}"),
+        params = params.len(),
+        "SendDataPacket applied (0x0133 GenericData)",
     );
 }
 

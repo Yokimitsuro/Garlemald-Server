@@ -69,6 +69,23 @@ pub enum LuaCommand {
         player_id: u32,
         music_id: u16,
     },
+    /// `player:SendDataPacket(dataType, ...)` — port of C#
+    /// `Player::SendDataPacket` (`Player.cs` → `GenericDataPacket`,
+    /// opcode 0x0133). Emits a 0x0133 GenericData subpacket carrying the
+    /// variadic args as a LuaParam list. This is how the tutorial helpers
+    /// in `tutorial.lua` drive the client: `startTutorialMode` =
+    /// `SendDataPacket(9)` (puts the client into tutorial mode + arms the
+    /// active-mode / draw-weapon F toggle), `openTutorialWidget` =
+    /// `SendDataPacket(4, nil, nil, ctrl, widget)`, `showTutorialSuccessWidget`
+    /// = `SendDataPacket(2, nil, nil, textId)`, `closeTutorialWidget` =
+    /// `SendDataPacket(5)`, plus `SendDataPacket("attention", worldMaster,
+    /// "", textId, n)`. Without it the SEQ_005 director's
+    /// `startTutorialMode(player)` is silently dropped and the client never
+    /// lets the player press F. (Garlemald-Server #28.)
+    SendDataPacket {
+        player_id: u32,
+        params: Vec<LuaCommandArg>,
+    },
     PlayAnimation {
         actor_id: u32,
         animation_id: u32,

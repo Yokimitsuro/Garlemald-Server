@@ -2184,24 +2184,31 @@ impl UserData for LuaPlayer {
                 Ok(())
             },
         );
-        methods.add_method(
-            "SendDataPacket",
-            |_,
-             this,
-             (_attention, _sender, _param, _text_id, _rest): (
-                Value,
-                Value,
-                Value,
-                Option<u32>,
-                mlua::MultiValue,
-            )| {
-                // `player:SendDataPacket("attention", worldmaster, "", 25225, …)`
-                // in retail. We log only — the real packet builder lives
-                // on the cross-cutting sprint's TODO list.
-                let _ = &this.snapshot.actor_id;
-                Ok(())
-            },
-        );
+        methods.add_method("SendDataPacket", |_, this, varargs: mlua::MultiValue| {
+            // Port of C# `Player::SendDataPacket` (0x0133 GenericData).
+            // Marshal the FULL variadic arg list generically (not just a
+            // leading text id) so every call shape works:
+            //   startTutorialMode      -> SendDataPacket(9)
+            //   showTutorialSuccess    -> SendDataPacket(2, nil, nil, textId)
+            //   openTutorialWidget     -> SendDataPacket(4, nil, nil, ctrl, widget)
+            //   closeTutorialWidget    -> SendDataPacket(5)
+            //   "attention" message    -> SendDataPacket("attention", wm, "", id, n)
+            // The applier (apply_send_data_packet) maps these to LuaParams
+            // and ships a 0x0133 with target_id = the player's actor id.
+            // (Garlemald-Server #28.)
+            let params: Vec<super::command::LuaCommandArg> = varargs
+                .iter()
+                .map(super::scheduler::value_to_command_arg)
+                .collect();
+            push(
+                &this.queue,
+                LuaCommand::SendDataPacket {
+                    player_id: this.snapshot.actor_id,
+                    params,
+                },
+            );
+            Ok(())
+        });
         methods.add_method("ChangeMusic", |_, this, music_id: u16| {
             push(
                 &this.queue,

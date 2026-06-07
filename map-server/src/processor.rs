@@ -2135,6 +2135,19 @@ impl PacketProcessor {
         }
         bnpc.npc.character.chara.level = spawn.min_level.clamp(1, i16::MAX as u32) as i16;
 
+        // Stamp the visual model + equipment from `gamedata_actor_appearance`,
+        // exactly as the populace `apply_spawn_actor` path does. Without this
+        // the BattleNpc keeps the constructor defaults (model_id = 0, all 28
+        // appearance slots = 0), so the zone-in 0x00D6 SetActorAppearance ships
+        // an empty model: creature mobs (wolves) have no mesh to draw and are
+        // invisible, and humanoid allies (Yda/Papalymo) fall back to an empty
+        // skeleton that renders as a knocked-out/downed pose. (Garlemald #28.)
+        if let Ok(Some(app)) = self.db.load_npc_appearance(spawn.actor_class_id).await {
+            let (model_id, slots) = app.pack();
+            bnpc.npc.character.chara.model_id = model_id;
+            bnpc.npc.character.chara.appearance_ids = slots;
+        }
+
         let actor_id = bnpc.actor_id();
         if actor_id != expected_actor_id {
             tracing::warn!(
@@ -7352,30 +7365,47 @@ impl PacketProcessor {
                 let c = handle.character.read().await;
                 c.event_session.clone()
             };
-            let mut outbox = crate::event::outbox::EventOutbox::new();
-            crate::event::lua_bridge::translate_lua_commands_into_outbox(
-                &rest,
-                &event_session_snapshot,
-                &mut outbox,
-            );
-            for e in outbox.drain() {
-                Box::pin(dispatch_event_event(
-                    &e,
-                    &self.registry,
-                    &self.world,
-                    &self.db,
-                    self.lua.as_ref(),
-                ))
-                .await;
+            // Process commands in their ORIGINAL order, routing each to
+            // exactly one path. Order is load-bearing on the wire: pmeteor
+            // sends `SendDataPacket(9)` (startTutorialMode — a runtime/0x0133
+            // command) BEFORE the `processTtrBtl001` cinematic
+            // (RunEventFunction/0x0130), while later it sends the tutorial-
+            // widget SendDataPackets AFTER their cinematic. A two-pass split
+            // (all events then all runtime, or vice-versa) inverts one of
+            // those, so we interleave per-command instead. Event-flavoured
+            // commands (RunEventFunction/EndEvent) go through the event bridge;
+            // everything else (SendDataPacket, ChangeState, KickEvent capture,
+            // …) through the runtime drain. (Garlemald-Server #28.)
+            for c in rest {
+                let mut outbox = crate::event::outbox::EventOutbox::new();
+                crate::event::lua_bridge::translate_lua_commands_into_outbox(
+                    std::slice::from_ref(&c),
+                    &event_session_snapshot,
+                    &mut outbox,
+                );
+                let events = outbox.drain();
+                if events.is_empty() {
+                    crate::runtime::quest_apply::apply_runtime_lua_command(
+                        c,
+                        &self.registry,
+                        &self.db,
+                        &self.world,
+                        self.lua.as_ref(),
+                    )
+                    .await;
+                } else {
+                    for e in events {
+                        Box::pin(dispatch_event_event(
+                            &e,
+                            &self.registry,
+                            &self.world,
+                            &self.db,
+                            self.lua.as_ref(),
+                        ))
+                        .await;
+                    }
+                }
             }
-            crate::runtime::quest_apply::apply_runtime_lua_commands(
-                rest,
-                &self.registry,
-                &self.db,
-                &self.world,
-                self.lua.as_ref(),
-            )
-            .await;
         }
         if let Some(lua) = self.lua.as_ref() {
             for name in signals {
