@@ -2999,6 +2999,24 @@ impl PacketProcessor {
             .send_bytes(crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes())
             .await;
 
+        // Give the client a frame to process DeleteAllActors and run its
+        // map-element TEARDOWN before the SetMap lands. Per the decompiled
+        // client (MapLayoutElement vtable slot 9, FUN_0059ced0): a SetMap only
+        // reloads the scene when its region != the resident-region field
+        // [+0x94] (or a force-reload latch [+0xbc] is set). On this same-zone
+        // content warp the content region == the resident region (both 106), so
+        // the ONLY way to reload at 106 is for [+0x94] to first be cleared to 0
+        // — which the client's own teardown (FUN_0059d0d0, driven by the
+        // actor-wipe / LockUpdates cycle) does on a LATER frame. If
+        // DeleteAllActors and SetMap are processed in the same client frame,
+        // [+0x94] is still 106 when SetMap(106) arrives → same-region →
+        // early-return → no reload → "Now Loading" hang. This wall-clock gap
+        // lets the teardown run first, so SetMap(106) sees 106 != 0 → reload,
+        // committing a VALID resident region 106 (unlike the old high-16 region
+        // tag, which forced the reload but left [+0x94]=0x1006A and broke the
+        // post-cinematic movement / active-mode-F unlock). (Garlemald #28.)
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
         // 4. Replay the zone-in bundle. `send_zone_in_bundle` reads from
         //    the session + character we just updated, so the bundle
         //    spawns the player at the content-area coords.
