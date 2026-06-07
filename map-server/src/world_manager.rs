@@ -1790,12 +1790,38 @@ impl WorldManager {
         // registration (0x016B / 0x0136) is still deferred — Meteor
         // only emits those for NPCs with parsed event tables, which
         // we'll wire when Lua event-condition parsing lands.
+        // When the player is inside a content instance (e.g. the SEQ_005
+        // man0g01 tutorial), suppress base-zone populace from the instance
+        // view. garlemald keeps ALL actors in the parent zone's single `core`
+        // pool so the combat-AI arena can see the content BattleNpcs (see the
+        // project_garlemald_seq005_b1 note — moving them to a separate pool
+        // empties the arena and breaks aggro). The cost is that the base-zone
+        // quest ENPCs (the SEQ_000 intro Yda class 1000009 / Papalymo 1000010
+        // placed by `quest:SetENpc`) would otherwise leak into the instance
+        // alongside the content fighters, producing TWO Yda + TWO Papalymo.
+        // pmeteor's per-Area actor pool makes them structurally invisible; we
+        // emulate that on the wire by dropping non-content-band actors from the
+        // instance fan-out. Content-script-spawned actors carry bit 18
+        // (0x40000) in their actor-number (SpawnBattleNpcById = 0x40000|id,
+        // SpawnActor = 0x60000|suffix); base-zone populace use small
+        // actor-numbers (1,2,3,…). Players are always kept; masters/directors
+        // are sent separately (not in this list). (Garlemald-Server #28.)
+        let in_content_instance = session
+            .active_content_script
+            .as_ref()
+            .is_some_and(|active| session.current_zone_id == active.parent_zone_id);
+        const CONTENT_ACTOR_BAND_BIT: u32 = 0x0004_0000;
         let neighbours: Vec<(u32, crate::zone::area::ActorKind)> = {
             let z = zone_arc.read().await;
             z.core
                 .actors_around(actor_id, 50.0)
                 .into_iter()
                 .filter(|a| a.actor_id != actor_id)
+                .filter(|a| {
+                    !in_content_instance
+                        || matches!(a.kind, crate::zone::area::ActorKind::Player)
+                        || (a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
+                })
                 .map(|a| (a.actor_id, a.kind))
                 .collect()
         };

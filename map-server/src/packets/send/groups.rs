@@ -280,7 +280,58 @@ fn build_group_members_n(
     SubPacket::new(opcode, source_actor_id, data)
 }
 
-/// Content (instance/duty) member variants — shape identical, different opcodes.
+/// Per-member stride for the CONTENT (instance/duty) group list — distinct
+/// from the party `GROUP_MEMBER_SLOT_BYTES` (0x30). pmeteor
+/// `ContentMembersX08Packet.cs` writes a 12-byte entry: `(actorId u32,
+/// 1001 layoutId u32, 1 u32)`.
+const CONTENT_MEMBER_SLOT_BYTES: usize = 0x0C;
+
+/// Content (instance/duty) member list body. CRITICAL: this is NOT the party
+/// (0x017F) layout — the 1.x client parses the content opcodes (0x0183-0x0186)
+/// with a 12-byte stride `(actorId, 1001, 1)`, count written only when it fits
+/// (X08 at body 0x70; X16/X32/X64 fill the body so the count is omitted, which
+/// the offset guard below reproduces — matching pmeteor exactly). The prior
+/// code reused `build_group_members_n` (the 0x30 party stride), so the client
+/// misread the content roster and Yda/Papalymo never appeared in the panel.
+/// (Garlemald-Server #28; pmeteor `ContentMembersX08Packet.cs:49-62`.)
+#[allow(clippy::too_many_arguments)]
+fn build_content_members_n(
+    source_actor_id: u32,
+    location_code: u64,
+    sequence_id: u64,
+    members: &[GroupMember],
+    list_offset: &mut usize,
+    cap: usize,
+    opcode: u16,
+    packet_size: usize,
+) -> SubPacket {
+    let mut data = body(packet_size);
+    let max = members.len().saturating_sub(*list_offset).min(cap);
+    {
+        let mut c = Cursor::new(&mut data[..]);
+        c.write_u64::<LittleEndian>(location_code).unwrap();
+        c.write_u64::<LittleEndian>(sequence_id).unwrap();
+    }
+    for i in 0..max {
+        let off = 0x10 + (CONTENT_MEMBER_SLOT_BYTES * i);
+        let mut c = Cursor::new(&mut data[off..off + CONTENT_MEMBER_SLOT_BYTES]);
+        c.write_u32::<LittleEndian>(members[*list_offset + i].actor_id)
+            .unwrap();
+        c.write_u32::<LittleEndian>(1001).unwrap(); // layout id (pmeteor constant)
+        c.write_u32::<LittleEndian>(1).unwrap();
+    }
+    // Count at body 0x10 + 0xC*cap (0x70 for X08). For X16/X32/X64 this offset
+    // lands exactly at the end of the body, so the guard skips it — pmeteor
+    // omits the count for those variants too.
+    let count_offset = 0x10 + (CONTENT_MEMBER_SLOT_BYTES * cap);
+    if count_offset + 4 <= data.len() {
+        data[count_offset..count_offset + 4].copy_from_slice(&(max as u32).to_le_bytes());
+    }
+    *list_offset += max;
+    SubPacket::new(opcode, source_actor_id, data)
+}
+
+/// Content (instance/duty) member variants — distinct 0xC stride per member.
 pub fn build_content_members_x08(
     source_actor_id: u32,
     location_code: u64,
@@ -288,7 +339,7 @@ pub fn build_content_members_x08(
     members: &[GroupMember],
     list_offset: &mut usize,
 ) -> SubPacket {
-    build_group_members_n(
+    build_content_members_n(
         source_actor_id,
         location_code,
         sequence_id,
@@ -306,7 +357,7 @@ pub fn build_content_members_x16(
     members: &[GroupMember],
     list_offset: &mut usize,
 ) -> SubPacket {
-    build_group_members_n(
+    build_content_members_n(
         source_actor_id,
         location_code,
         sequence_id,
@@ -324,7 +375,7 @@ pub fn build_content_members_x32(
     members: &[GroupMember],
     list_offset: &mut usize,
 ) -> SubPacket {
-    build_group_members_n(
+    build_content_members_n(
         source_actor_id,
         location_code,
         sequence_id,
@@ -342,7 +393,7 @@ pub fn build_content_members_x64(
     members: &[GroupMember],
     list_offset: &mut usize,
 ) -> SubPacket {
-    build_group_members_n(
+    build_content_members_n(
         source_actor_id,
         location_code,
         sequence_id,
@@ -789,6 +840,46 @@ mod tests {
 
         // numEntries u32 then 4 bytes trailing pad.
         assert_eq!(&body[0x290..0x298], &[0x01, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn content_members_x08_uses_0xc_stride_not_party_layout() {
+        // 0x0183 ContentMembersX08 must use pmeteor's 12-byte stride
+        // (actorId, 1001, 1) with the count at body 0x70 — NOT the 0x30 party
+        // stride. Reusing the party builder made the 1.x client misread the
+        // content roster so Yda/Papalymo never appeared. (Garlemald #28.)
+        let members = vec![
+            GroupMember {
+                actor_id: 0x0000_0001,
+                ..Default::default()
+            },
+            GroupMember {
+                actor_id: 0x4534_0006,
+                ..Default::default()
+            },
+            GroupMember {
+                actor_id: 0x4534_0007,
+                ..Default::default()
+            },
+        ];
+        let mut offset = 0usize;
+        let pkt = build_content_members_x08(0x0000_0001, 0xA6, 0x01, &members, &mut offset);
+        assert_eq!(pkt.data.len(), 0x1B8 - 0x20);
+        // Member 0 at 0x10: actorId=1, layout=1001, 1.
+        assert_eq!(
+            &pkt.data[0x10..0x1C],
+            &[1, 0, 0, 0, 0xE9, 3, 0, 0, 1, 0, 0, 0]
+        );
+        // Member 1 at 0x1C (0x10 + 0xC): actorId=0x45340006.
+        assert_eq!(
+            &pkt.data[0x1C..0x28],
+            &[0x06, 0x00, 0x34, 0x45, 0xE9, 3, 0, 0, 1, 0, 0, 0]
+        );
+        // Member 2 at 0x28: actorId=0x45340007.
+        assert_eq!(&pkt.data[0x28..0x2C], &[0x07, 0x00, 0x34, 0x45]);
+        // Count at body 0x70.
+        assert_eq!(&pkt.data[0x70..0x74], &[3, 0, 0, 0]);
+        assert_eq!(offset, 3);
     }
 
     #[test]
