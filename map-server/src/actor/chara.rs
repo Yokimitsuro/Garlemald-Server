@@ -641,9 +641,15 @@ impl Character {
         matches!(self.chara.class as u8, 39..=41)
     }
 
-    /// True if this actor is still engaged in combat (main-state bit set).
+    /// True if this actor is actively engaged in combat — i.e. it has a live
+    /// `AttackState`. Delegates to `AIContainer::is_engaged()` to match pmeteor
+    /// (`Character.IsEngaged()` → `aiContainer.IsEngaged()`). The previous
+    /// `current_target != INVALID_ACTORID` test was structurally always-true
+    /// for any actor that never receives a `current_target` (the field defaults
+    /// to `0`, and `INVALID_ACTORID == 0xC0000000`), which made every NPC read
+    /// as "engaged" and broke the content-tutorial engagement gate. (#28.)
     pub fn is_engaged(&self) -> bool {
-        self.chara.current_target != crate::actor::INVALID_ACTORID
+        self.ai_container.is_engaged()
     }
 
     /// Generic is-valid-target helper mirroring the ValidTarget bitmask in

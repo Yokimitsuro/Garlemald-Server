@@ -10,25 +10,6 @@ function init()
 	return "/Director/Quest/QuestDirectorMan0g001";
 end
 
-function onCreateContentArea(players, director, contentArea, contentGroup)
-	-- Per pmeteor quest_system QuestDirectorMan0g001.lua: register the
-	-- player + director + content NPCs into the CONTENT GROUP so they
-	-- appear in the client's content-group / party panel (Yda + Papalymo
-	-- visible as group members in the retail screenshot). The actors
-	-- themselves are spawned by SimpleContent30010.onCreate before this
-	-- hook runs.
-	for _, player in pairs(players) do
-		contentGroup:AddMember(player);
-	end;
-	contentGroup:AddMember(director);
-	if yda       ~= nil then contentGroup:AddMember(yda); end
-	if papalymo  ~= nil then contentGroup:AddMember(papalymo); end
-	if mob1      ~= nil then contentGroup:AddMember(mob1); end
-	if mob2      ~= nil then contentGroup:AddMember(mob2); end
-	if mob3      ~= nil then contentGroup:AddMember(mob3); end
-	director:StartContentGroup();
-end
-
 function onEventStarted(player, actor, triggerName)
 	-- Ported from pmeteor quest_system QuestDirectorMan0g001.lua. The
 	-- prior Garlemald port over-engineered this with `waitForSignal`s
@@ -107,9 +88,15 @@ end
 function onEventUpdate(player, npc)
 end
 
-function onCommand(player, command)	
+function onCommand(player, command)
 end
 
-function main(director, contentGroup)
-    onCreateContentArea(director:GetPlayerMembers(), director, director:GetZone(), contentGroup);
-end;
+-- NOTE: this director intentionally defines NO `main` (and no
+-- `onCreateContentArea`). pmeteor's QuestDirectorMan0g001 has neither — its
+-- `onCreateContentArea` is orphan/dead code never called from C#. The content
+-- group's spawning + roster are owned entirely by SimpleContent30010.lua's
+-- `onCreate` (director:AddMember ×7), and the content-group wire trio is
+-- emitted Rust-side from apply_do_zone_change_content. A `main(director,
+-- contentGroup)` here used to crash on a nil `contentGroup` (the engine only
+-- passes the director to a director's main), aborting before StartContentGroup
+-- with no effect on the wire. (Garlemald-Server #28.)

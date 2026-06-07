@@ -112,6 +112,13 @@ impl UserData for LuaActor {
         methods.add_method("GetActorClassId", |_, this, _: ()| Ok(this.actor_id));
         methods.add_method("GetZoneID", |_, this, _: ()| Ok(this.zone_id));
         methods.add_method("GetState", |_, this, _: ()| Ok(this.state));
+        // `IsDead()` — true when the actor is in the DEAD main-state. Used by
+        // content scripts to detect when the tutorial wolves are defeated
+        // (the snapshot `state` is refreshed each tick from the live actor).
+        // (Garlemald-Server #28.)
+        methods.add_method("IsDead", |_, this, _: ()| {
+            Ok(this.state == crate::actor::MAIN_STATE_DEAD)
+        });
         methods.add_method("GetPos", |_, this, _: ()| {
             Ok((
                 this.pos.0,
@@ -2177,24 +2184,31 @@ impl UserData for LuaPlayer {
                 Ok(())
             },
         );
-        methods.add_method(
-            "SendDataPacket",
-            |_,
-             this,
-             (_attention, _sender, _param, _text_id, _rest): (
-                Value,
-                Value,
-                Value,
-                Option<u32>,
-                mlua::MultiValue,
-            )| {
-                // `player:SendDataPacket("attention", worldmaster, "", 25225, …)`
-                // in retail. We log only — the real packet builder lives
-                // on the cross-cutting sprint's TODO list.
-                let _ = &this.snapshot.actor_id;
-                Ok(())
-            },
-        );
+        methods.add_method("SendDataPacket", |_, this, varargs: mlua::MultiValue| {
+            // Port of C# `Player::SendDataPacket` (0x0133 GenericData).
+            // Marshal the FULL variadic arg list generically (not just a
+            // leading text id) so every call shape works:
+            //   startTutorialMode      -> SendDataPacket(9)
+            //   showTutorialSuccess    -> SendDataPacket(2, nil, nil, textId)
+            //   openTutorialWidget     -> SendDataPacket(4, nil, nil, ctrl, widget)
+            //   closeTutorialWidget    -> SendDataPacket(5)
+            //   "attention" message    -> SendDataPacket("attention", wm, "", id, n)
+            // The applier (apply_send_data_packet) maps these to LuaParams
+            // and ships a 0x0133 with target_id = the player's actor id.
+            // (Garlemald-Server #28.)
+            let params: Vec<super::command::LuaCommandArg> = varargs
+                .iter()
+                .map(super::scheduler::value_to_command_arg)
+                .collect();
+            push(
+                &this.queue,
+                LuaCommand::SendDataPacket {
+                    player_id: this.snapshot.actor_id,
+                    params,
+                },
+            );
+            Ok(())
+        });
         methods.add_method("ChangeMusic", |_, this, music_id: u16| {
             push(
                 &this.queue,
@@ -2609,34 +2623,65 @@ impl UserData for LuaPlayer {
 
         // --- Equipment / inventory ------------------------------------------
         // `player:GetEquipment():Set(slots, srcPositions, srcPackage)` —
-        // the script chain in `player.lua::initClassItems` does
+        // the script chain in `player.lua::equipClassItems` does
         // `player:GetEquipment():Set({0,10,12,14,15}, {0,1,2,3,4}, 0)`
-        // to bind freshly-added items to gear slots. Return a stub
-        // table whose `Set` is a no-op so the chain doesn't error;
-        // real equipment refresh would route through the existing
-        // SendAppearance path with `appearance_ids` mutated to
-        // reflect the new gear. Smoke-test surfaced this in commit
-        // `81f7218`'s wake — initClassItems ran past
-        // `state_mainSkill[0]` once charaWork was bound, then
-        // tripped on `nil:Set`.
+        // to bind freshly-added items to gear slots. Garlemald-Server #28:
+        // this used to be a logged no-op, which left a fresh Gladiator's
+        // Weathered Gladius sitting in the bag, never equipped — so the
+        // client could not enter Active mode (press F) and the SEQ_005
+        // combat tutorial softlocked. Now we collect the two index tables
+        // and push an `EquipFromPackage` command; the runtime applier
+        // (`apply_equip_from_package`) resolves each bag slot to its
+        // serverItemId, equips it through the existing `DbEquip` path
+        // (DB write + stat recalc), and re-sends the 0x014E equipment
+        // packet so the weapon shows + is drawable.
+        //
+        // `src_package` is the 4th arg; the table arity (3 tables +
+        // optional u32) is unchanged so the call signature stays
+        // backwards-compatible.
         methods.add_method("GetEquipment", |lua, this, _: ()| {
             let t = lua.create_table()?;
             let actor_id = this.snapshot.actor_id;
+            let queue = this.queue.clone();
             // `:Set(slots, srcPositions, srcPackage)` — bulk-bind
-            // bag-slot items to gear slots (used by initClassItems).
+            // bag-slot items to gear slots (used by equipClassItems).
             let set_fn = lua.create_function(
-                move |_, (_self, slots, src_positions, src_package): (
+                move |_,
+                      (_self, slots, src_positions, src_package): (
                     mlua::Table,
                     mlua::Table,
                     mlua::Table,
                     Option<u32>,
                 )| {
+                    // Collect the two positional index tables into Vecs.
+                    // Lua passes 1-indexed sequence tables; `Table::sequence_values`
+                    // walks 1..#t so the order matches the script literal.
+                    let gear_slots: Vec<u16> = slots
+                        .sequence_values::<i64>()
+                        .filter_map(|v| v.ok())
+                        .map(|v| v as u16)
+                        .collect();
+                    let src_positions: Vec<u16> = src_positions
+                        .sequence_values::<i64>()
+                        .filter_map(|v| v.ok())
+                        .map(|v| v as u16)
+                        .collect();
+                    let src_package = src_package.unwrap_or(0);
                     tracing::debug!(
                         actor = actor_id,
-                        slots = slots.len().unwrap_or(0),
-                        src_positions = src_positions.len().unwrap_or(0),
-                        src_package = src_package.unwrap_or(0),
-                        "Equipment:Set captured (gear-slot bind not wired — appearance refresh deferred)",
+                        gear_slots = gear_slots.len(),
+                        src_positions = src_positions.len(),
+                        src_package,
+                        "Equipment:Set → EquipFromPackage (Garlemald-Server #28)",
+                    );
+                    push(
+                        &queue,
+                        LuaCommand::EquipFromPackage {
+                            player_id: actor_id,
+                            gear_slots,
+                            src_positions,
+                            src_package,
+                        },
                     );
                     Ok(())
                 },
@@ -2646,16 +2691,15 @@ impl UserData for LuaPlayer {
             // EquipCommand.lua) to bracket a class-change re-equip
             // pass without per-slot DB writes. No-op until real
             // gear DB write batching lands.
-            let toggle_dbwrite_fn = lua.create_function(
-                move |_, (_self, enabled): (mlua::Table, bool)| {
+            let toggle_dbwrite_fn =
+                lua.create_function(move |_, (_self, enabled): (mlua::Table, bool)| {
                     tracing::debug!(
                         actor = actor_id,
                         enabled,
                         "Equipment:ToggleDBWrite captured (no-op — DB write batching not wired)",
                     );
                     Ok(())
-                },
-            )?;
+                })?;
             t.set("ToggleDBWrite", toggle_dbwrite_fn)?;
             // `:GetItemAtSlot(slot)` — used by loadGearset to read
             // back the currently-equipped item per slot. Return nil
@@ -2729,17 +2773,13 @@ impl UserData for LuaPlayer {
         });
 
         // --- Session control ------------------------------------------------
-        // `Disengage` is currently a no-op surface stub — the
-        // dispatch-side equivalent runs in the battle-state machine
-        // (`die_if_defender_fell`'s engaged-flag clear). The real
-        // bindings for `DespawnMyRetainer` / `Logout` / `QuitGame`
-        // live earlier in this `add_methods` body and emit
-        // `LuaCommand::DespawnMyRetainer` / `Logout` / `QuitGame`
-        // respectively; do NOT re-register no-op stubs for them
-        // here because mlua's `add_method` overwrites earlier
-        // registrations of the same name and the stub would
-        // silently drop the script's drain.
-        methods.add_method("Disengage", |_, _this, _: ()| Ok(()));
+        // `player.Engage(targ, mainState)` / `player.Disengage(mainState)` are
+        // bound on the Index meta-method below (not here) so they work with the
+        // DOT syntax `commands/ActivateCommand.lua` uses (`player.Engage(0,
+        // 0x0002)` / `player.Disengage(0x0000)`); a no-op `add_method`
+        // ("Disengage") used to shadow that and silently drop the active-mode
+        // toggle (Garlemald-Server #28). The real `DespawnMyRetainer` / `Logout`
+        // / `QuitGame` bindings live earlier in this body.
 
         // --- Party ----------------------------------------------------------
         methods.add_method("PartyLeave", |_, _this, _: ()| Ok(()));
@@ -2899,6 +2939,57 @@ impl UserData for LuaPlayer {
                 };
                 return lua.create_userdata(target).map(Value::UserData);
             }
+            // `player.Engage(targ, mainState)` / `player.Disengage(mainState)`
+            // (DOT syntax, like the LuaActor `Engage` branch above) — used by
+            // `commands/ActivateCommand.lua` to flip active/passive mode. Both
+            // push a `ChangeState` so the 0x0134 SetActorState broadcast fires
+            // and the player visibly draws/sheathes the weapon. The script
+            // passes `(0, 0x0002)` to engage and `(0x0000)` to disengage; we
+            // read the LAST numeric arg as the new main_state. (Garlemald #28.)
+            if key == "Engage" {
+                let queue = this.queue.clone();
+                let actor_id = this.snapshot.actor_id;
+                return lua
+                    .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                        let main_state = args
+                            .iter()
+                            .rev()
+                            .find_map(|v| v.as_u32())
+                            .unwrap_or(crate::actor::MAIN_STATE_ACTIVE as u32)
+                            as u16;
+                        push(
+                            &queue,
+                            LuaCommand::ChangeState {
+                                actor_id,
+                                main_state,
+                            },
+                        );
+                        Ok(())
+                    })
+                    .map(Value::Function);
+            }
+            if key == "Disengage" {
+                let queue = this.queue.clone();
+                let actor_id = this.snapshot.actor_id;
+                return lua
+                    .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                        let main_state = args
+                            .iter()
+                            .rev()
+                            .find_map(|v| v.as_u32())
+                            .unwrap_or(crate::actor::MAIN_STATE_PASSIVE as u32)
+                            as u16;
+                        push(
+                            &queue,
+                            LuaCommand::ChangeState {
+                                actor_id,
+                                main_state,
+                            },
+                        );
+                        Ok(())
+                    })
+                    .map(Value::Function);
+            }
             let out: Value = match key.as_str() {
                 "positionX" => Value::Number(this.snapshot.pos.0 as f64),
                 "positionY" => Value::Number(this.snapshot.pos.1 as f64),
@@ -2907,6 +2998,10 @@ impl UserData for LuaPlayer {
                 "actorId" => Value::Integer(this.snapshot.actor_id as i64),
                 "actorName" => Value::Nil, // deliberately unchangeable
                 "isGM" => Value::Boolean(this.snapshot.is_gm),
+                // Active/passive mode, read by `commands/ActivateCommand.lua`
+                // (0x0000 passive / 0x0002 active). Sourced from
+                // `current_main_state`. (Garlemald-Server #28.)
+                "currentMainState" => Value::Integer(this.snapshot.state as i64),
                 _ => Value::Nil,
             };
             Ok(out)
@@ -3506,6 +3601,16 @@ pub struct LuaWorldManager {
 
 impl UserData for LuaWorldManager {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // `GetLuaInstance():OnSignal(name)` — the runtime end of
+        // `global.lua::sendSignal`. Queues a `SendSignal` that the apply
+        // pipeline turns into `LuaEngine::fire_signal_and_drain`, resuming
+        // every coroutine parked on `waitForSignal(name)` (e.g. the combat-
+        // tutorial director on "playerActive"). (Garlemald-Server #28.)
+        methods.add_method("OnSignal", |_, this, name: String| {
+            push(&this.queue, LuaCommand::SendSignal { name });
+            Ok(())
+        });
+
         // `GetWorldManager():DoZoneChange(player, zoneId, privateArea_or_nil,
         // privateAreaType, spawnType, x, y, z, rot)` — full cross-zone
         // warp. `player` is a LuaPlayer userdata (not a u32); we extract

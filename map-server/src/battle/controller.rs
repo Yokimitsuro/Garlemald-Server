@@ -264,9 +264,21 @@ impl Controller {
             return ControllerDecision::Idle;
         }
 
-        // Engaged → combat tick. Not engaged → try aggro, else roam.
+        // Engaged → combat tick. Not engaged → retaliate, try aggro, else roam.
         if owner.is_engaged {
             self.do_combat_tick(now_ms, owner)
+        } else if let Some(hated) = owner.most_hated_actor_id {
+            // Retaliate. A mob that has accumulated hate (because it took
+            // damage — `resolve_auto_attack` calls `update_hate` on the
+            // defender) engages its attacker even when it would not have
+            // aggroed via sight/sound/scent, and even when it is `neutral`.
+            // C#: a struck BattleNpc enters combat on its first hate entry.
+            // This is what makes the tutorial wolves (and any struck mob)
+            // fight back; without it a neutral / out-of-detection mob would
+            // soak hits without ever swinging.
+            ControllerDecision::Engage {
+                target_actor_id: hated,
+            }
         } else if let Some(target_id) = self.try_aggro(now_ms, owner, arena) {
             ControllerDecision::Engage {
                 target_actor_id: target_id,
@@ -365,6 +377,15 @@ impl Controller {
             return true;
         }
         if detect_type.contains(DetectionType::SOUND)
+            && !has_stealth
+            && dist <= self.battle.sound_range
+        {
+            return true;
+        }
+        // SCENT is proximity-based like SOUND (no facing requirement). The
+        // SEQ_005 tutorial wolves detect by SCENT; without this arm they never
+        // aggro. Uses the sound range as the scent radius. (Garlemald-Server #28.)
+        if detect_type.contains(DetectionType::SCENT)
             && !has_stealth
             && dist <= self.battle.sound_range
         {
@@ -557,6 +578,26 @@ mod tests {
         let owner_actor = view(1, 0.0, 0.0, 2, true);
         let arena = arena_with(&[owner_actor, player]);
         let out = c.tick(1_000, owner_view(true, false, None, None), &arena);
+        match out {
+            ControllerDecision::Engage { target_actor_id } => assert_eq!(target_actor_id, 10),
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn battle_npc_retaliates_on_hate_when_not_engaged() {
+        // A neutral mob with NONE detection still fights back once it has
+        // taken damage (a hate entry exists) even though `try_aggro` would
+        // never fire for it.
+        let mut c = BattleNpcController::new_for(1);
+        c.battle.neutral = true;
+        c.battle.detection_type = DetectionType::NONE;
+        let arena = arena_with(&[view(1, 0.0, 0.0, 2, true)]);
+        let out = c.tick(
+            1_000,
+            owner_view(true, /* engaged */ false, Some(10), None),
+            &arena,
+        );
         match out {
             ControllerDecision::Engage { target_actor_id } => assert_eq!(target_actor_id, 10),
             other => panic!("unexpected: {:?}", other),

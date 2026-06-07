@@ -341,12 +341,18 @@ impl AIContainer {
             // actor and calls `follow_path` directly when needed.
         }
 
-        if let Some(ctrl) = self.controller.as_mut()
+        // Run the controller, then apply its decision. We pull the decision out
+        // of the `&mut self.controller` borrow before calling `apply_decision`
+        // (which needs `&mut self` to push an AttackState on Engage).
+        let controller_decision = if let Some(ctrl) = self.controller.as_mut()
             && ctrl.can_update
         {
-            let decision = ctrl.tick(now_ms, owner_view, arena);
-            let owner_id = self.owner_actor_id;
-            Self::apply_decision(owner_id, decision, outbox);
+            Some(ctrl.tick(now_ms, owner_view, arena))
+        } else {
+            None
+        };
+        if let Some(decision) = controller_decision {
+            self.apply_decision(decision, now_ms, owner_view.attack_delay_ms, outbox);
         }
 
         // Process the state stack. Auto-attack swings (Attack state, ready)
@@ -406,10 +412,21 @@ impl AIContainer {
         }
     }
 
-    fn apply_decision(owner_id: u32, decision: ControllerDecision, outbox: &mut BattleOutbox) {
+    fn apply_decision(
+        &mut self,
+        decision: ControllerDecision,
+        now_ms: u64,
+        attack_delay_ms: u32,
+        outbox: &mut BattleOutbox,
+    ) {
+        let owner_id = self.owner_actor_id;
         match decision {
             ControllerDecision::Idle => {}
             ControllerDecision::Engage { target_actor_id } => {
+                // Push an Attack state so the swing clock starts ticking and the
+                // controller stays in its combat branch (C#: BattleNpc engages by
+                // entering the active battle state, not just signalling the wire).
+                self.internal_engage(target_actor_id, now_ms, attack_delay_ms);
                 outbox.push(BattleEvent::Engage {
                     owner_actor_id: owner_id,
                     target_actor_id,

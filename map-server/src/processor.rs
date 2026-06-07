@@ -1760,6 +1760,25 @@ impl PacketProcessor {
                     "login lua cmd routed via EventOutbox bridge",
                 );
             }
+            // Equip starting gear at login. `player.lua::equipClassItems`
+            // (called from `onLogin`) does `player:GetEquipment():Set(...)`,
+            // which pushes `EquipFromPackage`. The equip applier lives in the
+            // runtime drain (`apply_runtime_lua_command`); the login drain
+            // otherwise dropped this as "unhandled", so the class weapon was
+            // never actually equipped (it sat in the bag) and a Gladiator could
+            // not draw it → F / Active-mode stayed inert. Route it through the
+            // runtime applier so the equip + 0x014E refresh actually run.
+            // (Garlemald-Server #28.)
+            cmd @ LC::EquipFromPackage { .. } => {
+                crate::runtime::quest_apply::apply_runtime_lua_command(
+                    cmd,
+                    &self.registry,
+                    &self.db,
+                    &self.world,
+                    self.lua.as_ref(),
+                )
+                .await;
+            }
             other => {
                 tracing::debug!(?other, "login lua cmd (unhandled)");
             }
@@ -2112,15 +2131,41 @@ impl PacketProcessor {
             spawn.animation_id,
             None,
         );
-        if spawn.hp > 0 {
-            bnpc.npc.character.chara.hp = spawn.hp.min(i16::MAX as u32) as i16;
-            bnpc.npc.character.chara.max_hp = spawn.hp.min(i16::MAX as u32) as i16;
-        }
+        // Give every script-spawned BattleNpc real HP. The seed `hp` column is
+        // 0 for many groups (incl. the SEQ_005 tutorial wolves/Yda/Papalymo),
+        // and garlemald's spawn path — unlike pmeteor's CalculateBaseStats() —
+        // never derives HP from genus/level, so those actors would spawn at
+        // hp=0 → `is_dead()` → rendered downed and unable to fight. When the
+        // seed gives no HP, fall back to a level-scaled default so the actor is
+        // alive. (Garlemald-Server #28; pmeteor parity TODO: full stat derive.)
+        let resolved_hp: u32 = if spawn.hp > 0 {
+            spawn.hp
+        } else {
+            // `saturating_mul` guards against a malformed seed row with an
+            // absurd `min_level` overflowing u32 (panic in debug / wrap in
+            // release); the result is clamped to i16 below regardless.
+            spawn.min_level.max(1).saturating_mul(100).max(100)
+        };
+        bnpc.npc.character.chara.hp = resolved_hp.min(i16::MAX as u32) as i16;
+        bnpc.npc.character.chara.max_hp = resolved_hp.min(i16::MAX as u32) as i16;
         if spawn.mp > 0 {
             bnpc.npc.character.chara.mp = spawn.mp.min(i16::MAX as u32) as i16;
             bnpc.npc.character.chara.max_mp = spawn.mp.min(i16::MAX as u32) as i16;
         }
         bnpc.npc.character.chara.level = spawn.min_level.clamp(1, i16::MAX as u32) as i16;
+
+        // Stamp the visual model + equipment from `gamedata_actor_appearance`,
+        // exactly as the populace `apply_spawn_actor` path does. Without this
+        // the BattleNpc keeps the constructor defaults (model_id = 0, all 28
+        // appearance slots = 0), so the zone-in 0x00D6 SetActorAppearance ships
+        // an empty model: creature mobs (wolves) have no mesh to draw and are
+        // invisible, and humanoid allies (Yda/Papalymo) fall back to an empty
+        // skeleton that renders as a knocked-out/downed pose. (Garlemald #28.)
+        if let Ok(Some(app)) = self.db.load_npc_appearance(spawn.actor_class_id).await {
+            let (model_id, slots) = app.pack();
+            bnpc.npc.character.chara.model_id = model_id;
+            bnpc.npc.character.chara.appearance_ids = slots;
+        }
 
         let actor_id = bnpc.actor_id();
         if actor_id != expected_actor_id {
@@ -6786,21 +6831,36 @@ impl PacketProcessor {
             }
             OP_RX_SET_TARGET => {
                 // 118 events/session — most-frequent IN gap. Wiki:
-                // "Target Selected". Client sends this on
-                // soft-target / hover-select. Project Meteor parses
-                // it via `SetTargetPacket` and uses
-                // `attackTarget != 0xE0000000` to drive auto-attack
-                // engage state (`PacketProcessor.cs:175`).
-                let attack_target = if sub.data.len() >= 4 {
+                // "Target Selected". `SetTargetPacket` (pmeteor
+                // `PacketProcessor.cs:173`):
+                //   body[0..4] = actorID      — the selected (soft) target
+                //   body[4..8] = attackTarget — 0xE0000000 when there is no
+                //                               locked attack target, else a
+                //                               real actor id (auto-attack on).
+                // pmeteor sets `currentTarget = actorID` and
+                // `isAutoAttackEnabled = attackTarget != 0xE0000000`. The prior
+                // garlemald code mislabelled body[0..4] as `attackTarget` and
+                // only logged it. (Garlemald-Server #28.)
+                let selected_target = if sub.data.len() >= 4 {
                     u32::from_le_bytes(sub.data[..4].try_into().unwrap())
                 } else {
                     0
                 };
+                let attack_target = if sub.data.len() >= 8 {
+                    u32::from_le_bytes(sub.data[4..8].try_into().unwrap())
+                } else {
+                    Self::SET_TARGET_NONE
+                };
+                let auto_attack = attack_target != Self::SET_TARGET_NONE;
                 tracing::debug!(
                     source = source,
+                    selected = format!("0x{:08X}", selected_target),
                     attack_target = format!("0x{:08X}", attack_target),
+                    auto_attack,
                     "RX 0x00CD target-selected",
                 );
+                self.apply_player_set_target(source, selected_target, auto_attack)
+                    .await;
             }
             OP_RX_DATA_REQUEST => {
                 // 44 events/session. Same opcode as outbound
@@ -7015,6 +7075,10 @@ impl PacketProcessor {
         let event_name_for_director = pkt.event_name.clone();
         let event_type_for_director = pkt.event_type;
         let lua_params_for_director = pkt.lua_params.clone();
+        // Same snapshot for the command-static-actor dispatch below.
+        let event_name_for_cmd = pkt.event_name.clone();
+        let event_type_for_cmd = pkt.event_type;
+        let lua_params_for_cmd = pkt.lua_params.clone();
         let mut outbox = EventOutbox::new();
         {
             let mut chara = handle.character.write().await;
@@ -7135,6 +7199,24 @@ impl PacketProcessor {
             && event_name_for_match == "commandRequest"
         {
             self.send_quest_journal_data(&handle, session_id).await;
+        }
+
+        // Generic client-command dispatch — run `commands/<Name>.lua::
+        // onEventStarted` for a command static actor. This is how the client's
+        // active-mode toggle (F / sword → ActivateCommand) reaches the script
+        // that calls `player.Engage(...)` + `sendSignal("playerActive")`,
+        // un-parking the combat-tutorial director. Generalizes the journal
+        // one-off above. (Garlemald-Server #28.)
+        if let Some(command_name) = Self::command_script_name(owner_actor_id) {
+            self.dispatch_command_script(
+                &handle,
+                owner_actor_id,
+                command_name,
+                event_name_for_cmd,
+                event_type_for_cmd,
+                lua_params_for_cmd,
+            )
+            .await;
         }
 
         tracing::debug!(
@@ -7265,43 +7347,283 @@ impl PacketProcessor {
             }
         };
 
+        Box::pin(self.apply_event_script_commands(handle, commands)).await;
+    }
+
+    /// Apply a script's drained `LuaCommand`s. Event-flavoured commands
+    /// (`RunEventFunction` / `EndEvent` / `KickEvent` / …) are translated
+    /// through the `EventOutbox` + dispatcher so cinematic packets reach the
+    /// wire (without this they hit `apply_runtime_lua_command`'s catch-all and
+    /// are dropped); the rest go through the runtime; and any `SendSignal`
+    /// resumes the coroutines parked on `waitForSignal(name)` (e.g. the combat
+    /// tutorial director on "playerActive") and applies THEIR commands,
+    /// recursively. Shared by the content-director dispatch and the
+    /// command-static-actor dispatch. Mirrors `apply_quest_on_notice` +
+    /// `fire_quest_event_hook`. (Garlemald-Server #28.)
+    async fn apply_event_script_commands(
+        &self,
+        handle: &ActorHandle,
+        commands: Vec<crate::lua::command::LuaCommand>,
+    ) {
+        use crate::lua::command::LuaCommand;
         if commands.is_empty() {
             return;
         }
-
-        // Translate event-flavoured commands (`RunEventFunction` /
-        // `EndEvent` / `KickEvent`) through the EventOutbox + dispatcher
-        // so cinematic packets reach the wire. Without this step the
-        // commands fall through `apply_runtime_lua_command`'s catch-all
-        // branch and are silently dropped (see `processor.rs:1684` log).
-        // Mirrors `apply_quest_on_notice` (`runtime/quest_apply.rs:2410-
-        // 2513`) and `fire_quest_event_hook` (`processor.rs:5912-5934`).
-        let event_session_snapshot = {
-            let c = handle.character.read().await;
-            c.event_session.clone()
-        };
-        let mut outbox = crate::event::outbox::EventOutbox::new();
-        crate::event::lua_bridge::translate_lua_commands_into_outbox(
-            &commands,
-            &event_session_snapshot,
-            &mut outbox,
-        );
-        for e in outbox.drain() {
-            Box::pin(dispatch_event_event(
-                &e,
-                &self.registry,
-                &self.world,
-                &self.db,
-                self.lua.as_ref(),
-            ))
-            .await;
+        // Pull `SendSignal` out — it re-enters the engine (resumes parked
+        // coroutines) rather than being applied as a state mutation.
+        let mut signals: Vec<String> = Vec::new();
+        let mut rest: Vec<LuaCommand> = Vec::with_capacity(commands.len());
+        for c in commands {
+            match c {
+                LuaCommand::SendSignal { name } => signals.push(name),
+                other => rest.push(other),
+            }
         }
-        crate::runtime::quest_apply::apply_runtime_lua_commands(
-            commands,
+        if !rest.is_empty() {
+            let event_session_snapshot = {
+                let c = handle.character.read().await;
+                c.event_session.clone()
+            };
+            // Process commands in their ORIGINAL order, routing each to
+            // exactly one path. Order is load-bearing on the wire: pmeteor
+            // sends `SendDataPacket(9)` (startTutorialMode — a runtime/0x0133
+            // command) BEFORE the `processTtrBtl001` cinematic
+            // (RunEventFunction/0x0130), while later it sends the tutorial-
+            // widget SendDataPackets AFTER their cinematic. A two-pass split
+            // (all events then all runtime, or vice-versa) inverts one of
+            // those, so we interleave per-command instead. Event-flavoured
+            // commands (RunEventFunction/EndEvent) go through the event bridge;
+            // everything else (SendDataPacket, ChangeState, KickEvent capture,
+            // …) through the runtime drain. (Garlemald-Server #28.)
+            for c in rest {
+                let mut outbox = crate::event::outbox::EventOutbox::new();
+                crate::event::lua_bridge::translate_lua_commands_into_outbox(
+                    std::slice::from_ref(&c),
+                    &event_session_snapshot,
+                    &mut outbox,
+                );
+                let events = outbox.drain();
+                if events.is_empty() {
+                    crate::runtime::quest_apply::apply_runtime_lua_command(
+                        c,
+                        &self.registry,
+                        &self.db,
+                        &self.world,
+                        self.lua.as_ref(),
+                    )
+                    .await;
+                } else {
+                    for e in events {
+                        Box::pin(dispatch_event_event(
+                            &e,
+                            &self.registry,
+                            &self.world,
+                            &self.db,
+                            self.lua.as_ref(),
+                        ))
+                        .await;
+                    }
+                }
+            }
+        }
+        if let Some(lua) = self.lua.as_ref() {
+            for name in signals {
+                let resumed = lua.fire_signal_and_drain(&name);
+                if !resumed.is_empty() {
+                    tracing::debug!(
+                        signal = %name,
+                        commands = resumed.len(),
+                        "sendSignal resumed parked coroutine(s)",
+                    );
+                    Box::pin(self.apply_event_script_commands(handle, resumed)).await;
+                }
+            }
+        }
+    }
+
+    /// Command static-actor ids that dispatch to a `commands/<Name>.lua`
+    /// script via `onEventStarted`. Decoded from `staticactors.bin`
+    /// (`… | 0xA0F00000`). ActivateCommand is the active/passive (draw/sheathe)
+    /// toggle the client sends on F / the sword icon — two ids for
+    /// activate/deactivate, both routed to the one script which branches on
+    /// `player.currentMainState`. (Garlemald-Server #28.)
+    const ACTIVATE_COMMAND_A: u32 = 0xA0F0_5209;
+    const ACTIVATE_COMMAND_B: u32 = 0xA0F0_520A;
+
+    /// SetTarget's `attackTarget` "no attack target" sentinel — the value the
+    /// 1.x client writes when the player has no locked combat target (pmeteor
+    /// `SetTargetPacket.attackTarget` "Usually 0xE0000000"). Same constant as
+    /// `actor_battle::NO_ENMITY_TARGET`. (Garlemald-Server #28.)
+    const SET_TARGET_NONE: u32 = 0xE000_0000;
+
+    fn command_script_name(owner_actor_id: u32) -> Option<&'static str> {
+        match owner_actor_id {
+            Self::ACTIVATE_COMMAND_A | Self::ACTIVATE_COMMAND_B => Some("ActivateCommand"),
+            _ => None,
+        }
+    }
+
+    /// Run `commands/<Name>.lua::onEventStarted` for a client command static
+    /// actor and apply its commands (incl. any `sendSignal`). Generalizes the
+    /// hardcoded journal command. (Garlemald-Server #28.)
+    async fn dispatch_command_script(
+        &self,
+        handle: &ActorHandle,
+        command_actor_id: u32,
+        command_name: &'static str,
+        event_name: String,
+        event_type: u8,
+        lua_params: Vec<common::luaparam::LuaParam>,
+    ) {
+        let Some(lua) = self.lua.as_ref() else {
+            return;
+        };
+        let script_path = lua.resolver().command(command_name);
+        if !script_path.exists() {
+            tracing::warn!(
+                command = command_name,
+                owner = command_actor_id,
+                script = %script_path.display(),
+                "command script not on disk — skipping dispatch",
+            );
+            return;
+        }
+        let snapshot = {
+            let c = handle.character.read().await;
+            build_player_snapshot_from_character(&c)
+        };
+        let lua_clone = lua.clone();
+        let script_path_clone = script_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            lua_clone.call_command_on_event_started(
+                &script_path_clone,
+                snapshot,
+                command_actor_id,
+                event_name,
+                event_type,
+                lua_params,
+            )
+        })
+        .await;
+        let partial = match result {
+            Ok(p) => p,
+            Err(join_err) => {
+                tracing::warn!(
+                    command = command_name,
+                    error = %join_err,
+                    "command onEventStarted dispatch panicked",
+                );
+                return;
+            }
+        };
+        if let Some(e) = partial.error {
+            tracing::warn!(
+                command = command_name,
+                error = %e,
+                "command onEventStarted errored; applying partial commands",
+            );
+        } else {
+            tracing::debug!(
+                command = command_name,
+                owner = command_actor_id,
+                commands = partial.commands.len(),
+                "command onEventStarted fired",
+            );
+        }
+        Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
+    }
+
+    /// Apply a client `SetTarget` (0x00CD). Port of pmeteor
+    /// `PacketProcessor.cs:173`:
+    ///
+    /// ```text
+    /// actor.currentTarget       = packet.actorID      (body[0..4])
+    /// actor.isAutoAttackEnabled = packet.attackTarget != 0xE0000000  (body[4..8])
+    /// broadcast SetActorTargetAnimated(actorID)
+    /// ```
+    ///
+    /// Garlemald previously only logged this opcode, so the player never
+    /// acquired a target and never auto-attacked. Because
+    /// `SimpleContent30010.lua::onUpdate` gates ally engagement on
+    /// `player:IsEngaged() and player.target`, that left the entire combat
+    /// tutorial inert — allies never stood in, mobs were never struck, and so
+    /// (with the wolf-retaliation path) never fought back. Recording the
+    /// target + pushing the player's `AttackState` is the keystone that drives
+    /// the whole loop: player swings → wolf takes damage → wolf gains hate →
+    /// wolf retaliates. (Garlemald-Server #28.)
+    async fn apply_player_set_target(
+        &self,
+        session_id: u32,
+        selected_target: u32,
+        auto_attack: bool,
+    ) {
+        let Some(handle) = self.registry.by_session(session_id).await else {
+            return;
+        };
+        let actor_id = handle.actor_id;
+
+        {
+            let mut c = handle.character.write().await;
+
+            // Record the soft target so `player.target` resolves and
+            // `Character::is_engaged()` reads correctly. INVALID_ACTORID is the
+            // canonical "no target" marker (pmeteor `Actor.INVALID_ACTORID`).
+            let cleared = selected_target == 0 || selected_target == Self::SET_TARGET_NONE;
+            c.chara.current_target = if cleared {
+                crate::actor::INVALID_ACTORID
+            } else {
+                selected_target
+            };
+
+            let valid_combat_target = auto_attack
+                && !cleared
+                && selected_target != actor_id
+                && selected_target != crate::actor::INVALID_ACTORID;
+
+            if valid_combat_target {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let delay = c.get_attack_delay_ms();
+                let cur = c
+                    .ai_container
+                    .current_state()
+                    .map(|s| s.target_actor_id)
+                    .filter(|id| *id != 0);
+                // Re-engage only when switching targets — re-engaging the same
+                // target restarts the swing clock (same gate as
+                // `apply_actor_engage` / pmeteor `if (IsEngaged) return`).
+                if cur != Some(selected_target) {
+                    c.ai_container.clear_states();
+                    c.ai_container
+                        .internal_engage(selected_target, now_ms, delay);
+                }
+            } else if !auto_attack {
+                // Auto-attack toggled off (attackTarget == 0xE0000000) — stop
+                // swinging but keep the soft target so the reticle stays.
+                c.ai_container.clear_states();
+            }
+        }
+
+        // Broadcast the target reticle so nearby clients (and our own, for the
+        // animated draw) render who the player is locked onto. pmeteor sends
+        // SetActorTargetAnimated here. `0` on a clear leaves the reticle empty.
+        let bytes =
+            crate::packets::send::actor::build_set_actor_target_animated(actor_id, selected_target)
+                .to_bytes();
+        crate::runtime::dispatcher::send_to_self_if_player(
             &self.registry,
-            &self.db,
             &self.world,
-            self.lua.as_ref(),
+            actor_id,
+            bytes.clone(),
+        )
+        .await;
+        crate::runtime::dispatcher::broadcast_to_neighbours(
+            &self.world,
+            &self.registry,
+            actor_id,
+            bytes,
         )
         .await;
     }
@@ -7457,6 +7779,38 @@ impl PacketProcessor {
         };
         let actor_id = handle.actor_id;
 
+        // Resume a parked director coroutine waiting on the cinematic's
+        // `_WAIT_EVENT` yield (a `callClientFunction(...)` in the director's
+        // `onEventStarted`). The 1.x client posts `0x012E EventUpdate` when the
+        // cinematic finishes; pmeteor resumes the coroutine here (`Player.
+        // UpdateEvent` → `LuaEngine.OnEventUpdate` → `coroutine.Resume`), which
+        // runs the director's continuation — its own `player:EndEvent()`,
+        // `kickEventContinue`, the tutorial widgets, and crucially the steps
+        // that hand movement + the active-mode/F command back to the player.
+        // garlemald previously only faked the EndEvent via the event-session
+        // echo below and NEVER resumed the coroutine (the referenced
+        // `dispatch_event_updated` never existed), so the SEQ_005 director
+        // parked forever after the first cinematic → softlock (can't move, F
+        // inert). When a coroutine IS resumed it emits its own EndEvent, so we
+        // skip the event-session echo to avoid a double EndEvent.
+        // (Garlemald-Server #28.)
+        let resumed = self
+            .lua
+            .as_ref()
+            .and_then(|lua| lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new()))
+            .filter(|cmds| !cmds.is_empty());
+        if let Some(cmds) = resumed {
+            tracing::debug!(
+                player = actor_id,
+                commands = cmds.len(),
+                "EventUpdate resumed parked director coroutine",
+            );
+            Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
+            return Ok(());
+        }
+
+        // No parked coroutine — fall back to the event-session echo (the prior
+        // behaviour, kept for non-director EventUpdates).
         let mut outbox = EventOutbox::new();
         {
             let chara = handle.character.read().await;
@@ -8100,6 +8454,19 @@ pub(crate) fn build_player_snapshot_from_character(
         })
         .collect();
     snapshot.completed_quests = c.quest_journal.iter_completed().collect();
+
+    // Overlay live combat state so Lua content scripts see real engagement.
+    // pmeteor's `Character.IsEngaged()` delegates to `aiContainer.IsEngaged()`
+    // (an active AttackState), and `player.target` reads `currentTarget`. The
+    // login snapshot hard-codes both to inert defaults; without this overlay
+    // `SimpleContent30010.lua::onUpdate`'s `player:IsEngaged() and
+    // player.target` gate is permanently false and the allies never engage.
+    // (Garlemald-Server #28.)
+    snapshot.is_engaged = c.ai_container.is_engaged();
+    snapshot.target_actor_id = match c.chara.current_target {
+        0 | crate::actor::INVALID_ACTORID => 0,
+        id => id,
+    };
     snapshot
 }
 

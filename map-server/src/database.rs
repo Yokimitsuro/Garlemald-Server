@@ -2548,6 +2548,89 @@ impl Database {
         Ok(rows)
     }
 
+    /// Garlemald-Server #28 — resolve the `(serverItemId, catalogId)` of
+    /// the bag item sitting at `(item_package, slot)` for `chara_id`.
+    /// Mirrors the `characters_inventory(characterId, serverItemId,
+    /// itemPackage, slot)` layout joined to `server_items(id, itemId)`.
+    ///
+    /// Used by the `LC::EquipFromPackage` applier (the runtime drain of
+    /// `player:GetEquipment():Set(slots, srcPositions, srcPackage)`) to
+    /// turn a bag-slot index into the unique item-instance id `equip_item`
+    /// needs, plus the catalog id the appearance / 0x014E refresh needs.
+    /// Returns `None` (not an error) when the bag slot is empty — the
+    /// applier skips those indices.
+    pub async fn resolve_bag_slot_item_id(
+        &self,
+        chara_id: u32,
+        item_package: u16,
+        slot: u16,
+    ) -> Result<Option<(u64, u32)>> {
+        let v = self
+            .conn
+            .call_db(move |c| {
+                let v = c
+                    .query_row(
+                        r"SELECT ci.serverItemId, si.itemId
+                          FROM characters_inventory ci
+                          INNER JOIN server_items si ON ci.serverItemId = si.id
+                          WHERE ci.characterId = :cid
+                            AND ci.itemPackage = :pkg
+                            AND ci.slot = :slot",
+                        named_params! {
+                            ":cid": chara_id,
+                            ":pkg": item_package,
+                            ":slot": slot,
+                        },
+                        |r| {
+                            Ok((
+                                r.get::<_, u64>(0).unwrap_or_default(),
+                                r.get::<_, u32>(1).unwrap_or_default(),
+                            ))
+                        },
+                    )
+                    .optional()?;
+                Ok(v)
+            })
+            .await?;
+        Ok(v)
+    }
+
+    /// Garlemald-Server #28 — is gear slot `equip_slot` already filled for
+    /// `chara_id` under `class_id`? Undergarment rows live under
+    /// `classId = 0` (see `equip_item`'s `effective_class` quirk), so the
+    /// check matches the active class OR class 0 — same predicate
+    /// `load_equipped_catalog_ids` / `get_equipment` use.
+    ///
+    /// The `LC::EquipFromPackage` applier consults this so it only ever
+    /// fills EMPTY slots — that makes re-running `equipClassItems` on every
+    /// login idempotent and stops it clobbering a player's chosen gear.
+    pub async fn is_gear_slot_equipped(
+        &self,
+        chara_id: u32,
+        class_id: u16,
+        equip_slot: u16,
+    ) -> Result<bool> {
+        let occupied = self
+            .conn
+            .call_db(move |c| {
+                let n: i64 = c.query_row(
+                    r"SELECT COUNT(*) FROM characters_inventory_equipment
+                      WHERE characterId = :cid
+                        AND equipSlot = :slot
+                        AND (classId = :class OR classId = 0)",
+                    named_params! {
+                        ":cid": chara_id,
+                        ":slot": equip_slot,
+                        ":class": class_id,
+                    },
+                    |r| r.get(0),
+                )?;
+                Ok(n > 0)
+            })
+            .await?;
+        Ok(occupied)
+    }
+
     pub async fn equip_item(
         &self,
         chara_id: u32,
@@ -4434,6 +4517,119 @@ mod battle_npc_spawn_tests {
         if let Some(c) = class {
             assert_eq!(c.actor_class_id, 2_290_005);
         }
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Garlemald-Server #28 — the bag-slot resolver + gear-slot occupancy
+/// check that back the `EquipFromPackage` (`player:GetEquipment():Set`)
+/// applier.
+#[cfg(test)]
+mod equip_from_package_tests {
+    use super::*;
+
+    fn tempdb(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "garlemald-equip-from-package-{label}-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Seed a Gladiator-shaped starter bag: AddItems lands the five
+    /// catalog ids into NORMAL (package 0) at sequential slots 0..4,
+    /// exactly like `player.lua::initClassItems`. `resolve_bag_slot_item_id`
+    /// must then map each (package, slot) back to (serverItemId, catalogId).
+    #[tokio::test]
+    async fn resolve_bag_slot_maps_package_slot_to_server_item() {
+        let path = tempdb("resolve");
+        let db = Database::open(&path).await.expect("open db");
+        // GLA AddItems({4030010, 8031120, 8050245, 8080601, 8090307}).
+        let catalog = [4030010u32, 8031120, 8050245, 8080601, 8090307];
+        for id in catalog {
+            db.add_harvest_item(42, id, 1, 1).await.expect("add item");
+        }
+
+        // Each bag slot resolves to a distinct serverItemId whose catalog
+        // id matches the AddItems order.
+        for (slot, &cat) in catalog.iter().enumerate() {
+            let (sid, resolved_cat) = db
+                .resolve_bag_slot_item_id(42, 0, slot as u16)
+                .await
+                .expect("query")
+                .unwrap_or_else(|| panic!("slot {slot} should hold an item"));
+            assert!(sid > 0, "serverItemId should be a real rowid");
+            assert_eq!(resolved_cat, cat, "catalog id mismatch at slot {slot}");
+        }
+
+        // An empty bag slot resolves to None (not an error).
+        assert!(
+            db.resolve_bag_slot_item_id(42, 0, 99)
+                .await
+                .expect("query")
+                .is_none(),
+            "empty bag slot should resolve to None"
+        );
+        // A different character sees nothing.
+        assert!(
+            db.resolve_bag_slot_item_id(43, 0, 0)
+                .await
+                .expect("query")
+                .is_none(),
+            "other character's bag should be empty"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `is_gear_slot_equipped` is the idempotence gate: it reports false
+    /// for an empty slot and true once equipped, so the applier skips
+    /// already-filled slots on re-run. Undergarments (class 0) must be
+    /// visible regardless of the queried class.
+    #[tokio::test]
+    async fn is_gear_slot_equipped_tracks_occupancy() {
+        let path = tempdb("occupancy");
+        let db = Database::open(&path).await.expect("open db");
+
+        // Main-hand slot 0 starts empty for GLA (class 3).
+        assert!(
+            !db.is_gear_slot_equipped(42, 3, crate::actor::player::SLOT_MAINHAND)
+                .await
+                .expect("query"),
+            "main-hand should start empty"
+        );
+
+        // Equip a weapon into main-hand under class 3.
+        db.equip_item(42, 3, crate::actor::player::SLOT_MAINHAND, 1001, false)
+            .await
+            .expect("equip");
+        assert!(
+            db.is_gear_slot_equipped(42, 3, crate::actor::player::SLOT_MAINHAND)
+                .await
+                .expect("query"),
+            "main-hand should now be occupied"
+        );
+
+        // A different gear slot is still empty.
+        assert!(
+            !db.is_gear_slot_equipped(42, 3, crate::actor::player::SLOT_BODY)
+                .await
+                .expect("query"),
+            "body slot should still be empty"
+        );
+
+        // Undergarments are written under class 0; the occupancy check
+        // includes class 0 regardless of the queried class.
+        db.equip_item(42, 3, crate::actor::player::SLOT_UNDERSHIRT, 2002, true)
+            .await
+            .expect("equip undergarment");
+        assert!(
+            db.is_gear_slot_equipped(42, 99, crate::actor::player::SLOT_UNDERSHIRT)
+                .await
+                .expect("query"),
+            "undergarment (class 0) should be visible from any class"
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

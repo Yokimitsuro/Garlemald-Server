@@ -43,9 +43,16 @@ use common::Vector3;
 
 pub const INVALID_ACTORID: u32 = 0xC0000000;
 
+// 1.x wire values (pmeteor `SetActorStatePacket.cs`): PASSIVE=0, DEAD=1,
+// ACTIVE=2. These were previously swapped (ACTIVE=1/DEAD=2), which made
+// `ChangeState(2)` (intended ACTIVE — e.g. content allies standing into combat
+// stance in `SimpleContent30010.lua`) read internally as DEAD, gating the
+// freshly-spawned tutorial allies as dead, and also broadcast the wrong wire
+// byte (2 = client-ACTIVE) for genuinely dead actors. All Rust callers use the
+// symbolic names, so they re-bind consistently. (Garlemald-Server #28.)
 pub const MAIN_STATE_PASSIVE: u16 = 0x00;
-pub const MAIN_STATE_ACTIVE: u16 = 0x01;
-pub const MAIN_STATE_DEAD: u16 = 0x02;
+pub const MAIN_STATE_DEAD: u16 = 0x01;
+pub const MAIN_STATE_ACTIVE: u16 = 0x02;
 /// Retail 1.x mounted state — client flips its own animation and
 /// speed rigs on seeing this. `PopulaceChocoboLender.lua` sets it via
 /// `player:ChangeState(15)`.

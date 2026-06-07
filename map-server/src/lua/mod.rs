@@ -684,6 +684,66 @@ impl LuaEngine {
     /// construct `LuaPlayer` / `LuaDirectorHandle` userdata bound to
     /// the freshly-loaded queue) and returns the MultiValue to hand the
     /// coroutine on the initial resume.
+    /// Run a `commands/<Name>.lua::onEventStarted(player, command, eventType,
+    /// eventName, ...luaParams)` script — the runtime dispatch for a client
+    /// command static actor (e.g. ActivateCommand, the active/passive toggle).
+    /// Mirrors pmeteor `LuaEngine.cs::EventStarted` for a Command target. The
+    /// `command` arg is a stub `LuaActor` carrying the command actor id (the
+    /// scripts that need it only read its id; ActivateCommand.lua ignores it).
+    /// (Garlemald-Server #28.)
+    pub fn call_command_on_event_started(
+        &self,
+        script_path: &Path,
+        player_snapshot: userdata::PlayerSnapshot,
+        command_actor_id: u32,
+        event_name: String,
+        event_type: u8,
+        lua_params: Vec<common::luaparam::LuaParam>,
+    ) -> PartialLuaCallResult {
+        self.spawn_director_on_event_started(script_path, |lua, queue| {
+            let player = userdata::LuaPlayer {
+                snapshot: player_snapshot,
+                queue: queue.clone(),
+            };
+            let command = userdata::LuaActor {
+                actor_id: command_actor_id,
+                name: String::new(),
+                class_name: String::new(),
+                class_path: String::new(),
+                unique_id: String::new(),
+                zone_id: 0,
+                zone_name: String::new(),
+                state: 0,
+                pos: (0.0, 0.0, 0.0),
+                rotation: 0.0,
+                queue: queue.clone(),
+                is_engaged: false,
+                speed: 0.0,
+                target_actor_id: 0,
+            };
+            let player_ud = lua
+                .create_userdata(player)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+            let command_ud = lua
+                .create_userdata(command)
+                .map_err(|e| anyhow::anyhow!("create_userdata(LuaActor command): {e}"))?;
+            let mut mv = MultiValue::new();
+            mv.push_back(Value::UserData(player_ud));
+            mv.push_back(Value::UserData(command_ud));
+            mv.push_back(Value::Integer(event_type as mlua::Integer));
+            let event_name_lua = lua
+                .create_string(&event_name)
+                .map_err(|e| anyhow::anyhow!("create_string(event_name): {e}"))?;
+            mv.push_back(Value::String(event_name_lua));
+            for p in lua_params {
+                let v = lua_param_to_value(lua, p)
+                    .map_err(|e| anyhow::anyhow!("lua_param_to_value: {e}"))?;
+                mv.push_back(v);
+            }
+            Ok(mv)
+        })
+    }
+
     pub fn spawn_director_on_event_started<F>(
         &self,
         script_path: &Path,
@@ -983,17 +1043,39 @@ impl LuaEngine {
         all_commands
     }
 
-    /// Notify the scheduler that `signal` fired. Any coroutine parked on it
-    /// is resumed once.
+    /// Notify the scheduler that `signal` fired, resuming every coroutine
+    /// parked on it via [`Self::fire_signal_and_drain`] (commands discarded).
     pub fn fire_signal(&self, signal: &str) {
+        let _ = self.fire_signal_and_drain(signal);
+    }
+
+    /// Like [`Self::fire_signal`] but drains the commands each resumed
+    /// coroutine queued before it yielded/finished, and re-parks any
+    /// coroutine that yielded again — mirroring [`Self::tick`] /
+    /// [`Self::fire_player_event_and_drain`]. Returns the collected commands
+    /// for the caller to apply (the old `fire_signal` resumed coroutines but
+    /// silently dropped their commands and lost re-yielded handles, so a
+    /// director woken on "playerActive" never ran its post-`waitForSignal`
+    /// body). (Garlemald-Server #28.)
+    pub fn fire_signal_and_drain(&self, signal: &str) -> Vec<LuaCommand> {
         let due = self
             .scheduler
             .lock()
             .map(|mut s| s.drain_signal(signal))
             .unwrap_or_default();
+        let mut all_commands = Vec::new();
         for parked in due {
-            let _ = parked.thread.resume::<Value>(());
+            let queue = parked.queue.clone();
+            let resume = parked.thread.resume::<Value>(());
+            all_commands.extend(CommandQueue::drain(&queue));
+            if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable)
+                && let Ok(value) = resume
+            {
+                let directive = scheduler::classify_yield(&value);
+                self.repark(parked, directive);
+            }
         }
+        all_commands
     }
 
     /// Notify the scheduler that `player_id` just received an event update.
