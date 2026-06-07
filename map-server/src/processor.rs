@@ -1760,6 +1760,25 @@ impl PacketProcessor {
                     "login lua cmd routed via EventOutbox bridge",
                 );
             }
+            // Equip starting gear at login. `player.lua::equipClassItems`
+            // (called from `onLogin`) does `player:GetEquipment():Set(...)`,
+            // which pushes `EquipFromPackage`. The equip applier lives in the
+            // runtime drain (`apply_runtime_lua_command`); the login drain
+            // otherwise dropped this as "unhandled", so the class weapon was
+            // never actually equipped (it sat in the bag) and a Gladiator could
+            // not draw it → F / Active-mode stayed inert. Route it through the
+            // runtime applier so the equip + 0x014E refresh actually run.
+            // (Garlemald-Server #28.)
+            cmd @ LC::EquipFromPackage { .. } => {
+                crate::runtime::quest_apply::apply_runtime_lua_command(
+                    cmd,
+                    &self.registry,
+                    &self.db,
+                    &self.world,
+                    self.lua.as_ref(),
+                )
+                .await;
+            }
             other => {
                 tracing::debug!(?other, "login lua cmd (unhandled)");
             }
