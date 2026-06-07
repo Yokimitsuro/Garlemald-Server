@@ -2990,6 +2990,27 @@ impl PacketProcessor {
             self.world.upsert_session(snap).await;
         }
 
+        // pmeteor sends a "you have entered an instance" system message
+        // (`SendGameMessage(WorldMaster, 34108, 0x20)`) in the content-warp
+        // burst, immediately before DeleteAllActors — the one warp packet
+        // garlemald lacked entirely. It is the client's instance-entry signal
+        // and the most likely trigger that makes the client perform a
+        // SAME-REGION instance scene reload, which is what lets us ship the
+        // unmodified parent region (106) instead of the harmful high-16 region
+        // tag (the tag forced a reload but registered the player into a region
+        // the post-cinematic movement/command unlock doesn't recognise).
+        // (Garlemald-Server #28.)
+        {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                actor_id,
+                0x5FF8_0001, // WorldMaster (matches pmeteor's 0x166 source)
+                34108,
+                0x20,
+            );
+            msg.set_target_id(actor_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
+
         client
             .send_bytes(
                 crate::packets::send::handshake::build_delete_all_actors(actor_id).to_bytes(),
