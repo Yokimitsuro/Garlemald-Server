@@ -289,6 +289,31 @@ pub enum LuaCommand {
         item_id: u32,
         quantity: i32,
     },
+    /// Garlemald-Server #28 — `player:GetEquipment():Set(slots,
+    /// srcPositions, srcPackage)`. Bulk-binds bag-slot items to gear
+    /// slots, the way `player.lua::equipClassItems` equips a fresh
+    /// character's starter kit. For each index `i`, the item currently in
+    /// the bag at `(src_package, src_positions[i])` is equipped into gear
+    /// slot `gear_slots[i]`.
+    ///
+    /// Applied by `apply_equip_from_package` (runtime drain in
+    /// `runtime/quest_apply.rs`). The applier resolves each bag slot to its
+    /// `serverItemId`, equips it via the existing `DbEquip` path (DB write
+    /// plus stat recalc), and ONLY fills gear slots that are currently EMPTY,
+    /// so re-running it on every login backfills broken / seed characters
+    /// without overriding a player's chosen gear. The combat-tutorial
+    /// softlock (SEQ_005 / Garlemald-Server #28) was a fresh Gladiator with
+    /// the Weathered Gladius in the bag but never equipped, so the client
+    /// couldn't enter Active mode.
+    ///
+    /// The two index vectors are paired positionally; trailing entries with
+    /// no partner (length mismatch) are dropped by the `zip` in the applier.
+    EquipFromPackage {
+        player_id: u32,
+        gear_slots: Vec<u16>,
+        src_positions: Vec<u16>,
+        src_package: u32,
+    },
     /// `levemete:HandInRegionalLeve(player, leve_id)` — the drain-side
     /// trigger for Tier 3 #13 reward payout + Tier 4 #16 C seal
     /// accrual. Routes through `apply_regional_leve_hand_in` which

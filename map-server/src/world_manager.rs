@@ -1517,20 +1517,36 @@ impl WorldManager {
             tx::actor_inventory::build_inventory_set_end(actor_id),
             tx::actor_inventory::build_inventory_set_begin(actor_id, 35, 0x00FE),
         ]);
-        let _ = db;
         // Meteor's `equipment.SendUpdate` calls SetInitialEquipmentPacket
         // (0x014E) between the set-begin/set-end brackets, even for a
         // fully-empty equipment set — the client's DepictionJudge Lua
         // indexes into the equipment table during nameplate rendering,
         // and without this packet the table stays nil, which produces
         // the `DepictionJudge:judgeNameplate [?:900] attempt to index a
-        // nil value` crash ~10s after zone-in. Emit one empty packet
-        // (count=0) for the Asdf-shape login; real populated equipment
-        // lands once we wire `characters_parametersave.weaponX`/gear
-        // slots into this bundle.
+        // nil value` crash ~10s after zone-in.
+        //
+        // Garlemald-Server #28: load the player's REAL equipped
+        // `(equip_slot, catalog_id)` pairs from
+        // `characters_inventory_equipment` (joined to `server_items` for
+        // the graphic id) and send them here. Previously this always
+        // passed an empty slice, so even a correctly-equipped player got
+        // no weapon on the wire at zone-in — the client couldn't enter
+        // Active mode and the SEQ_005 combat tutorial softlocked. A
+        // player with no equipment still yields an empty slice, which
+        // `build_set_initial_equipment` handles by emitting one count=0
+        // packet (the prior behaviour) — so the empty-equipment case is
+        // unchanged.
+        let equip_class_id: u8 = if current_job != 0 {
+            current_job as u8
+        } else {
+            class_slot
+        };
+        let equip_pairs =
+            crate::runtime::quest_apply::load_initial_equipment_pairs(db, actor_id, equip_class_id)
+                .await;
         subpackets.extend(tx::actor_inventory::build_set_initial_equipment(
             actor_id,
-            &[],
+            &equip_pairs,
         ));
         subpackets.extend([
             tx::actor_inventory::build_inventory_set_end(actor_id),

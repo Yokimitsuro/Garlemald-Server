@@ -2623,34 +2623,65 @@ impl UserData for LuaPlayer {
 
         // --- Equipment / inventory ------------------------------------------
         // `player:GetEquipment():Set(slots, srcPositions, srcPackage)` —
-        // the script chain in `player.lua::initClassItems` does
+        // the script chain in `player.lua::equipClassItems` does
         // `player:GetEquipment():Set({0,10,12,14,15}, {0,1,2,3,4}, 0)`
-        // to bind freshly-added items to gear slots. Return a stub
-        // table whose `Set` is a no-op so the chain doesn't error;
-        // real equipment refresh would route through the existing
-        // SendAppearance path with `appearance_ids` mutated to
-        // reflect the new gear. Smoke-test surfaced this in commit
-        // `81f7218`'s wake — initClassItems ran past
-        // `state_mainSkill[0]` once charaWork was bound, then
-        // tripped on `nil:Set`.
+        // to bind freshly-added items to gear slots. Garlemald-Server #28:
+        // this used to be a logged no-op, which left a fresh Gladiator's
+        // Weathered Gladius sitting in the bag, never equipped — so the
+        // client could not enter Active mode (press F) and the SEQ_005
+        // combat tutorial softlocked. Now we collect the two index tables
+        // and push an `EquipFromPackage` command; the runtime applier
+        // (`apply_equip_from_package`) resolves each bag slot to its
+        // serverItemId, equips it through the existing `DbEquip` path
+        // (DB write + stat recalc), and re-sends the 0x014E equipment
+        // packet so the weapon shows + is drawable.
+        //
+        // `src_package` is the 4th arg; the table arity (3 tables +
+        // optional u32) is unchanged so the call signature stays
+        // backwards-compatible.
         methods.add_method("GetEquipment", |lua, this, _: ()| {
             let t = lua.create_table()?;
             let actor_id = this.snapshot.actor_id;
+            let queue = this.queue.clone();
             // `:Set(slots, srcPositions, srcPackage)` — bulk-bind
-            // bag-slot items to gear slots (used by initClassItems).
+            // bag-slot items to gear slots (used by equipClassItems).
             let set_fn = lua.create_function(
-                move |_, (_self, slots, src_positions, src_package): (
+                move |_,
+                      (_self, slots, src_positions, src_package): (
                     mlua::Table,
                     mlua::Table,
                     mlua::Table,
                     Option<u32>,
                 )| {
+                    // Collect the two positional index tables into Vecs.
+                    // Lua passes 1-indexed sequence tables; `Table::sequence_values`
+                    // walks 1..#t so the order matches the script literal.
+                    let gear_slots: Vec<u16> = slots
+                        .sequence_values::<i64>()
+                        .filter_map(|v| v.ok())
+                        .map(|v| v as u16)
+                        .collect();
+                    let src_positions: Vec<u16> = src_positions
+                        .sequence_values::<i64>()
+                        .filter_map(|v| v.ok())
+                        .map(|v| v as u16)
+                        .collect();
+                    let src_package = src_package.unwrap_or(0);
                     tracing::debug!(
                         actor = actor_id,
-                        slots = slots.len().unwrap_or(0),
-                        src_positions = src_positions.len().unwrap_or(0),
-                        src_package = src_package.unwrap_or(0),
-                        "Equipment:Set captured (gear-slot bind not wired — appearance refresh deferred)",
+                        gear_slots = gear_slots.len(),
+                        src_positions = src_positions.len(),
+                        src_package,
+                        "Equipment:Set → EquipFromPackage (Garlemald-Server #28)",
+                    );
+                    push(
+                        &queue,
+                        LuaCommand::EquipFromPackage {
+                            player_id: actor_id,
+                            gear_slots,
+                            src_positions,
+                            src_package,
+                        },
                     );
                     Ok(())
                 },
@@ -2660,16 +2691,15 @@ impl UserData for LuaPlayer {
             // EquipCommand.lua) to bracket a class-change re-equip
             // pass without per-slot DB writes. No-op until real
             // gear DB write batching lands.
-            let toggle_dbwrite_fn = lua.create_function(
-                move |_, (_self, enabled): (mlua::Table, bool)| {
+            let toggle_dbwrite_fn =
+                lua.create_function(move |_, (_self, enabled): (mlua::Table, bool)| {
                     tracing::debug!(
                         actor = actor_id,
                         enabled,
                         "Equipment:ToggleDBWrite captured (no-op — DB write batching not wired)",
                     );
                     Ok(())
-                },
-            )?;
+                })?;
             t.set("ToggleDBWrite", toggle_dbwrite_fn)?;
             // `:GetItemAtSlot(slot)` — used by loadGearset to read
             // back the currently-equipped item per slot. Return nil

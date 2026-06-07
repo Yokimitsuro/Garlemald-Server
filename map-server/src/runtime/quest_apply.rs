@@ -238,6 +238,29 @@ pub async fn apply_runtime_lua_command(
             apply_add_item_to_retainer(retainer_id, item_package, item_id, quantity, db).await;
             true
         }
+        // Garlemald-Server #28 — `player:GetEquipment():Set(...)`. Equip
+        // the bag items the per-class `equipClassItems` table names into
+        // the matching gear slots, but only when the slot is currently
+        // EMPTY (idempotent backfill — see `apply_equip_from_package`).
+        LC::EquipFromPackage {
+            player_id,
+            gear_slots,
+            src_positions,
+            src_package,
+        } => {
+            apply_equip_from_package(
+                player_id,
+                &gear_slots,
+                &src_positions,
+                src_package,
+                registry,
+                db,
+                world,
+                lua,
+            )
+            .await;
+            true
+        }
         LC::HandInRegionalLeve { player_id, leve_id } => {
             let _ = apply_regional_leve_hand_in(player_id, leve_id, registry, db, lua).await;
             true
@@ -2230,6 +2253,245 @@ pub async fn apply_add_item(
             );
         }
     }
+}
+
+/// Garlemald-Server #28 — runtime drain of `player:GetEquipment():Set(
+/// slots, srcPositions, srcPackage)`. For each paired
+/// `(gear_slot, src_position)`, equip the item currently sitting in the
+/// player's bag at `(src_package, src_position)` into gear slot
+/// `gear_slot`.
+///
+/// Flow per index:
+///  1. Resolve the bag item's `serverItemId` + catalog id via
+///     [`Database::resolve_bag_slot_item_id`]; skip empty bag slots.
+///  2. Skip the gear slot if it's ALREADY equipped
+///     ([`Database::is_gear_slot_equipped`]) — this is the idempotence
+///     guarantee that lets `player.lua::equipClassItems` run on EVERY
+///     login (FIX C) to backfill broken / seed characters without ever
+///     clobbering a normal player's chosen gear.
+///  3. Equip through the EXISTING `InventoryEvent::DbEquip` path
+///     ([`dispatch_inventory_event`]) — it writes
+///     `characters_inventory_equipment` via `db.equip_item(...)` and runs
+///     `apply_recalc_stats(...)`, so STR/VIT/HP/MP/weapon-damage all
+///     refresh exactly like a manual equip.
+///
+/// After all slots are processed, re-send the 0x014E
+/// SetInitialEquipment packet (built from the now-updated DB) to the
+/// player's own client so the equipment table the client gates Active
+/// mode on is populated mid-session — without this the freshly-equipped
+/// Gladiator still couldn't press F until a re-zone.
+///
+/// `lua` carries the [`Catalogs`] the `DbEquip` recalc needs; if it's
+/// absent (battle-path callers without a LuaEngine) we fall back to a
+/// direct `db.equip_item` + best-effort skip so the DB row still lands.
+///
+/// [`Catalogs`]: crate::lua::Catalogs
+/// [`dispatch_inventory_event`]: crate::runtime::dispatcher::dispatch_inventory_event
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_equip_from_package(
+    player_id: u32,
+    gear_slots: &[u16],
+    src_positions: &[u16],
+    src_package: u32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    // The active class id keys the equipment table (undergarments use
+    // class 0, handled inside `equip_item`). Read it once up front.
+    let class_id = resolve_player_class_id(registry, player_id).await;
+    let mut equipped_any = false;
+    // Pair the two index tables positionally; a length mismatch simply
+    // drops the trailing unpaired entries (zip semantics).
+    for (&gear_slot, &src_position) in gear_slots.iter().zip(src_positions.iter()) {
+        // (1) Resolve the bag item at (src_package, src_position).
+        let resolved = match db
+            .resolve_bag_slot_item_id(player_id, src_package as u16, src_position)
+            .await
+        {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                tracing::debug!(
+                    player = format!("0x{player_id:08X}"),
+                    gear_slot,
+                    src_position,
+                    src_package,
+                    "EquipFromPackage: bag slot empty — skipping",
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    player = format!("0x{player_id:08X}"),
+                    gear_slot,
+                    src_position,
+                    err = %e,
+                    "EquipFromPackage: bag-slot resolve failed",
+                );
+                continue;
+            }
+        };
+        let (server_item_id, _catalog_id) = resolved;
+        // (2) Idempotence — only fill EMPTY gear slots.
+        match db
+            .is_gear_slot_equipped(player_id, class_id, gear_slot)
+            .await
+        {
+            Ok(true) => {
+                tracing::debug!(
+                    player = format!("0x{player_id:08X}"),
+                    gear_slot,
+                    "EquipFromPackage: gear slot already filled — skipping (idempotent)",
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    player = format!("0x{player_id:08X}"),
+                    gear_slot,
+                    err = %e,
+                    "EquipFromPackage: occupancy check failed — skipping for safety",
+                );
+                continue;
+            }
+        }
+        // (3) Equip via the existing DbEquip path (DB write + recalc).
+        if let Some(lua) = lua {
+            let event = crate::inventory::InventoryEvent::DbEquip {
+                owner_actor_id: player_id,
+                equip_slot: gear_slot,
+                unique_item_id: server_item_id,
+            };
+            crate::runtime::dispatcher::dispatch_inventory_event(
+                &event,
+                registry,
+                world,
+                db,
+                lua.catalogs(),
+            )
+            .await;
+            equipped_any = true;
+        } else {
+            // No LuaEngine in scope — write the equip row directly so the
+            // gear at least persists; stat recalc is best-effort skipped
+            // (callers without a LuaEngine don't drive Active mode).
+            let is_undergarment = gear_slot == crate::actor::player::SLOT_UNDERSHIRT
+                || gear_slot == crate::actor::player::SLOT_UNDERGARMENT;
+            if let Err(e) = db
+                .equip_item(
+                    player_id,
+                    class_id as u8,
+                    gear_slot,
+                    server_item_id,
+                    is_undergarment,
+                )
+                .await
+            {
+                tracing::warn!(
+                    player = format!("0x{player_id:08X}"),
+                    gear_slot,
+                    err = %e,
+                    "EquipFromPackage: direct equip_item failed",
+                );
+            } else {
+                equipped_any = true;
+            }
+        }
+    }
+
+    // Re-send the 0x014E SetInitialEquipment packet from the now-updated
+    // DB so the client's equipment table reflects the new gear without a
+    // re-zone — this is what unblocks Active mode for the tutorial.
+    if equipped_any {
+        resend_initial_equipment(player_id, class_id, registry, db, world).await;
+    }
+}
+
+/// Garlemald-Server #28 — resolve the player's active class id (current
+/// job if set, else the class slot). Mirrors the dispatcher's private
+/// `resolve_current_class_id` but returns `u16` to match the equipment
+/// table's `classId` column type used by `is_gear_slot_equipped` /
+/// `get_equipment`.
+async fn resolve_player_class_id(registry: &ActorRegistry, player_id: u32) -> u16 {
+    let Some(handle) = registry.get(player_id).await else {
+        return 0;
+    };
+    let c = handle.character.read().await;
+    if c.chara.current_job != 0 {
+        c.chara.current_job as u16
+    } else {
+        c.chara.class.max(0) as u16
+    }
+}
+
+/// Garlemald-Server #28 — re-send the 0x014E SetInitialEquipment packet
+/// to the player's own client, wrapped in the inventory begin/set/end
+/// brackets the zone-in bundle uses. Built from
+/// [`Database::load_equipped_catalog_ids`] so the `(equip_slot,
+/// catalog_id)` pairs match what FIX B sends at zone-in. No-ops cleanly
+/// when the player isn't in the registry or has no live session.
+async fn resend_initial_equipment(
+    player_id: u32,
+    class_id: u16,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let pairs = load_initial_equipment_pairs(db, player_id, class_id as u8).await;
+    let mut subs = vec![
+        crate::packets::send::actor_inventory::build_inventory_begin_change(player_id, false),
+        crate::packets::send::actor_inventory::build_inventory_set_begin(player_id, 35, 0x00FE),
+    ];
+    subs.extend(
+        crate::packets::send::actor_inventory::build_set_initial_equipment(player_id, &pairs),
+    );
+    subs.push(crate::packets::send::actor_inventory::build_inventory_set_end(player_id));
+    subs.push(crate::packets::send::actor_inventory::build_inventory_end_change(player_id));
+    for mut sub in subs {
+        sub.set_target_id(session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+    tracing::debug!(
+        player = format!("0x{player_id:08X}"),
+        slots = pairs.len(),
+        "EquipFromPackage: re-sent SetInitialEquipment",
+    );
+}
+
+/// Garlemald-Server #28 — load the player's equipped `(equip_slot,
+/// catalog_id)` pairs ready for `build_set_initial_equipment`. Shared by
+/// the FIX-A mid-session re-send (above) and the FIX-B zone-in bundle
+/// (`world_manager::send_zone_in_bundle`). The catalog id is the item
+/// graphic the client renders; `load_equipped_catalog_ids` resolves it
+/// by joining `characters_inventory_equipment` → `server_items`.
+pub async fn load_initial_equipment_pairs(
+    db: &Database,
+    player_id: u32,
+    class_id: u8,
+) -> Vec<(u16, u32)> {
+    let mut pairs: Vec<(u16, u32)> = db
+        .load_equipped_catalog_ids(player_id, class_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    // Deterministic order — the HashMap iteration order is otherwise
+    // nondeterministic, which would make the packet bytes (and tests)
+    // flaky.
+    pairs.sort_by_key(|(slot, _)| *slot);
+    pairs
 }
 
 /// Tier 3 #13 — advance any fieldcraft leves the player currently
@@ -4475,5 +4737,57 @@ mod tests {
         apply_actor_engage(0xDEAD_BEEF, 0, &registry).await;
         apply_hate_container_add_base_hate(0xDEAD_BEEF, 0x4000_0099, &registry).await;
         apply_hate_container_add_base_hate(0xDEAD_BEEF, 0, &registry).await;
+    }
+
+    /// Garlemald-Server #28 — `load_initial_equipment_pairs` builds the
+    /// `&[(equip_slot, catalog_id)]` slice both the FIX-A mid-session
+    /// re-send and the FIX-B zone-in bundle feed into
+    /// `build_set_initial_equipment`. Verifies (a) the slot→catalog
+    /// mapping is correct, (b) the result is sorted by equip slot
+    /// (deterministic packet bytes), and (c) a character with no
+    /// equipment yields an empty slice (the legacy zone-in behaviour).
+    #[tokio::test]
+    async fn load_initial_equipment_pairs_builds_sorted_slot_value_slice() {
+        let db = crate::database::Database::open(tempdb()).await.unwrap();
+
+        // No equipment yet → empty slice (must stay valid for zone-in).
+        let empty = load_initial_equipment_pairs(&db, 42, 3).await;
+        assert!(empty.is_empty(), "no equipment → empty slice");
+
+        // Seed two bag items, equip them into out-of-order gear slots, and
+        // confirm the pairs come back sorted with the right catalog ids.
+        // `add_harvest_item` lands NORMAL slots 0 (4030010) and 1 (8050245).
+        db.add_harvest_item(42, 4030010, 1, 1).await.unwrap();
+        db.add_harvest_item(42, 8050245, 1, 1).await.unwrap();
+        let (weapon_sid, _) = db
+            .resolve_bag_slot_item_id(42, 0, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        let (legs_sid, _) = db
+            .resolve_bag_slot_item_id(42, 0, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        // Equip legs (slot 10) BEFORE main-hand (slot 0) so insertion
+        // order is reversed vs. the expected sorted output.
+        db.equip_item(42, 3, 10, legs_sid, false).await.unwrap();
+        db.equip_item(
+            42,
+            3,
+            crate::actor::player::SLOT_MAINHAND,
+            weapon_sid,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let pairs = load_initial_equipment_pairs(&db, 42, 3).await;
+        assert_eq!(pairs.len(), 2, "two equipped slots");
+        // Sorted by equip slot: main-hand (0) first, legs (10) second.
+        assert_eq!(pairs[0].0, crate::actor::player::SLOT_MAINHAND);
+        assert_eq!(pairs[0].1, 4030010, "main-hand catalog id");
+        assert_eq!(pairs[1].0, 10);
+        assert_eq!(pairs[1].1, 8050245, "legs catalog id");
     }
 }
