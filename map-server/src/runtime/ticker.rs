@@ -293,7 +293,16 @@ impl GameTicker {
                                 pos: (c.base.position_x, c.base.position_y, c.base.position_z),
                                 rotation: c.base.rotation,
                                 queue: placeholder_queue.clone(),
-                                is_engaged: c.is_engaged(),
+                                // Engagement = an active AttackState (pmeteor
+                                // `aiContainer.IsEngaged()`), NOT
+                                // `Character::is_engaged()` which reads
+                                // `current_target != INVALID_ACTORID` and
+                                // defaults to `0 != 0xC0000000` = always-true
+                                // for NPCs that never get a `current_target`.
+                                // With the buggy value the content script's
+                                // `if not allies[i]:IsEngaged()` guard never
+                                // passes and allies never engage. (Garlemald #28.)
+                                is_engaged: c.ai_container.is_engaged(),
                                 speed: c.get_speed(),
                                 target_actor_id: c
                                     .ai_container

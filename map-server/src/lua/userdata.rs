@@ -112,6 +112,13 @@ impl UserData for LuaActor {
         methods.add_method("GetActorClassId", |_, this, _: ()| Ok(this.actor_id));
         methods.add_method("GetZoneID", |_, this, _: ()| Ok(this.zone_id));
         methods.add_method("GetState", |_, this, _: ()| Ok(this.state));
+        // `IsDead()` — true when the actor is in the DEAD main-state. Used by
+        // content scripts to detect when the tutorial wolves are defeated
+        // (the snapshot `state` is refreshed each tick from the live actor).
+        // (Garlemald-Server #28.)
+        methods.add_method("IsDead", |_, this, _: ()| {
+            Ok(this.state == crate::actor::MAIN_STATE_DEAD)
+        });
         methods.add_method("GetPos", |_, this, _: ()| {
             Ok((
                 this.pos.0,
@@ -2729,17 +2736,13 @@ impl UserData for LuaPlayer {
         });
 
         // --- Session control ------------------------------------------------
-        // `Disengage` is currently a no-op surface stub — the
-        // dispatch-side equivalent runs in the battle-state machine
-        // (`die_if_defender_fell`'s engaged-flag clear). The real
-        // bindings for `DespawnMyRetainer` / `Logout` / `QuitGame`
-        // live earlier in this `add_methods` body and emit
-        // `LuaCommand::DespawnMyRetainer` / `Logout` / `QuitGame`
-        // respectively; do NOT re-register no-op stubs for them
-        // here because mlua's `add_method` overwrites earlier
-        // registrations of the same name and the stub would
-        // silently drop the script's drain.
-        methods.add_method("Disengage", |_, _this, _: ()| Ok(()));
+        // `player.Engage(targ, mainState)` / `player.Disengage(mainState)` are
+        // bound on the Index meta-method below (not here) so they work with the
+        // DOT syntax `commands/ActivateCommand.lua` uses (`player.Engage(0,
+        // 0x0002)` / `player.Disengage(0x0000)`); a no-op `add_method`
+        // ("Disengage") used to shadow that and silently drop the active-mode
+        // toggle (Garlemald-Server #28). The real `DespawnMyRetainer` / `Logout`
+        // / `QuitGame` bindings live earlier in this body.
 
         // --- Party ----------------------------------------------------------
         methods.add_method("PartyLeave", |_, _this, _: ()| Ok(()));
@@ -2899,6 +2902,57 @@ impl UserData for LuaPlayer {
                 };
                 return lua.create_userdata(target).map(Value::UserData);
             }
+            // `player.Engage(targ, mainState)` / `player.Disengage(mainState)`
+            // (DOT syntax, like the LuaActor `Engage` branch above) — used by
+            // `commands/ActivateCommand.lua` to flip active/passive mode. Both
+            // push a `ChangeState` so the 0x0134 SetActorState broadcast fires
+            // and the player visibly draws/sheathes the weapon. The script
+            // passes `(0, 0x0002)` to engage and `(0x0000)` to disengage; we
+            // read the LAST numeric arg as the new main_state. (Garlemald #28.)
+            if key == "Engage" {
+                let queue = this.queue.clone();
+                let actor_id = this.snapshot.actor_id;
+                return lua
+                    .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                        let main_state = args
+                            .iter()
+                            .rev()
+                            .find_map(|v| v.as_u32())
+                            .unwrap_or(crate::actor::MAIN_STATE_ACTIVE as u32)
+                            as u16;
+                        push(
+                            &queue,
+                            LuaCommand::ChangeState {
+                                actor_id,
+                                main_state,
+                            },
+                        );
+                        Ok(())
+                    })
+                    .map(Value::Function);
+            }
+            if key == "Disengage" {
+                let queue = this.queue.clone();
+                let actor_id = this.snapshot.actor_id;
+                return lua
+                    .create_function(move |_, args: mlua::Variadic<mlua::Value>| {
+                        let main_state = args
+                            .iter()
+                            .rev()
+                            .find_map(|v| v.as_u32())
+                            .unwrap_or(crate::actor::MAIN_STATE_PASSIVE as u32)
+                            as u16;
+                        push(
+                            &queue,
+                            LuaCommand::ChangeState {
+                                actor_id,
+                                main_state,
+                            },
+                        );
+                        Ok(())
+                    })
+                    .map(Value::Function);
+            }
             let out: Value = match key.as_str() {
                 "positionX" => Value::Number(this.snapshot.pos.0 as f64),
                 "positionY" => Value::Number(this.snapshot.pos.1 as f64),
@@ -2907,6 +2961,10 @@ impl UserData for LuaPlayer {
                 "actorId" => Value::Integer(this.snapshot.actor_id as i64),
                 "actorName" => Value::Nil, // deliberately unchangeable
                 "isGM" => Value::Boolean(this.snapshot.is_gm),
+                // Active/passive mode, read by `commands/ActivateCommand.lua`
+                // (0x0000 passive / 0x0002 active). Sourced from
+                // `current_main_state`. (Garlemald-Server #28.)
+                "currentMainState" => Value::Integer(this.snapshot.state as i64),
                 _ => Value::Nil,
             };
             Ok(out)
@@ -3506,6 +3564,16 @@ pub struct LuaWorldManager {
 
 impl UserData for LuaWorldManager {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // `GetLuaInstance():OnSignal(name)` — the runtime end of
+        // `global.lua::sendSignal`. Queues a `SendSignal` that the apply
+        // pipeline turns into `LuaEngine::fire_signal_and_drain`, resuming
+        // every coroutine parked on `waitForSignal(name)` (e.g. the combat-
+        // tutorial director on "playerActive"). (Garlemald-Server #28.)
+        methods.add_method("OnSignal", |_, this, name: String| {
+            push(&this.queue, LuaCommand::SendSignal { name });
+            Ok(())
+        });
+
         // `GetWorldManager():DoZoneChange(player, zoneId, privateArea_or_nil,
         // privateAreaType, spawnType, x, y, z, rot)` — full cross-zone
         // warp. `player` is a LuaPlayer userdata (not a u32); we extract

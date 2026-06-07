@@ -57,6 +57,14 @@ pub enum LuaCommand {
         actor_id: u32,
         main_state: u16,
     },
+    /// `sendSignal(name)` (`global.lua` → `GetLuaInstance():OnSignal(name)`).
+    /// Resumes every coroutine parked on `name` via
+    /// `LuaEngine::fire_signal_and_drain`; the resumed coroutines' own
+    /// commands are then applied. This is what wakes a director parked on
+    /// `waitForSignal("playerActive")`. (Garlemald-Server #28.)
+    SendSignal {
+        name: String,
+    },
     ChangeMusic {
         player_id: u32,
         music_id: u16,

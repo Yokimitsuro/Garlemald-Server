@@ -538,6 +538,14 @@ async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &Acto
     let started = c
         .ai_container
         .internal_engage(target_actor_id, now_ms, delay);
+    // Seed hate toward the target. AI-controlled actors (allies driven by
+    // `allyGlobal.EngageTarget`, scripted BattleNpcs) run `do_combat_tick`,
+    // which `should_deaggro`s the instant `most_hated()` is None. Attacking
+    // only seeds hate on the *defender* (`resolve_auto_attack`), so without
+    // this the engager would emit a Disengage on its very next tick and spin
+    // an engage/disengage loop while its AttackState keeps swinging. Mirrors
+    // the `BattleEvent::Engage` hate-seed in `dispatcher.rs`. (Garlemald #28.)
+    c.hate.update_hate(target_actor_id, 1);
     tracing::debug!(
         actor = format!("0x{actor_id:08X}"),
         target = format!("0x{target_actor_id:08X}"),

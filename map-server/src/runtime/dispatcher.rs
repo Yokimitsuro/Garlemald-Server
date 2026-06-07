@@ -185,6 +185,17 @@ pub async fn dispatch_battle_event(
                 100,
             );
             broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
+            // Seed the hate container so `most_hated()` resolves to the target
+            // we just engaged. Without this, the very next combat tick sees
+            // `most_hated == None` and `should_deaggro` immediately disengages
+            // the mob (controller.rs::do_combat_tick) — the wolf would swing
+            // once and then drop out of combat. The auto-attack swing clock is
+            // driven by the AttackState pushed in `internal_engage`; this entry
+            // is what keeps the controller in its combat branch tick-to-tick.
+            if let Some(handle) = registry.get(*owner_actor_id).await {
+                let mut chara = handle.character.write().await;
+                chara.hate.update_hate(*target_actor_id, 1);
+            }
         }
         BattleEvent::Disengage { owner_actor_id } => {
             tracing::debug!(owner = owner_actor_id, kind = ?event_tag(event), "battle event");
@@ -202,6 +213,13 @@ pub async fn dispatch_battle_event(
             // ResetHead returns the mob to its neutral pose.
             let head = tx::actor::build_reset_head(*owner_actor_id);
             broadcast_around_actor(world, registry, zone, *owner_actor_id, head.to_bytes()).await;
+            // Drop all hate so `most_hated()` is None and the controller stays
+            // in its non-combat branch — otherwise residual hate would re-arm
+            // `do_combat_tick` on the next tick and the mob would re-engage.
+            if let Some(handle) = registry.get(*owner_actor_id).await {
+                let mut chara = handle.character.write().await;
+                chara.hate.clear_hate(None);
+            }
         }
         BattleEvent::Spawn { owner_actor_id }
         | BattleEvent::Despawn { owner_actor_id }
@@ -1657,7 +1675,40 @@ pub(crate) async fn apply_die(
             crate::status::StatusEffectFlags::LOSE_ON_DEATH,
             &mut status_outbox,
         );
+        // Drop the dead actor's own hate so a respawned NPC starts fresh.
+        c.hate.clear_hate(None);
     }
+
+    // Disengage every OTHER actor that was targeting (or hated) the now-dead
+    // actor. Without this, an attacker's `AttackState` keeps `Continue`-ing on
+    // the corpse — `ai_container.is_engaged()` stays true and `most_hated()`
+    // keeps pointing at the dead id, so `should_deaggro` never fires and the
+    // attacker is permanently combat-locked. For SEQ_005 this is load-bearing:
+    // the content `onUpdate` re-engages an ally onto the next wolf only
+    // `if not ally:IsEngaged()`, so a stale AttackState on the first dead wolf
+    // would stop the ally ever helping with wolves 2 and 3. Mobs locked onto a
+    // dead player would likewise never return to neutral. (Garlemald #28.)
+    let zone_id = handle.zone_id;
+    for other in registry.actors_in_zone(zone_id).await {
+        if other.actor_id == owner_actor_id {
+            continue;
+        }
+        let mut oc = other.character.write().await;
+        let targets_dead = oc
+            .ai_container
+            .current_state()
+            .map(|s| s.target_actor_id == owner_actor_id)
+            .unwrap_or(false);
+        // `clear_hate(Some(id))` is idempotent — a no-op when no entry exists.
+        oc.hate.clear_hate(Some(owner_actor_id));
+        if targets_dead {
+            // Clear the swing state so `is_engaged()` flips false; the next
+            // controller tick re-engages the next live `most_hated` (if any)
+            // via the retaliation branch, or goes idle.
+            oc.ai_container.clear_states();
+        }
+    }
+
     let sub = tx::build_set_actor_state(owner_actor_id, crate::actor::MAIN_STATE_DEAD as u8, 0);
     let bytes = sub.to_bytes();
     send_to_self_if_player(registry, world, owner_actor_id, bytes.clone()).await;
@@ -1904,6 +1955,61 @@ mod home_point_revive_tests {
         assert_eq!(session.destination_zone_id, 230);
         assert_eq!(session.destination_x, -407.0);
         assert_eq!(session.destination_spawn_type, 2);
+    }
+
+    /// Corpse-lock regression (#28): when an actor dies, every other actor
+    /// whose `AttackState` targets it must disengage and drop its hate toward
+    /// the dead id — otherwise an ally that kills the first wolf stays
+    /// `is_engaged()` on the corpse and the content `onUpdate` never re-engages
+    /// it onto the next wolf.
+    #[tokio::test]
+    async fn apply_die_disengages_actors_targeting_the_dead() {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        let zone_id = 100u32;
+        world.register_zone(make_zone(zone_id)).await;
+        let zone_arc = world.zone(zone_id).await.expect("zone registered");
+
+        // The wolf that is about to die.
+        let mut wolf = Character::new(2);
+        wolf.chara.max_hp = 100;
+        wolf.chara.hp = 1;
+        wolf.base.zone_id = zone_id;
+        registry
+            .insert(ActorHandle::new(
+                2,
+                ActorKindTag::BattleNpc,
+                zone_id,
+                0,
+                wolf,
+            ))
+            .await;
+
+        // An ally attacking the wolf: AttackState on id 2 + hate toward 2.
+        let mut ally = Character::new(3);
+        ally.base.zone_id = zone_id;
+        ally.ai_container.internal_engage(2, 0, 2000);
+        ally.hate.update_hate(2, 50);
+        let ally_handle = ActorHandle::new(3, ActorKindTag::Ally, zone_id, 0, ally);
+        registry.insert(ally_handle.clone()).await;
+
+        assert!(
+            ally_handle.character.read().await.ai_container.is_engaged(),
+            "pre-condition: ally engaged on the wolf",
+        );
+
+        apply_die(2, &registry, &world, &zone_arc, None, None).await;
+
+        let c = ally_handle.character.read().await;
+        assert!(
+            !c.ai_container.is_engaged(),
+            "ally must disengage from the dead wolf",
+        );
+        assert_eq!(
+            c.hate.most_hated(),
+            None,
+            "ally hate toward the dead wolf must be cleared",
+        );
     }
 
     /// Player with `homepoint == 0` (never attuned to an aetheryte)
