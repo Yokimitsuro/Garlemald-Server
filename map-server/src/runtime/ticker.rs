@@ -188,9 +188,16 @@ impl GameTicker {
         // the dispatcher + seal accrual same as a fresh script call.
         if let Some(lua) = self.lua.as_ref() {
             let lua = lua.clone();
-            let resumed = tokio::task::spawn_blocking(move || lua.tick())
-                .await
-                .unwrap_or_default();
+            let resumed = match tokio::task::spawn_blocking(move || lua.tick()).await {
+                Ok(batches) => batches,
+                Err(e) => {
+                    // A panic inside the scheduler tick would otherwise
+                    // vanish into `unwrap_or_default()` — and a panicked
+                    // resume means a parked coroutine was lost.
+                    tracing::warn!(error = %e, "lua scheduler tick panicked");
+                    Vec::new()
+                }
+            };
             // Per-owner batches: a coroutine resumed off a `wait(n)` may
             // queue EVENT-flavoured commands (the SEQ_005 director's
             // post-`wait(1)` `kickEventContinue` + `processTtrBtl002`

@@ -643,29 +643,51 @@ async fn apply_change_state(
         );
         return;
     };
-    let sub =
+    // pmeteor's State-flag flush (Character.cs PostUpdate:411-419) ships a
+    // TRIO, not just the 0x0134: SetActorState + CommandResultX00 (anim
+    // 0x72000062) + CommandResultX01 (anim 0x7C000062, command 21001
+    // Activate, one self-hit `CommandResult(Id, 0, 1)`). The 1.x client
+    // plays the draw-/sheathe-weapon animation off the X00/X01 battle
+    // actions — a bare 0x0134 changes the logical state but the model
+    // never draws (the SEQ_005 live test: state toggled 2->0->2 with no
+    // visible weapon). Byte-verified against pmeteor's capture at its
+    // tutorial F-press (map-packets.log:38247ff: 0x134 + 0x13C + 0x139).
+    // (Garlemald-Server #28.)
+    let state_sub =
         crate::packets::send::actor::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
+    let x00 =
+        crate::packets::send::actor_battle::build_command_result_x00(actor_id, 0x7200_0062, 0);
+    let x01 = crate::packets::send::actor_battle::build_command_result_x01(
+        actor_id,
+        0x7C00_0062,
+        21001,
+        &crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            hit_num: 1,
+            hit_effect: 1,
+            ..Default::default()
+        },
+    );
+    let mut bytes = state_sub.to_bytes();
+    bytes.extend(x00.to_bytes());
+    bytes.extend(x01.to_bytes());
     // Send to the actor's OWN client first when it's a player —
     // `broadcast_around_actor`'s `actors_around` excludes the source, so
     // a player's own state change (the F-press Engage drawing the
     // weapon) otherwise never reaches their client (`recipients=0` in
     // the SEQ_005 live test). Mirrors `apply_die` / `apply_revive`.
     // (Garlemald-Server #28.)
-    crate::runtime::dispatcher::send_to_self_if_player(registry, world, actor_id, sub.to_bytes())
+    crate::runtime::dispatcher::send_to_self_if_player(registry, world, actor_id, bytes.clone())
         .await;
     let recipients = crate::runtime::broadcast::broadcast_around_actor(
-        world,
-        registry,
-        &zone_arc,
-        actor_id,
-        sub.to_bytes(),
+        world, registry, &zone_arc, actor_id, bytes,
     )
     .await;
     tracing::debug!(
         actor = format!("0x{actor_id:08X}"),
         main_state,
         recipients,
-        "ChangeState applied",
+        "ChangeState applied (0x134 + draw-anim X00/X01 trio)",
     );
 }
 
@@ -4981,7 +5003,7 @@ mod change_state_self_send_tests {
 
         apply_change_state(1, 2, &registry, &world).await;
 
-        let got = rx.try_recv().expect("player should receive own 0x0134");
+        let got = rx.try_recv().expect("player should receive own state trio");
         let mut off = 0usize;
         let sub = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
         assert_eq!(sub.game_message.opcode, 0x0134);
@@ -4990,6 +5012,15 @@ mod change_state_self_send_tests {
             "self-send must stamp the session id"
         );
         assert_eq!(sub.data[0], 2, "main_state byte");
+        // pmeteor parity: the draw-animation battle actions ride along.
+        let x00 = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
+        assert_eq!(x00.game_message.opcode, 0x013C);
+        assert_eq!(x00.header.target_id, 7);
+        assert_eq!(&x00.data[..4], &0x7200_0062u32.to_le_bytes());
+        let x01 = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
+        assert_eq!(x01.game_message.opcode, 0x0139);
+        assert_eq!(&x01.data[..4], &0x7C00_0062u32.to_le_bytes());
+        assert_eq!(&x01.data[4..6], &21001u16.to_le_bytes());
 
         // Stored state mutated too.
         let handle = registry.get(1).await.unwrap();

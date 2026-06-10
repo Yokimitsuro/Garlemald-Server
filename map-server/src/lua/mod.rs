@@ -1054,12 +1054,27 @@ impl LuaEngine {
             // script's command queue — the directive classification
             // below doesn't touch the queue, so drain before reparking.
             let cmds = CommandQueue::drain(&queue);
-            if !cmds.is_empty() {
+            if cmds.is_empty() {
+                // A resumed slice that queued nothing is legal (e.g.
+                // straight into another wait) but worth a breadcrumb —
+                // it is also the signature of a queue-repoint bug
+                // (commands landing in a reinstalled queue).
+                tracing::debug!(owner, "tick: resumed coroutine produced no commands");
+            } else {
                 all_commands.push((owner, cmds));
             }
-            if let Ok(value) = resume {
-                let directive = scheduler::classify_yield_mv(&value);
-                self.repark(parked, directive);
+            match resume {
+                Ok(value) => {
+                    let directive = scheduler::classify_yield_mv(&value);
+                    self.repark(parked, directive);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        owner,
+                        error = %e,
+                        "tick: parked coroutine resume errored — coroutine dropped",
+                    );
+                }
             }
         }
 
@@ -1096,11 +1111,21 @@ impl LuaEngine {
             let queue = parked.queue.clone();
             let resume = parked.thread.resume::<MultiValue>(());
             all_commands.extend(CommandQueue::drain(&queue));
-            if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable)
-                && let Ok(value) = resume
-            {
-                let directive = scheduler::classify_yield_mv(&value);
-                self.repark(parked, directive);
+            match resume {
+                Ok(value) => {
+                    if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {
+                        let directive = scheduler::classify_yield_mv(&value);
+                        self.repark(parked, directive);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        signal,
+                        owner = parked.owner_player_id,
+                        error = %e,
+                        "fire_signal: coroutine resume errored — coroutine dropped",
+                    );
+                }
             }
         }
         all_commands
@@ -1139,13 +1164,23 @@ impl LuaEngine {
         })?;
         let resume_result = parked.thread.resume::<MultiValue>(args);
         let commands = CommandQueue::drain(&parked.queue);
-        if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {
-            // Coroutine yielded again — re-park on whatever directive
-            // it returned. Without this, a multi-step script that
-            // yields more than once would lose its handle.
-            if let Ok(value) = resume_result {
-                let directive = scheduler::classify_yield_mv(&value);
-                self.repark(parked, directive);
+        match resume_result {
+            Ok(value) => {
+                if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {
+                    // Coroutine yielded again — re-park on whatever
+                    // directive it returned. Without this, a multi-step
+                    // script that yields more than once would lose its
+                    // handle.
+                    let directive = scheduler::classify_yield_mv(&value);
+                    self.repark(parked, directive);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    player = player_id,
+                    error = %e,
+                    "fire_player_event: coroutine resume errored — coroutine dropped",
+                );
             }
         }
         Some(commands)
@@ -2653,5 +2688,329 @@ mod tests {
         );
         assert_eq!(look_ats[0], (player_actor_id, 0x4000_5099));
         assert_eq!(look_ats[1], (player_actor_id, 0x4000_4444));
+    }
+
+    /// End-to-end repro of the SEQ_005 F-press chain using the REAL
+    /// `global.lua` yield shapes — BARE pairs, not tables. The director
+    /// parks on `waitForSignal("playerActive")`, the F press's
+    /// `fire_signal_and_drain` resumes it into `wait(0.05)` (which must
+    /// RE-PARK on time, not be dropped), and the ticker's `tick()` then
+    /// drains the post-wait continuation as a batch owned by the
+    /// trigger player. Before the MultiValue capture fix, the bare
+    /// `("_WAIT_SIGNAL", name)` yield lost its name and the coroutine
+    /// was dropped at re-park (the live softlock); the older
+    /// integration test missed it because its synthetic `wait()`
+    /// yielded the TABLE form. (Garlemald-Server #28.)
+    #[test]
+    fn bare_yield_signal_then_wait_then_tick_round_trip() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+        // Mirror scripts/lua/global.lua EXACTLY: bare-pair yields.
+        std::fs::write(
+            root.join("global.lua"),
+            r#"
+                function wait(seconds)
+                    return coroutine.yield("_WAIT_TIME", seconds);
+                end
+                function waitForSignal(signal)
+                    return coroutine.yield("_WAIT_SIGNAL", signal);
+                end
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("directors/Quest/QuestDirectorSignalWait.lua"),
+            r#"
+                require ("global")
+                function onEventStarted(player, director, eventType, eventName)
+                    waitForSignal("playerActive")
+                    wait(0.05)
+                    player:SendMessage(0x20, "", "post-wait continuation")
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("directors/Quest/QuestDirectorSignalWait.lua");
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_director_on_event_started(
+            &script_path,
+            sample_snapshot(),
+            sample_director(dummy_queue),
+            "noticeEvent".to_string(),
+            5,
+            vec![],
+        );
+        assert!(result.error.is_none(), "spawn errored: {:?}", result.error);
+        {
+            let sched = engine.scheduler().lock().unwrap();
+            assert_eq!(
+                sched.pending_signal_count(),
+                1,
+                "bare _WAIT_SIGNAL yield must park on the signal",
+            );
+        }
+
+        // F press: resume off the signal; the coroutine runs into
+        // `wait(0.05)` and must RE-PARK on time.
+        let resumed = engine.fire_signal_and_drain("playerActive");
+        assert!(
+            resumed.is_empty(),
+            "no commands queued between the signal and the wait; got {resumed:?}",
+        );
+        {
+            let sched = engine.scheduler().lock().unwrap();
+            assert_eq!(sched.pending_signal_count(), 0);
+            assert_eq!(
+                sched.pending_time_count(),
+                1,
+                "bare _WAIT_TIME yield after the signal must re-park on time",
+            );
+        }
+
+        // Ticker: after the deadline, the continuation drains as a
+        // batch owned by the trigger player (snapshot actor 42).
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let batches = engine.tick();
+        assert_eq!(
+            batches.len(),
+            1,
+            "one coroutine batch should drain; got {batches:?}",
+        );
+        let (owner, cmds) = &batches[0];
+        assert_eq!(*owner, 42, "batch must carry the trigger player as owner");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::SendMessage { .. })),
+            "post-wait continuation commands must drain; got {cmds:?}",
+        );
+    }
+
+    /// FULL live-sequence repro of the SEQ_005 chain: cinematic
+    /// `_WAIT_EVENT` park -> EventUpdate resume -> `_WAIT_SIGNAL`
+    /// re-park -> F-press signal resume -> `_WAIT_TIME` re-park ->
+    /// ticker drain. All with global.lua's BARE yield pairs.
+    /// (Garlemald-Server #28.)
+    #[test]
+    fn full_cinematic_signal_wait_chain_round_trip() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+        std::fs::write(
+            root.join("global.lua"),
+            r#"
+                function callClientFunction(player, fn_name, ...)
+                    player:RunEventFunction(fn_name, ...)
+                    return coroutine.yield("_WAIT_EVENT", player);
+                end
+                function wait(seconds)
+                    return coroutine.yield("_WAIT_TIME", seconds);
+                end
+                function waitForSignal(signal)
+                    return coroutine.yield("_WAIT_SIGNAL", signal);
+                end
+                function kickEventContinue(player, actor, trigger, ...)
+                    player:KickEvent(actor, trigger, ...);
+                    return coroutine.yield("_WAIT_EVENT", player);
+                end
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("directors/Quest/QuestDirectorFullChain.lua"),
+            r#"
+                require ("global")
+                function onEventStarted(player, director, eventType, eventName)
+                    callClientFunction(player, "delegateEvent", player, "processTtrBtl001")
+                    player:EndEvent()
+                    waitForSignal("playerActive")
+                    wait(0.05)
+                    kickEventContinue(player, director, "noticeEvent", "noticeEvent")
+                    callClientFunction(player, "delegateEvent", player, "processTtrBtl002")
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = LuaEngine::new(&root);
+        let script_path = root.join("directors/Quest/QuestDirectorFullChain.lua");
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_director_on_event_started(
+            &script_path,
+            sample_snapshot(),
+            sample_director(dummy_queue),
+            "noticeEvent".to_string(),
+            5,
+            vec![],
+        );
+        assert!(result.error.is_none(), "spawn errored: {:?}", result.error);
+        // First slice: RunEventFunction queued, parked on the event.
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::RunEventFunction { .. })),
+            "cinematic RunEventFunction should drain; got {:?}",
+            result.commands,
+        );
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
+
+        // Client finishes the cinematic -> EventUpdate resume. The
+        // coroutine emits EndEvent then parks on the signal.
+        let cmds = engine
+            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .expect("a coroutine should be parked on the player event");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::EndEvent { .. })),
+            "EndEvent should drain off the EventUpdate resume; got {cmds:?}",
+        );
+        {
+            let sched = engine.scheduler().lock().unwrap();
+            assert_eq!(sched.pending_event_count(), 0);
+            assert_eq!(
+                sched.pending_signal_count(),
+                1,
+                "director must be parked on playerActive after the cinematic",
+            );
+        }
+
+        // F press.
+        let resumed = engine.fire_signal_and_drain("playerActive");
+        assert!(resumed.is_empty(), "straight into wait(); got {resumed:?}");
+        assert_eq!(
+            engine.scheduler().lock().unwrap().pending_time_count(),
+            1,
+            "wait(0.05) must re-park on time after the signal resume",
+        );
+
+        // Ticker: post-wait slice queues the kick (kickEventContinue)
+        // and parks on the next client event.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let batches = engine.tick();
+        assert_eq!(batches.len(), 1, "got {batches:?}");
+        let (owner, cmds) = &batches[0];
+        assert_eq!(*owner, 42);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::KickEvent { .. })),
+            "kickEventContinue's KickEvent must drain from the tick; got {cmds:?}",
+        );
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
+
+        // Client replies to the kick -> next resume runs
+        // processTtrBtl002's RunEventFunction.
+        let cmds = engine
+            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .expect("parked on the kick reply");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::RunEventFunction { .. })),
+            "processTtrBtl002 must drain off the kick reply; got {cmds:?}",
+        );
+    }
+
+    /// Same chain as `full_cinematic_signal_wait_chain_round_trip` but
+    /// against the REAL production scripts (`scripts/lua/` — the full
+    /// `QuestDirectorMan0g001.lua` require chain, global.lua's real
+    /// helpers, and the real `wait(1)`), so script-side regressions in
+    /// the SEQ_005 F-press flow fail in CI instead of live.
+    /// (Garlemald-Server #28.)
+    #[test]
+    fn real_man0g001_director_f_press_chain() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        assert!(
+            root.join("directors/Quest/QuestDirectorMan0g001.lua")
+                .exists()
+        );
+        let engine = LuaEngine::new(root);
+
+        let mut snapshot = sample_snapshot();
+        snapshot.current_class = 2; // gladiator -> IsDiscipleOfWar
+        snapshot.active_quests = vec![110_005]; // Man0g0
+        snapshot.active_quest_states = vec![userdata::QuestStateSnapshot {
+            quest_id: 110_005,
+            sequence: 5,
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }];
+
+        let script_path = root.join("directors/Quest/QuestDirectorMan0g001.lua");
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_director_on_event_started(
+            &script_path,
+            snapshot,
+            sample_director(dummy_queue),
+            "noticeEvent".to_string(),
+            5,
+            vec![],
+        );
+        assert!(
+            result.error.is_none(),
+            "director spawn errored: {:?}",
+            result.error,
+        );
+        // First slice: startTutorialMode's SendDataPacket + the
+        // processTtrBtl001 RunEventFunction, parked on the cinematic.
+        assert!(
+            result
+                .commands
+                .iter()
+                .any(|c| matches!(c, LuaCommand::RunEventFunction { .. })),
+            "processTtrBtl001 should drain; got {:?}",
+            result.commands,
+        );
+        assert_eq!(
+            engine.scheduler().lock().unwrap().pending_event_count(),
+            1,
+            "parked on the cinematic EventUpdate",
+        );
+
+        // Cinematic done.
+        let cmds = engine
+            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .expect("parked on cinematic");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::EndEvent { .. })),
+            "EndEvent after the cinematic; got {cmds:?}",
+        );
+        assert_eq!(
+            engine.scheduler().lock().unwrap().pending_signal_count(),
+            1,
+            "parked on playerActive",
+        );
+
+        // F press.
+        let resumed = engine.fire_signal_and_drain("playerActive");
+        assert!(resumed.is_empty(), "straight into wait(1); got {resumed:?}",);
+        assert_eq!(
+            engine.scheduler().lock().unwrap().pending_time_count(),
+            1,
+            "wait(1) must re-park on time",
+        );
+
+        // The REAL wait(1): sleep past it, then tick.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let batches = engine.tick();
+        assert_eq!(
+            batches.len(),
+            1,
+            "the post-wait continuation must drain; got {batches:?}",
+        );
+        let (owner, cmds) = &batches[0];
+        assert_eq!(*owner, 42);
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::KickEvent { .. })),
+            "kickEventContinue's KickEvent must drain; got {cmds:?}",
+        );
+        assert_eq!(
+            engine.scheduler().lock().unwrap().pending_event_count(),
+            1,
+            "parked on the kick reply",
+        );
     }
 }
