@@ -4726,7 +4726,10 @@ impl PacketProcessor {
             && let Some(client) = self.world.client(handle.session_id).await
         {
             let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25118,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -4811,7 +4814,10 @@ impl PacketProcessor {
             && let Some(client) = self.world.client(handle.session_id).await
         {
             let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30603,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -4885,7 +4891,10 @@ impl PacketProcessor {
             && let Some(client) = self.world.client(session_id).await
         {
             let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                player_id,
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30604,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -5055,7 +5064,10 @@ impl PacketProcessor {
             && let Some(client) = self.world.client(handle.session_id).await
         {
             let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30603,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -6441,7 +6453,10 @@ impl PacketProcessor {
         // system message).
         if let Some(client) = self.world.client(handle.session_id).await {
             let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25224,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -6509,7 +6524,10 @@ impl PacketProcessor {
         // `SendGameMessage(WorldMaster, 25086, 0x20, GetQuestId())`.
         if let Some(client) = self.world.client(handle.session_id).await {
             let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25086,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -6564,7 +6582,10 @@ impl PacketProcessor {
         // `SendGameMessage(this, WorldMaster, 25236, 0x20, abandoned.GetQuestId())`.
         if let Some(client) = self.world.client(handle.session_id).await {
             let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25236,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
