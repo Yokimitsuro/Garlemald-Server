@@ -3783,7 +3783,18 @@ pub(crate) async fn broadcast_quest_enpc_update(
     let Some(client) = world.client(session_id).await else {
         return;
     };
-    let zone_id = player_handle.zone_id;
+    // Resolve the player's CURRENT zone from the session — the
+    // ActorHandle's zone_id is frozen at registration (`reassign_zone`
+    // has no production callers), so after the man0g0 zone-166 → 155
+    // warp the handle still says 166 and the SEQ_010 quest NPCs spawned
+    // into 155 would never resolve. Pre-warp call sites read the same
+    // zone either way. (Garlemald-Server #28, req 4.)
+    let zone_id = world
+        .session(session_id)
+        .await
+        .map(|s| s.current_zone_id)
+        .filter(|z| *z != 0)
+        .unwrap_or(player_handle.zone_id);
     let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
     else {
         tracing::debug!(
@@ -3839,7 +3850,13 @@ async fn broadcast_quest_enpc_clear(
     let Some(client) = world.client(session_id).await else {
         return;
     };
-    let zone_id = player_handle.zone_id;
+    // Session-resolved zone (see broadcast_quest_enpc_update above).
+    let zone_id = world
+        .session(session_id)
+        .await
+        .map(|s| s.current_zone_id)
+        .filter(|z| *z != 0)
+        .unwrap_or(player_handle.zone_id);
     let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
     else {
         return;

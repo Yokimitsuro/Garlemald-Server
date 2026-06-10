@@ -6304,7 +6304,18 @@ impl PacketProcessor {
             return;
         };
 
-        let zone_id = player_handle.zone_id;
+        // Session-resolved zone — the ActorHandle's zone_id is frozen at
+        // registration (`reassign_zone` has no production callers), so a
+        // post-warp UpdateENPCs (the SEQ_010 Tkebbe talk flow in zone
+        // 155) would otherwise search the login zone and skip every
+        // broadcast. (Garlemald-Server #28, req 4.)
+        let zone_id = self
+            .world
+            .session(session_id)
+            .await
+            .map(|s| s.current_zone_id)
+            .filter(|z| *z != 0)
+            .unwrap_or(player_handle.zone_id);
         let Some(npc_handle) = self
             .find_npc_by_class_id(zone_id, enpc.actor_class_id)
             .await
@@ -6377,7 +6388,14 @@ impl PacketProcessor {
         let Some(client) = self.world.client(session_id).await else {
             return;
         };
-        let zone_id = player_handle.zone_id;
+        // Session-resolved zone (see broadcast_quest_enpc_update above).
+        let zone_id = self
+            .world
+            .session(session_id)
+            .await
+            .map(|s| s.current_zone_id)
+            .filter(|z| *z != 0)
+            .unwrap_or(player_handle.zone_id);
         let Some(npc_handle) = self
             .find_npc_by_class_id(zone_id, enpc.actor_class_id)
             .await
