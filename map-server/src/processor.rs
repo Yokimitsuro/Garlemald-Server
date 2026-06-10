@@ -1697,11 +1697,14 @@ impl PacketProcessor {
                 parent_zone_id,
                 area_name,
             } => {
-                tracing::info!(
-                    parent_zone = parent_zone_id,
-                    area = %area_name,
-                    "ContentFinished applied (stub: cleanup not yet wired)",
-                );
+                crate::runtime::quest_apply::apply_content_finished(
+                    parent_zone_id,
+                    &area_name,
+                    &self.registry,
+                    &self.world,
+                    self.lua.as_ref(),
+                )
+                .await;
             }
             // Event-flavoured commands (`RunEventFunction`, `EndEvent`)
             // emitted via the login-scoped pipeline get bridged through
@@ -1879,6 +1882,9 @@ impl PacketProcessor {
                 // client; roster broadcasts stay suppressed until
                 // `apply_do_zone_change_content` finishes the warp bundle.
                 warp_complete: false,
+                // Filled in by the spawn appliers as onCreate's spawns
+                // land; consumed by the ContentFinished teardown.
+                spawned_actor_ids: Vec::new(),
             });
             self.world.upsert_session(snap).await;
         }
@@ -2230,10 +2236,17 @@ impl PacketProcessor {
         // the owning session for this parent zone.
         let content_spawn = {
             let mut found = false;
-            for snap in self.world.all_sessions().await {
-                if let Some(active) = snap.active_content_script.as_ref()
+            for mut snap in self.world.all_sessions().await {
+                if let Some(active) = snap.active_content_script.as_mut()
                     && active.parent_zone_id == parent_zone_id
                 {
+                    // #28 S1.3 — record the spawn on the owning content so
+                    // the ContentFinished teardown despawns actors the
+                    // script never AddMember'd into the director roster.
+                    if !active.spawned_actor_ids.contains(&actor_id) {
+                        active.spawned_actor_ids.push(actor_id);
+                        self.world.upsert_session(snap).await;
+                    }
                     found = true;
                     break;
                 }
@@ -2468,6 +2481,23 @@ impl PacketProcessor {
                 character,
             ))
             .await;
+
+        // 6b. #28 S1.3 — content-area spawns (openingstoper et al.) are
+        //     recorded on the owning session's ActiveContentScript so the
+        //     ContentFinished teardown can despawn them: the director
+        //     roster alone misses SpawnActor'd trigger NPCs the script
+        //     never AddMember'd.
+        for mut snap in self.world.all_sessions().await {
+            if let Some(active) = snap.active_content_script.as_mut()
+                && active.parent_zone_id == zone_id
+            {
+                if !active.spawned_actor_ids.contains(&actor_id) {
+                    active.spawned_actor_ids.push(actor_id);
+                    self.world.upsert_session(snap).await;
+                }
+                break;
+            }
+        }
 
         // 7. SKIP immediate spawn_bundle_fanout. Same reasoning as
         //    apply_spawn_battle_npc_by_id: the content-area spawns
@@ -3307,138 +3337,26 @@ impl PacketProcessor {
         z: f32,
         rotation: f32,
     ) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            tracing::warn!(player = player_id, "DoZoneChange: actor missing");
-            return;
-        };
-        let session_id = handle.session_id;
-        let actor_id = handle.actor_id;
-        if session_id == 0 {
-            tracing::debug!(player = player_id, "DoZoneChange: no session (NPC?)");
-            return;
-        }
-
-        // 1. Migrate the actor between zones (no-op if zone_id is the
-        //    same as the current zone). `do_zone_change_with_private_area`
-        //    also updates the session's destination + zone +
-        //    private-area fields. `private_area = Some` routes the
-        //    actor into that PrivateArea instance's core pool;
-        //    `None` (or unknown name) goes to the parent zone's core.
-        let spawn = common::Vector3::new(x, y, z);
-        if let Err(e) = self
-            .world
-            .do_zone_change_with_private_area(
-                actor_id,
-                session_id,
-                zone_id,
-                private_area.clone(),
-                private_area_type,
-                spawn,
-                rotation,
-            )
-            .await
-        {
-            tracing::error!(
-                error = %e,
-                player = player_id,
-                zone = zone_id,
-                ?private_area,
-                "DoZoneChange: world.do_zone_change_with_private_area failed"
-            );
-            return;
-        }
-
-        // 2. Update the character's persistent zone_id + position
-        //    (the registry move above only touches the spatial grid;
-        //    the Character row's `base.zone_id` is what `send_zone_in_bundle`
-        //    reads on the next login + what persists to disk). Also
-        //    purge any status effects tagged LOSE_ON_ZONING — mirrors
-        //    Meteor's `Player.CleanupAndSave`
-        //    (`Map Server/Actors/Chara/Player/Player.cs:844`) which
-        //    drops these effects unconditionally as the player crosses
-        //    the zone boundary.
-        let mut status_outbox = crate::status::StatusOutbox::new();
-        {
-            let mut c = handle.character.write().await;
-            c.base.zone_id = zone_id;
-            c.base.position_x = x;
-            c.base.position_y = y;
-            c.base.position_z = z;
-            c.base.rotation = rotation;
-            c.status_effects.remove_by_flag(
-                crate::status::StatusEffectFlags::LOSE_ON_ZONING,
-                &mut status_outbox,
-            );
-        }
-        self.drain_status_outbox(status_outbox).await;
-
-        // 3. Carry the requested spawn_type through to the zone-in
-        //    bundle so the client plays the right "you arrived" anim.
-        if let Some(mut snap) = self.world.session(session_id).await {
-            snap.destination_spawn_type = spawn_type;
-            self.world.upsert_session(snap).await;
-        }
-
-        // 4. Emit the zone-change packet trio — same order as
-        //    `apply_do_zone_change_content`.
-        let Some(client) = self.world.client(session_id).await else {
-            tracing::warn!(player = player_id, "DoZoneChange: no client");
-            return;
-        };
-        // Tagged with the session id — untargeted subpackets are dropped by
-        // the world-server proxy fan-out, so this pair never reached the
-        // client before (see the matching block + decomp notes in
-        // `apply_do_zone_change_content`). Cross-zone warps still completed
-        // because a real region change takes the SetMap handler's
-        // region-mismatch arm; delivering the wipe + 0x00E2 restores pmeteor
-        // parity (`DoZoneChange`, WorldManager.cs:877-879). Subcode 0x02 is
-        // what pmeteor sends for full zone changes (0x10 is the in-place /
-        // content-instance variant) — both set the client's force-reload
-        // latch, so the distinction is parity-only. (Garlemald-Server #28.)
-        {
-            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
-            wipe.set_target_id(session_id);
-            client.send_bytes(wipe.to_bytes()).await;
-            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
-            e2.set_target_id(session_id);
-            client.send_bytes(e2.to_bytes()).await;
-        }
-
-        // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
-        //    from the session + character we just updated, so the
-        //    bundle spawns the player at the new coords.
-        self.world
-            .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
-            .await;
-
-        // 6. pmeteor sends the 34108 "instance" message AFTER the bundle
-        //    when the destination is a PrivateArea (`if (newArea is
-        //    PrivateArea)`, WorldManager.cs:887-888) — the SEQ_005 return
-        //    warp into zone 155's PrivateAreaMasterPast takes this branch
-        //    in the reference capture. (Garlemald-Server #28.)
-        if private_area.is_some() {
-            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
-                34108,
-                0x20,
-            );
-            msg.set_target_id(session_id);
-            client.send_bytes(msg.to_bytes()).await;
-        }
-
-        tracing::info!(
-            player = player_id,
-            zone = zone_id,
-            ?private_area,
+        // Body extracted to `quest_apply::apply_do_zone_change` (#28
+        // S1.2) so the runtime drain (ticker / signal resumes — the
+        // SEQ_005 director's final warp-out) can reach it without an
+        // `Arc<PacketProcessor>`; this arm just delegates.
+        crate::runtime::quest_apply::apply_do_zone_change(
+            player_id,
+            zone_id,
+            private_area,
             private_area_type,
             spawn_type,
             x,
             y,
             z,
             rotation,
-            "DoZoneChange applied (cross-zone warp + zone-in replay)",
-        );
+            &self.registry,
+            &self.db,
+            &self.world,
+            self.lua.as_ref(),
+        )
+        .await;
     }
 
     /// `WorldManager:WarpToPublicArea(player[, x, y, z, rot])` — quest

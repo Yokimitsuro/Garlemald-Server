@@ -99,7 +99,11 @@ pub fn translate_lua_commands_into_outbox(
             // `session.pending_kick_event` for emission either at the
             // end of the next zone-in bundle (OpeningDirector path) OR
             // pre-warp by `apply_do_zone_change_content` (SEQ_005
-            // content-director path).
+            // content-director path). Runtime/event-bridge drains hit
+            // `apply_runtime_lua_command`'s KickEvent arm instead
+            // (immediate send — the mid-flow `kickEventContinue`
+            // shape, #28 S1.1); both homes rely on this exclusion to
+            // stay single-emission.
             //
             // Translating KickEvent here AS WELL produced a duplicate
             // wire emission per quest-hook-driven kick: one fires

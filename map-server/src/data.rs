@@ -161,6 +161,13 @@ pub struct ActiveContentScript {
     /// for roster members (e.g. the `ChangeState(2)` poses) are
     /// suppressed until the warp bundle has spawned them client-side.
     pub warp_complete: bool,
+    /// Every actor id materialised by this content's spawn appliers
+    /// (`SpawnBattleNpcById` + `SpawnActor`) while the script was
+    /// active. The `ContentFinished` teardown despawns these — the
+    /// director roster alone misses actors the script spawned but
+    /// never `AddMember`'d (SEQ_005's `openingstoper` event trigger).
+    /// (#28 S1.3.)
+    pub spawned_actor_ids: Vec<u32>,
 }
 
 /// Runtime-only snapshot of an in-world retainer. Holds the minimal

@@ -3287,6 +3287,24 @@ impl UserData for LuaZone {
             "FindActorInZoneByUniqueID",
             |_, _this, _unique_id: String| Ok(Value::Nil),
         );
+        // `zone:ContentFinished()` — the SEQ_005 director's teardown
+        // arrives as `player:GetZone():ContentFinished()`, and
+        // `GetZone()` returns a LuaZone, NOT a LuaContentArea — without
+        // this method the call is a nil-call error and everything after
+        // it in the drained batch (the DoZoneChange warp-out) never
+        // runs. `area_name` is left empty; `apply_content_finished`
+        // resolves the live area from the owning session's
+        // `active_content_script`. (#28 S1.3.)
+        methods.add_method("ContentFinished", |_, this, _: ()| {
+            push(
+                &this.queue,
+                LuaCommand::ContentFinished {
+                    parent_zone_id: this.snapshot.zone_id,
+                    area_name: String::new(),
+                },
+            );
+            Ok(())
+        });
     }
 }
 

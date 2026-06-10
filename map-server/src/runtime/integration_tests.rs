@@ -11631,6 +11631,7 @@ async fn ticker_survives_tutorial_state_and_drains_time_parks() {
                 content_area_actor_id: 0x6534_0002,
                 content_script: "SimpleContent30010".to_string(),
                 warp_complete: true,
+                spawned_actor_ids: Vec::new(),
             }),
             ..MapSession::default()
         })
@@ -11683,5 +11684,622 @@ async fn ticker_survives_tutorial_state_and_drains_time_parks() {
         lua.scheduler().lock().unwrap().pending_time_count(),
         0,
         "the wait(0.2) park must have been drained by the ticker",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #28 Phase 1 — runtime/event-bridge command routing (S1.1–S1.4)
+// ---------------------------------------------------------------------------
+
+/// S1.1 — a `KickEvent` drained through the EVENT bridge for a
+/// registered player must produce exactly one 0x012F on the wire:
+/// event_type 5 ("noticeEvent" tag — the client's kick receiver[+0x80]
+/// gate), trigger = player at body+0x00, owner = director at body+0x04,
+/// target-stamped with the session id. The translator keeps its
+/// deliberate KickEvent exclusion (`kick_event_is_suppressed_from_outbox`),
+/// so the runtime arm is the single emission point on this path.
+#[tokio::test]
+async fn runtime_drain_kick_event_sends_kick_packet_with_event_type_5() {
+    use crate::data::Session as MapSession;
+    use crate::lua::command::LuaCommand;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0002u32;
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: session_id,
+            current_zone_id: 166,
+            ..MapSession::default()
+        })
+        .await;
+
+    let handle = registry.get(player_id).await.expect("player handle");
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        vec![LuaCommand::KickEvent {
+            player_id,
+            actor_id: director_id,
+            trigger: "noticeEvent".to_string(),
+            args: vec![],
+        }],
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+
+    let bytes = rx.try_recv().expect("kick packet must reach the client");
+    let mut offset = 0;
+    let sub = common::subpacket::SubPacket::parse(&bytes, &mut offset).expect("parse kick");
+    assert_eq!(
+        sub.game_message.opcode,
+        crate::packets::opcodes::OP_KICK_EVENT,
+        "runtime KickEvent must emit 0x012F",
+    );
+    assert_eq!(sub.header.source_id, player_id, "trigger actor = player");
+    assert_eq!(
+        sub.header.target_id, session_id,
+        "kick must be target-stamped with the session id (proxy rule)",
+    );
+    assert_eq!(
+        u32::from_le_bytes(sub.data[0..4].try_into().unwrap()),
+        player_id,
+        "body+0x00 trigger actor id",
+    );
+    assert_eq!(
+        u32::from_le_bytes(sub.data[4..8].try_into().unwrap()),
+        director_id,
+        "body+0x04 owner actor id",
+    );
+    assert_eq!(sub.data[8], 5, "event_type byte must be 5 (noticeEvent)");
+    assert!(
+        rx.try_recv().is_err(),
+        "exactly one packet — no duplicate emission",
+    );
+}
+
+/// S1.2 (documentation test) — the seed installs a
+/// `PrivateAreaMasterPast` level-1 replica on zone 155
+/// (`034_server_zones_privateareas.sql` row 5; `privateAreaType` is
+/// what `install_private_area` keys the level map by). Report E flagged
+/// this as unverified: the director's final
+/// `DoZoneChange(155, "PrivateAreaMasterPast", 1, …)` therefore
+/// resolves the named instance on a seeded server rather than taking
+/// the parent-zone fallback at `do_zone_change_with_private_area`.
+#[tokio::test]
+async fn zone_155_seed_installs_private_area_master_past_level_1() {
+    let db = crate::database::Database::open(tempdb()).await.expect("db");
+    let rows = db.load_private_areas().await.expect("load_private_areas");
+    assert!(
+        rows.iter().any(|r| r.parent_zone_id == 155
+            && r.private_area_name == "PrivateAreaMasterPast"
+            && r.private_area_type == 1),
+        "zone 155 must seed PrivateAreaMasterPast level 1 (SEQ_005 return warp target); got {:?}",
+        rows.iter()
+            .filter(|r| r.parent_zone_id == 155)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// S1.2 — `DoZoneChange` drained through the EVENT bridge (the SEQ_005
+/// director's final warp-out runs from a non-processor context) must
+/// migrate the player's session into the named private area and emit a
+/// non-empty warp burst whose every subpacket is target-stamped
+/// (untargeted subpackets are dropped by the world-server proxy).
+#[tokio::test]
+async fn runtime_drain_do_zone_change_warps_session_with_targeted_burst() {
+    use crate::data::Session as MapSession;
+    use crate::lua::command::LuaCommand;
+    use crate::zone::PrivateArea;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    // Source zone 166 + destination zone 155 carrying the
+    // PrivateAreaMasterPast level-1 replica (mirrors the seed row that
+    // `zone_155_seed_installs_private_area_master_past_level_1` pins).
+    let zone166 = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    world.register_zone(zone166).await;
+    let mut zone155 = Zone::new(
+        155,
+        "fst0Town01a",
+        102,
+        "/Area/Zone/ZoneMasterGridania",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    zone155.add_private_area(PrivateArea::new(
+        155,
+        "fst0Town01a",
+        102,
+        5,
+        "/Area/PrivateArea/PrivateAreaMasterPast",
+        "PrivateAreaMasterPast",
+        1,
+        51,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+    ));
+    world.register_zone(zone155).await;
+
+    let player_id = 0x0040_0001u32;
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player.base.position_x = 360.0;
+    player.base.position_z = -700.0;
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: session_id,
+            current_zone_id: 166,
+            ..MapSession::default()
+        })
+        .await;
+
+    let handle = registry.get(player_id).await.expect("player handle");
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        vec![LuaCommand::DoZoneChange {
+            player_id,
+            zone_id: 155,
+            private_area: Some("PrivateAreaMasterPast".to_string()),
+            private_area_type: 1,
+            spawn_type: 15,
+            x: 175.38,
+            y: -1.21,
+            z: -1156.51,
+            rotation: -2.1,
+        }],
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+
+    let session = world.session(session_id).await.expect("session");
+    assert_eq!(session.current_zone_id, 155, "session migrated to zone 155");
+    assert_eq!(
+        session.current_private_area_name.as_deref(),
+        Some("PrivateAreaMasterPast"),
+        "named private area resolved (no parent-zone fallback)",
+    );
+    assert_eq!(session.current_private_area_level, 1);
+    {
+        let c = handle.character.read().await;
+        assert_eq!(c.base.zone_id, 155, "character row follows the warp");
+    }
+
+    let mut total_subpackets = 0usize;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            total_subpackets += 1;
+            assert_ne!(
+                sub.header.target_id, 0,
+                "every warp-burst subpacket must be target-stamped (opcode 0x{:04X})",
+                sub.game_message.opcode,
+            );
+        }
+    }
+    assert!(
+        total_subpackets > 0,
+        "warp burst must be non-empty (DeleteAllActors + 0x00E2 + zone-in bundle)",
+    );
+}
+
+/// S1.3 — `apply_content_finished` is the full eager teardown: content
+/// NPCs (director roster + `spawned_actor_ids` extras) leave the
+/// registry AND the zone grid, the rosters + `active_content_script`
+/// clear, the player's tutorial `MinimumHpLock` lifts, and the player's
+/// parked coroutines purge from the scheduler.
+#[tokio::test]
+async fn apply_content_finished_tears_down_content_state() {
+    use crate::data::Session as MapSession;
+
+    // Script root: a director parked on waitForSignal so the scheduler
+    // holds a signal park owned by the player.
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-content-finished-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+    std::fs::write(
+        root.join("global.lua"),
+        r#"
+            function waitForSignal(signal)
+                return coroutine.yield("_WAIT_SIGNAL", signal);
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("directors/Quest/Teardown.lua"),
+        r#"
+            require ("global")
+            function onEventStarted(player, director, eventType, eventName)
+                waitForSignal("battleComplete")
+            end
+        "#,
+    )
+    .unwrap();
+    let lua = Arc::new(crate::lua::LuaEngine::new(&root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let mut zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0003u32;
+    let yda_id = 0x4534_0006u32;
+    let wolf_id = 0x4534_0003u32;
+    let stoper_id = 0x4534_0010u32; // SpawnActor'd, never AddMember'd
+    let mut ob = AreaOutbox::new();
+    for (id, kind) in [
+        (player_id, ActorKind::Player),
+        (yda_id, ActorKind::BattleNpc),
+        (wolf_id, ActorKind::BattleNpc),
+        (stoper_id, ActorKind::Npc),
+    ] {
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: id,
+                kind,
+                position: Vector3::new(360.0, 4.0, -700.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(166).await.unwrap();
+
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player
+        .chara
+        .mods
+        .set(crate::actor::Modifier::MinimumHpLock, 1.0);
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    for (id, kind) in [
+        (yda_id, ActorKindTag::Ally),
+        (wolf_id, ActorKindTag::BattleNpc),
+        (stoper_id, ActorKindTag::Npc),
+    ] {
+        let mut c = Character::new(id);
+        c.base.zone_id = 166;
+        registry.insert(ActorHandle::new(id, kind, 166, 0, c)).await;
+    }
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    let mut session = MapSession {
+        id: session_id,
+        current_zone_id: 166,
+        active_content_script: Some(crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+            director_name: "Quest/Teardown".to_string(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0x6534_0002,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+            spawned_actor_ids: vec![stoper_id],
+        }),
+        ..MapSession::default()
+    };
+    session
+        .transient_director_members
+        .insert(director_id, vec![player_id, director_id, yda_id, wolf_id]);
+    session.transient_party_members.push(yda_id);
+    world.upsert_session(session).await;
+
+    // Park the director coroutine on a signal, owned by the player.
+    let result = lua.call_director_on_event_started(
+        &root.join("directors/Quest/Teardown.lua"),
+        crate::lua::userdata::PlayerSnapshot {
+            actor_id: player_id,
+            ..Default::default()
+        },
+        crate::lua::userdata::LuaDirectorHandle {
+            name: "Quest/Teardown".to_string(),
+            actor_id: director_id,
+            class_path: "/Director/Quest/Teardown".to_string(),
+            queue: crate::lua::command::CommandQueue::new(),
+        },
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(lua.scheduler().lock().unwrap().pending_signal_count(), 1);
+
+    crate::runtime::quest_apply::apply_content_finished(166, "", &registry, &world, Some(&lua))
+        .await;
+
+    // Content NPCs gone from the registry; the player survives.
+    for id in [yda_id, wolf_id, stoper_id] {
+        assert!(
+            registry.get(id).await.is_none(),
+            "0x{id:08X} must be despawned from the registry",
+        );
+    }
+    assert!(registry.get(player_id).await.is_some(), "player stays");
+    // ...and gone from the zone grid (the apply_despawn_actor leak fix).
+    {
+        let z = zone_arc.read().await;
+        let around = z.core.actors_around_point(360.0, -700.0, 50.0);
+        let ids: Vec<u32> = around.iter().map(|a| a.actor_id).collect();
+        for id in [yda_id, wolf_id, stoper_id] {
+            assert!(
+                !ids.contains(&id),
+                "0x{id:08X} must be removed from the spatial grid; grid = {ids:?}",
+            );
+        }
+        assert!(ids.contains(&player_id), "player keeps their grid entry");
+    }
+    // Session state cleared.
+    let snap = world.session(session_id).await.expect("session");
+    assert!(snap.active_content_script.is_none(), "content script off");
+    assert!(snap.transient_director_members.is_empty(), "roster cleared");
+    assert!(snap.transient_party_members.is_empty(), "party cleared");
+    // MinimumHpLock lifted — player killable again.
+    {
+        let handle = registry.get(player_id).await.unwrap();
+        let c = handle.character.read().await;
+        assert_eq!(
+            c.chara.mods.get(crate::actor::Modifier::MinimumHpLock),
+            0.0,
+            "tutorial MinimumHpLock must be cleared at teardown",
+        );
+    }
+    // Scheduler empty for the owner — no stale park can resume into the
+    // torn-down instance.
+    {
+        let s = lua.scheduler().lock().unwrap();
+        assert_eq!(s.pending_signal_count(), 0, "signal park purged");
+        assert_eq!(s.pending_time_count(), 0);
+        assert_eq!(s.pending_event_count(), 0);
+    }
+}
+
+/// S1.4 — the ticker's content `onUpdate` drain rides the EVENT bridge:
+/// a content script calling `sendSignal("x")` must resume a coroutine
+/// parked on `waitForSignal("x")`. On the old plain runtime drain the
+/// `SendSignal` command fell through the catch-all and was silently
+/// dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_on_update_send_signal_resumes_parked_coroutine() {
+    use crate::data::Session as MapSession;
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-onupdate-signal-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("content")).unwrap();
+    std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+    std::fs::write(
+        root.join("global.lua"),
+        r#"
+            function waitForSignal(signal)
+                return coroutine.yield("_WAIT_SIGNAL", signal);
+            end
+            function sendSignal(signal)
+                GetLuaInstance():OnSignal(signal);
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("content/SignalContent.lua"),
+        r#"
+            require ("global")
+            function onUpdate(tick, area)
+                sendSignal("x")
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("directors/Quest/SignalWaiter.lua"),
+        r#"
+            require ("global")
+            function onEventStarted(player, director, eventType, eventName)
+                waitForSignal("x")
+            end
+        "#,
+    )
+    .unwrap();
+    let lua = Arc::new(crate::lua::LuaEngine::new(&root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    world.register_zone(zone).await;
+
+    let player_id = 0x0040_0001u32;
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: session_id,
+            current_zone_id: 166,
+            active_content_script: Some(crate::data::ActiveContentScript {
+                parent_zone_id: 166,
+                area_name: "man0g01".to_string(),
+                area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+                director_name: "Quest/SignalWaiter".to_string(),
+                director_actor_id: 0x6608_0003,
+                content_area_actor_id: 0x6534_0002,
+                content_script: "SignalContent".to_string(),
+                warp_complete: true,
+                spawned_actor_ids: Vec::new(),
+            }),
+            ..MapSession::default()
+        })
+        .await;
+
+    // Park a coroutine on "x".
+    let result = lua.call_director_on_event_started(
+        &root.join("directors/Quest/SignalWaiter.lua"),
+        crate::lua::userdata::PlayerSnapshot {
+            actor_id: player_id,
+            ..Default::default()
+        },
+        crate::lua::userdata::LuaDirectorHandle {
+            name: "Quest/SignalWaiter".to_string(),
+            actor_id: 0x6608_0003,
+            class_path: "/Director/Quest/SignalWaiter".to_string(),
+            queue: crate::lua::command::CommandQueue::new(),
+        },
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(lua.scheduler().lock().unwrap().pending_signal_count(), 1);
+
+    // One ticker frame past the 500 ms content cadence: onUpdate fires,
+    // its SendSignal rides the event bridge, and the park resumes.
+    let ticker = GameTicker::with_lua(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+        Some(lua.clone()),
+    );
+    ticker.tick_once(600).await;
+
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_signal_count(),
+        0,
+        "the coroutine parked on \"x\" must have been resumed by the onUpdate sendSignal",
     );
 }

@@ -32,8 +32,13 @@
 //! like `onStateChange` from a `QuestStartSequence` command).
 //!
 //! Login-flow-only commands (`SetLoginDirector`, `CreateDirector`,
-//! `KickEvent`, `SetPos` during tutorial spawn) stay on the processor
-//! because they mutate session state this module doesn't see.
+//! `SetPos` during tutorial spawn) stay on the processor because they
+//! mutate session state this module doesn't see. `KickEvent` has TWO
+//! homes by design: the processor's login arm captures into
+//! `session.pending_kick_event` (deferred emission at the end of the
+//! zone-in bundle / pre-warp window), while the runtime arm here sends
+//! immediately — the mid-flow `kickEventContinue` shape drained from
+//! ticker/signal contexts where no bundle is coming. (#28 S1.1.)
 
 #![allow(dead_code)]
 
@@ -523,6 +528,51 @@ pub async fn apply_runtime_lua_command(
         } => {
             apply_set_actor_target_animated(source_actor_id, target_actor_id, registry, world)
                 .await;
+            true
+        }
+        LC::KickEvent {
+            player_id,
+            actor_id,
+            trigger,
+            args,
+        } => {
+            apply_kick_event(player_id, actor_id, &trigger, &args, registry, world).await;
+            true
+        }
+        LC::DoZoneChange {
+            player_id,
+            zone_id,
+            private_area,
+            private_area_type,
+            spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+        } => {
+            apply_do_zone_change(
+                player_id,
+                zone_id,
+                private_area,
+                private_area_type,
+                spawn_type,
+                x,
+                y,
+                z,
+                rotation,
+                registry,
+                db,
+                world,
+                lua,
+            )
+            .await;
+            true
+        }
+        LC::ContentFinished {
+            parent_zone_id,
+            area_name,
+        } => {
+            apply_content_finished(parent_zone_id, &area_name, registry, world, lua).await;
             true
         }
         _ => false,
@@ -1047,9 +1097,18 @@ async fn apply_despawn_actor(
         sub.to_bytes(),
     )
     .await;
-    // Remove from registry after the broadcast so spatial-grid lookups
-    // during fan-out still see it.
+    // Remove from registry AND the zone's spatial grid after the
+    // broadcast (so spatial-grid lookups during fan-out still see it).
+    // The grid removal mirrors the spawn appliers' `zone.core.add_actor`
+    // insertion — without it a despawned actor leaks a ghost entry that
+    // `actors_around` keeps yielding to AI/broadcast radius queries.
+    // (#28 S1.3.)
     registry.remove(actor_id).await;
+    {
+        let mut zone_write = zone_arc.write().await;
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone_write.core.remove_actor(actor_id, &mut ob);
+    }
     tracing::debug!(
         actor = format!("0x{actor_id:08X}"),
         zone,
@@ -1229,6 +1288,208 @@ async fn apply_set_actor_target_animated(
     );
 }
 
+/// `player:KickEvent(director, trigger, ...)` drained from a runtime /
+/// event-bridge context (ticker resume, signal resume, death path) —
+/// the mid-flow `kickEventContinue` shape. Builds + sends the 0x012F
+/// immediately, copying the post-zone-in direct-dispatch shape
+/// (`processor::apply_post_zone_in_lua_command`). This is deliberately
+/// NOT the login-bundle capture: `apply_login_lua_command`'s KickEvent
+/// arm defers emission to the zone-in bundle / pre-warp window, which
+/// never comes for a director resumed mid-flow. `event_type` is always
+/// 5 — the "noticeEvent" tag the client's kick receiver[+0x80] gate
+/// requires; any other value is a silent client-side drop. The
+/// event-bridge translator keeps its deliberate KickEvent exclusion
+/// (`event/lua_bridge.rs`); this arm is the one runtime home. (#28 S1.1.)
+async fn apply_kick_event(
+    player_id: u32,
+    actor_id: u32,
+    trigger: &str,
+    args: &[crate::lua::command::LuaCommandArg],
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    if actor_id == 0 {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            trigger,
+            "KickEvent skipped — no owner actor id",
+        );
+        return;
+    }
+    let Some(handle) = registry.get(player_id).await else {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            trigger,
+            "KickEvent skipped — player not in registry",
+        );
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            trigger,
+            "KickEvent skipped — player has no session",
+        );
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        tracing::warn!(
+            session = session_id,
+            trigger,
+            "KickEvent dropped — no client handle",
+        );
+        return;
+    };
+    let lua_params: Vec<common::luaparam::LuaParam> = args
+        .iter()
+        .map(crate::event::lua_bridge::arg_to_lua_param)
+        .collect();
+    let mut sub = crate::packets::send::events::build_kick_event(
+        player_id,
+        actor_id,
+        trigger,
+        5,
+        &lua_params,
+    );
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::info!(
+        session = session_id,
+        trigger_actor = format!("0x{player_id:08X}"),
+        owner_actor = format!("0x{actor_id:08X}"),
+        event = %trigger,
+        args = lua_params.len(),
+        "KickEvent dispatched directly to client (runtime drain)",
+    );
+}
+
+/// `zone:ContentFinished()` / `area:ContentFinished()` — full teardown
+/// of the active scripted content. pmeteor's `PrivateAreaContent.
+/// ContentFinished` only sets `isContentFinished` and defers the real
+/// cleanup to the next `DoZoneChange`'s CheckDestroy sweep; garlemald's
+/// fixed director command order (ContentFinished immediately followed
+/// by DoZoneChange in the same drained batch) lets us be eager here
+/// (#28 S1.3, report E §3.2):
+///
+/// 1. resolve the owning session by `active_content_script` scan
+///    (`area_name` is empty from the LuaZone binding — the live area is
+///    whatever the session carries);
+/// 2. despawn the content NPCs: director-roster members with kind ∈
+///    {BattleNpc, Ally} plus every id the spawn appliers recorded on
+///    `spawned_actor_ids` (catches the `openingstoper` trigger that is
+///    SpawnActor'd but never AddMember'd). RemoveActor packets pre-warp
+///    are harmless — the warp's DeleteAllActors wipes client state;
+/// 3. clear the director roster + (defensively) the transient party;
+/// 4. `active_content_script = None` — stops the 500 ms onUpdate driver
+///    and the 0x0133 `/_init` content branch;
+/// 5. clear the player's tutorial `MinimumHpLock` (set in onCreate;
+///    mods survive warps — without this the player is unkillable
+///    forever);
+/// 6. purge the player's parked coroutines so a stale `_WAIT_EVENT`
+///    director can't resume into the torn-down instance.
+///
+/// Wire: nothing mandatory — the reference capture carries zero 0x0143
+/// DeleteGroup in 60,232 lines; the warp's DeleteAllActors resets
+/// client group state and the post-warp zone-in bundle re-sends the
+/// solo party trio.
+pub(crate) async fn apply_content_finished(
+    parent_zone_id: u32,
+    area_name: &str,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    // 1. Owning session — the one whose active content matches this
+    //    parent zone (+ area name when the caller knew it).
+    let mut owner: Option<crate::data::Session> = None;
+    for snap in world.all_sessions().await {
+        if let Some(active) = snap.active_content_script.as_ref()
+            && active.parent_zone_id == parent_zone_id
+            && (area_name.is_empty() || active.area_name == area_name)
+        {
+            owner = Some(snap);
+            break;
+        }
+    }
+    let Some(mut snap) = owner else {
+        tracing::info!(
+            parent_zone = parent_zone_id,
+            area = %area_name,
+            "ContentFinished: no session with active content — nothing to tear down",
+        );
+        return;
+    };
+    let session_id = snap.id;
+    let Some(active) = snap.active_content_script.clone() else {
+        return;
+    };
+    let director_id = active.director_actor_id;
+
+    // 2. Despawn set: roster content-NPCs (never the player or the
+    //    director) + the spawn appliers' recorded ids, deduped.
+    let mut despawn: Vec<u32> = Vec::new();
+    if let Some(roster) = snap.transient_director_members.get(&director_id) {
+        for &member_id in roster {
+            let Some(member) = registry.get(member_id).await else {
+                continue;
+            };
+            if matches!(member.kind, ActorKindTag::BattleNpc | ActorKindTag::Ally)
+                && !despawn.contains(&member_id)
+            {
+                despawn.push(member_id);
+            }
+        }
+    }
+    for &spawned_id in &active.spawned_actor_ids {
+        if !despawn.contains(&spawned_id) {
+            despawn.push(spawned_id);
+        }
+    }
+    let despawn_count = despawn.len();
+    for actor_id in despawn {
+        apply_despawn_actor(parent_zone_id, actor_id, registry, world).await;
+    }
+
+    // 3 + 4. Roster + content-script clears.
+    snap.transient_director_members.remove(&director_id);
+    snap.transient_party_members.clear();
+    snap.active_content_script = None;
+    world.upsert_session(snap).await;
+
+    // 5. Player teardown — MinimumHpLock off.
+    let player_id = match registry.by_session(session_id).await {
+        Some(player) => {
+            {
+                let mut c = player.character.write().await;
+                c.chara.mods.set(crate::actor::Modifier::MinimumHpLock, 0.0);
+            }
+            player.actor_id
+        }
+        None => 0,
+    };
+
+    // 6. Scheduler purge.
+    let purged = match (player_id, lua) {
+        (0, _) | (_, None) => 0,
+        (pid, Some(engine)) => engine
+            .scheduler()
+            .lock()
+            .map(|mut s| s.purge_owner(pid))
+            .unwrap_or(0),
+    };
+
+    tracing::info!(
+        session = session_id,
+        parent_zone = parent_zone_id,
+        area = %active.area_name,
+        director = format!("0x{director_id:08X}"),
+        despawned = despawn_count,
+        purged_coroutines = purged,
+        "ContentFinished applied (full teardown)",
+    );
+}
+
 /// B3 of the SEQ_005 unblock plan — port of C# `Chara::SetMod`.
 /// Writes `value` into the target actor's `ModifierMap` keyed by
 /// the numeric modifier id (the Rust `Modifier` enum's `as_u32`).
@@ -1362,6 +1623,187 @@ async fn apply_director_outbox_op<F>(
         zone = zone_id,
         op = op_name,
         "runtime director-outbox op applied",
+    );
+}
+
+/// `GetWorldManager():DoZoneChange(player, zoneId, privateArea_or_nil,
+/// privateAreaType, spawnType, x, y, z, rot)` — full cross-zone warp.
+/// Extracted from the processor (#28 S1.2) so the runtime drain
+/// (ticker / signal resumes — the SEQ_005 director's final warp-out
+/// runs in a death-path call stack) can reach it; the processor's
+/// login arm delegates here.
+///
+/// Same-zone targets short-circuit the registry move and behave like a
+/// glorified `WarpToPosition` followed by a re-render. `private_area =
+/// Some` routes the actor into that `PrivateArea` instance's core pool
+/// (zone 155 ships a `PrivateAreaMasterPast` level-1 replica in the
+/// seed — `034_server_zones_privateareas.sql` row 5 — so the tutorial
+/// return warp resolves it rather than taking the parent-zone fallback
+/// logged by `do_zone_change_with_private_area`).
+///
+/// Every directly-built subpacket in the warp burst is target-stamped
+/// with the session id — untargeted subpackets are dropped by the
+/// world-server proxy fan-out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_do_zone_change(
+    player_id: u32,
+    zone_id: u32,
+    private_area: Option<String>,
+    private_area_type: u32,
+    spawn_type: u8,
+    x: f32,
+    y: f32,
+    z: f32,
+    rotation: f32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        tracing::warn!(player = player_id, "DoZoneChange: actor missing");
+        return;
+    };
+    let session_id = handle.session_id;
+    let actor_id = handle.actor_id;
+    if session_id == 0 {
+        tracing::debug!(player = player_id, "DoZoneChange: no session (NPC?)");
+        return;
+    }
+
+    // 1. Migrate the actor between zones (no-op if zone_id is the
+    //    same as the current zone). `do_zone_change_with_private_area`
+    //    also updates the session's destination + zone +
+    //    private-area fields. `private_area = Some` routes the
+    //    actor into that PrivateArea instance's core pool;
+    //    `None` (or unknown name) goes to the parent zone's core.
+    let spawn = common::Vector3::new(x, y, z);
+    if let Err(e) = world
+        .do_zone_change_with_private_area(
+            actor_id,
+            session_id,
+            zone_id,
+            private_area.clone(),
+            private_area_type,
+            spawn,
+            rotation,
+        )
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            player = player_id,
+            zone = zone_id,
+            ?private_area,
+            "DoZoneChange: world.do_zone_change_with_private_area failed"
+        );
+        return;
+    }
+
+    // 2. Update the character's persistent zone_id + position
+    //    (the registry move above only touches the spatial grid;
+    //    the Character row's `base.zone_id` is what `send_zone_in_bundle`
+    //    reads on the next login + what persists to disk). Also
+    //    purge any status effects tagged LOSE_ON_ZONING — mirrors
+    //    Meteor's `Player.CleanupAndSave`
+    //    (`Map Server/Actors/Chara/Player/Player.cs:844`) which
+    //    drops these effects unconditionally as the player crosses
+    //    the zone boundary.
+    let mut status_outbox = crate::status::StatusOutbox::new();
+    {
+        let mut c = handle.character.write().await;
+        c.base.zone_id = zone_id;
+        c.base.position_x = x;
+        c.base.position_y = y;
+        c.base.position_z = z;
+        c.base.rotation = rotation;
+        c.status_effects.remove_by_flag(
+            crate::status::StatusEffectFlags::LOSE_ON_ZONING,
+            &mut status_outbox,
+        );
+    }
+    // Same drain shape as the processor's `drain_status_outbox` —
+    // without the Lua engine the wire/save/recalc fan-out is dropped
+    // but the in-memory purge above has already landed.
+    if let Some(lua_ref) = lua {
+        for evt in status_outbox.drain() {
+            crate::runtime::dispatcher::dispatch_status_event(
+                &evt,
+                registry,
+                world,
+                db,
+                lua_ref.catalogs(),
+            )
+            .await;
+        }
+    }
+
+    // 3. Carry the requested spawn_type through to the zone-in
+    //    bundle so the client plays the right "you arrived" anim.
+    if let Some(mut snap) = world.session(session_id).await {
+        snap.destination_spawn_type = spawn_type;
+        world.upsert_session(snap).await;
+    }
+
+    // 4. Emit the zone-change packet trio — same order as
+    //    `apply_do_zone_change_content`.
+    let Some(client) = world.client(session_id).await else {
+        tracing::warn!(player = player_id, "DoZoneChange: no client");
+        return;
+    };
+    // Tagged with the session id — untargeted subpackets are dropped by
+    // the world-server proxy fan-out, so this pair never reached the
+    // client before (see the matching block + decomp notes in
+    // `apply_do_zone_change_content`). Cross-zone warps still completed
+    // because a real region change takes the SetMap handler's
+    // region-mismatch arm; delivering the wipe + 0x00E2 restores pmeteor
+    // parity (`DoZoneChange`, WorldManager.cs:877-879). Subcode 0x02 is
+    // what pmeteor sends for full zone changes (0x10 is the in-place /
+    // content-instance variant) — both set the client's force-reload
+    // latch, so the distinction is parity-only. (Garlemald-Server #28.)
+    {
+        let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+        wipe.set_target_id(session_id);
+        client.send_bytes(wipe.to_bytes()).await;
+        let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
+        e2.set_target_id(session_id);
+        client.send_bytes(e2.to_bytes()).await;
+    }
+
+    // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
+    //    from the session + character we just updated, so the
+    //    bundle spawns the player at the new coords.
+    world
+        .send_zone_in_bundle(registry, db, session_id, spawn_type as u16)
+        .await;
+
+    // 6. pmeteor sends the 34108 "instance" message AFTER the bundle
+    //    when the destination is a PrivateArea (`if (newArea is
+    //    PrivateArea)`, WorldManager.cs:887-888) — the SEQ_005 return
+    //    warp into zone 155's PrivateAreaMasterPast takes this branch
+    //    in the reference capture. (Garlemald-Server #28.)
+    if private_area.is_some() {
+        let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            34108,
+            0x20,
+        );
+        msg.set_target_id(session_id);
+        client.send_bytes(msg.to_bytes()).await;
+    }
+
+    tracing::info!(
+        player = player_id,
+        zone = zone_id,
+        ?private_area,
+        private_area_type,
+        spawn_type,
+        x,
+        y,
+        z,
+        rotation,
+        "DoZoneChange applied (cross-zone warp + zone-in replay)",
     );
 }
 

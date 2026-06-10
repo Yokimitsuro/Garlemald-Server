@@ -122,6 +122,34 @@ impl CoroutineScheduler {
         self.sleeping_on_player_event.remove(&player_id)
     }
 
+    /// Drop every parked coroutine owned by `player_id`, across all
+    /// three park kinds. The `ContentFinished` teardown calls this so
+    /// a stale park (e.g. a director `_WAIT_EVENT` left behind by an
+    /// abandoned tutorial) can never resume into a torn-down instance.
+    /// Owner-0 (ownerless) parks are kept — they're not attributable
+    /// to the leaving player. Returns the number of coroutines dropped.
+    /// (#28 S1.3.)
+    pub fn purge_owner(&mut self, player_id: u32) -> usize {
+        if player_id == 0 {
+            return 0;
+        }
+        let before =
+            self.pending_time_count() + self.pending_signal_count() + self.pending_event_count();
+        self.sleeping_on_time
+            .retain(|(_, c)| c.owner_player_id != player_id);
+        for parked in self.sleeping_on_signal.values_mut() {
+            parked.retain(|c| c.owner_player_id != player_id);
+        }
+        self.sleeping_on_signal.retain(|_, v| !v.is_empty());
+        // Event parks key by the yield's player id, which can differ
+        // from the owning player (the historical player_id=0 fallback)
+        // — purge by either identity.
+        self.sleeping_on_player_event
+            .retain(|k, v| *k != player_id && v.owner_player_id != player_id);
+        before
+            - (self.pending_time_count() + self.pending_signal_count() + self.pending_event_count())
+    }
+
     pub fn pending_time_count(&self) -> usize {
         self.sleeping_on_time.len()
     }

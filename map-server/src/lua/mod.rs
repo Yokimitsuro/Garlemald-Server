@@ -1116,6 +1116,19 @@ impl LuaEngine {
                     if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {
                         let directive = scheduler::classify_yield_mv(&value);
                         self.repark(parked, directive);
+                    } else {
+                        // Previously silent — the live SEQ_005 `wait(1)`-
+                        // never-resumes break leaves NO trace if the
+                        // coroutine comes back non-Resumable here (it is
+                        // dropped, nothing reparks, and subsequent signals
+                        // find nothing). Log the terminal state so the
+                        // disappearance is attributable. (#28 S1.4.)
+                        tracing::debug!(
+                            signal,
+                            owner = parked.owner_player_id,
+                            status = ?parked.thread.status(),
+                            "fire_signal: coroutine completed (non-resumable) — dropped from scheduler",
+                        );
                     }
                 }
                 Err(e) => {

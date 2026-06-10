@@ -349,14 +349,34 @@ impl GameTicker {
                     );
                 }
                 if !partial.commands.is_empty() {
-                    crate::runtime::quest_apply::apply_runtime_lua_commands(
-                        partial.commands,
-                        &self.registry,
-                        &self.db,
-                        &self.world,
-                        self.lua.as_ref(),
-                    )
-                    .await;
+                    // Route through the EVENT bridge with the owning
+                    // player's handle so content scripts can `sendSignal`
+                    // (resuming parked director beats — the S4.1 kill
+                    // gate's `battleComplete` shape) and emit event-
+                    // flavoured commands; both were silent drops on the
+                    // plain runtime drain. The bridge falls back to the
+                    // same runtime appliers for everything else, so this
+                    // is a strict superset. (#28 S1.4.)
+                    if let Some(handle) = self.registry.by_session(session.id).await {
+                        crate::runtime::quest_apply::apply_event_script_commands(
+                            &handle,
+                            partial.commands,
+                            &self.registry,
+                            &self.db,
+                            &self.world,
+                            self.lua.as_ref(),
+                        )
+                        .await;
+                    } else {
+                        crate::runtime::quest_apply::apply_runtime_lua_commands(
+                            partial.commands,
+                            &self.registry,
+                            &self.db,
+                            &self.world,
+                            self.lua.as_ref(),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -969,6 +989,7 @@ mod tests {
             content_area_actor_id: 0,
             content_script: "SimpleContent30010".to_string(),
             warp_complete: true,
+            spawned_actor_ids: Vec::new(),
         };
 
         let (players, allies, monsters) = super::build_content_rosters(
