@@ -95,6 +95,22 @@ forwarded them verbatim), so the client was *dropping* them:
 likely invisible client-side for the same reason. Not touched here
 (separate work unit).
 
+## Round 3 — world relay drops subpackets with target_id 0
+
+Second live test: the warp feedback line rendered (SendMessage fix
+confirmed) but the actor still didn't move. Packet logs showed the
+0xE2 + SetActorPosition pair arriving at the world-server and **never
+being forwarded** — the zone-reply fan-out in
+`world-server/src/server.rs` drops any subpacket with
+`sub.header.target_id == 0`, and neither `build_0xe2` nor
+`build_set_actor_position` stamps a target. Every working send path
+in the codebase calls `sub.set_target_id(session_id)` before
+`client.send_bytes`; `handle_warp` now does the same on both packets.
+
+Same latent bug exists in `processor.rs::apply_warp_to_position` (the
+Lua `WarpToPosition` applier) — flagged as a separate work unit to
+avoid colliding with upstream PR #35's content-warp changes.
+
 ## Unknowns left
 
 - `is_gm` gating: the login snapshot hardcodes `is_gm: false`

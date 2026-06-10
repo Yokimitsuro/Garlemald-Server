@@ -650,9 +650,15 @@ impl CommandProcessor {
         if current_zone_id == zone_id
             && let Some(client) = self.world.client(session_id).await
         {
-            let e2 = crate::packets::send::build_0xe2(actor_id, 0x10);
+            // The world-server relay drops subpackets whose target_id
+            // is 0 (`world-server/src/server.rs`, zone-reply fan-out),
+            // so stamp the destination session on both — verified via
+            // packet logs: un-stamped 0xE2/0xCE reached the world and
+            // were never forwarded to the client.
+            let mut e2 = crate::packets::send::build_0xe2(actor_id, 0x10);
+            e2.set_target_id(session_id);
             client.send_bytes(e2.to_bytes()).await;
-            let pkt = crate::packets::send::build_set_actor_position(
+            let mut pkt = crate::packets::send::build_set_actor_position(
                 actor_id,
                 -1,
                 x,
@@ -662,6 +668,7 @@ impl CommandProcessor {
                 0,
                 false,
             );
+            pkt.set_target_id(session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
         format!("warped {name} to zone {zone_id} at ({x:.2}, {y:.2}, {z:.2})")
