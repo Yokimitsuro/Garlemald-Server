@@ -63,13 +63,23 @@ impl CommandProcessor {
     /// that `main.rs` forwards to the log. Unknown commands echo back so
     /// the operator notices typos.
     pub async fn run(&self, line: &str) -> Result<String> {
+        self.run_as(line, None).await
+    }
+
+    /// Variant carrying the invoking player's character name. The chat
+    /// `!command` path uses this so commands whose trailing `<name>` arg
+    /// is omitted target the sender — Meteor's command scripts get the
+    /// invoking session's player as the implicit first argument
+    /// (`onTrigger(player, ...)` in `Data/scripts/commands/gm/*.lua`)
+    /// and the optional `<targetname>` only overrides it.
+    pub async fn run_as(&self, line: &str, invoker: Option<&str>) -> Result<String> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return Ok(String::new());
         }
         let mut tokens = trimmed.split_whitespace();
         let cmd = tokens.next().unwrap_or("").to_lowercase();
-        let args = Args::new(tokens.collect::<Vec<&str>>());
+        let args = Args::new(tokens.collect::<Vec<&str>>(), invoker);
 
         let response = match cmd.as_str() {
             "help" => Self::help(),
@@ -121,7 +131,7 @@ impl CommandProcessor {
          rentchocobo <minutes> <name>, dismount <name>, \
          joingc <gc> <name>, setgcrank <gc> <rank> <name>, \
          addgcseals <gc> <amount> <name>, \
-         warp <zone> <x> <y> <z> <name>, \
+         warp <x> <y> <z> [name], warp <zone> <x> <y> <z> [name], \
          talkto <actor_class_id> <name>, \
          pushtrigger <actor_class_id> <name>, \
          setseq <quest_id> <sequence> <name>"
@@ -559,24 +569,44 @@ impl CommandProcessor {
     /// warp without the director piggyback (quest scripts can still
     /// create the director separately).
     async fn handle_warp(&self, args: &Args<'_>) -> String {
-        let zone_id = match args.parse_u32(0) {
-            Ok(z) => z,
-            Err(e) => return format!("usage: warp <zone> <x> <y> <z> <name> — {e}"),
+        const USAGE: &str = "usage: warp <x> <y> <z> [name] | warp <zone> <x> <y> <z> [name]";
+        // Meteor's `warp.lua` dispatches on argc: exactly three numeric
+        // args means "move within the current zone" (the
+        // `DoPlayerMoveInZone` branch); four or more is the cross-zone
+        // `DoZoneChange` form.
+        let same_zone_form = args.len() == 3
+            && args.parse_f32(0).is_ok()
+            && args.parse_f32(1).is_ok()
+            && args.parse_f32(2).is_ok();
+        let (explicit_zone, x, y, z, name) = if same_zone_form {
+            (
+                None,
+                args.parse_f32(0).unwrap(),
+                args.parse_f32(1).unwrap(),
+                args.parse_f32(2).unwrap(),
+                args.rest_joined(3),
+            )
+        } else {
+            let zone_id = match args.parse_u32(0) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let x = match args.parse_f32(1) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let y = match args.parse_f32(2) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            let z = match args.parse_f32(3) {
+                Ok(v) => v,
+                Err(e) => return format!("{USAGE} — {e}"),
+            };
+            (Some(zone_id), x, y, z, args.rest_joined(4))
         };
-        let x = match args.parse_f32(1) {
-            Ok(v) => v,
-            Err(e) => return format!("usage: warp <zone> <x> <y> <z> <name> — {e}"),
-        };
-        let y = match args.parse_f32(2) {
-            Ok(v) => v,
-            Err(e) => return format!("usage: warp <zone> <x> <y> <z> <name> — {e}"),
-        };
-        let z = match args.parse_f32(3) {
-            Ok(v) => v,
-            Err(e) => return format!("usage: warp <zone> <x> <y> <z> <name> — {e}"),
-        };
-        let Some(name) = args.rest_joined(4) else {
-            return "usage: warp <zone> <x> <y> <z> <name>".into();
+        let Some(name) = name else {
+            return USAGE.into();
         };
         let Some(chara_id) = self.lookup_character_id(&name).await else {
             return format!("unknown character: {name}");
@@ -588,12 +618,14 @@ impl CommandProcessor {
         // next zone-in bundle reads them.
         let rotation;
         let current_zone_id;
+        let zone_id;
         let actor_id = handle.actor_id;
         let session_id = handle.session_id;
         {
             let mut c = handle.character.write().await;
             current_zone_id = c.base.zone_id;
             rotation = c.base.rotation;
+            zone_id = explicit_zone.unwrap_or(current_zone_id);
             c.base.zone_id = zone_id;
             c.base.position_x = x;
             c.base.position_y = y;
@@ -1056,11 +1088,19 @@ enum TargetLookup {
 /// handler is a couple of lines.
 struct Args<'a> {
     tokens: Vec<&'a str>,
+    /// Character name of the chat sender, when the command came in via
+    /// the `!command` chat path. `None` on the stdin console, where
+    /// there is no implicit target and `<name>` stays mandatory.
+    invoker: Option<&'a str>,
 }
 
 impl<'a> Args<'a> {
-    fn new(tokens: Vec<&'a str>) -> Self {
-        Self { tokens }
+    fn new(tokens: Vec<&'a str>, invoker: Option<&'a str>) -> Self {
+        Self { tokens, invoker }
+    }
+
+    fn len(&self) -> usize {
+        self.tokens.len()
     }
 
     fn rest(&self) -> &[&'a str] {
@@ -1105,11 +1145,12 @@ impl<'a> Args<'a> {
     }
 
     /// Concatenate tokens `[from..]` into a single space-separated string
-    /// for name-like trailing args ("First Last"). Returns `None` if no
-    /// tokens exist at or after `from`.
+    /// for name-like trailing args ("First Last"). When no tokens exist
+    /// at or after `from`, falls back to the chat invoker's name (self-
+    /// targeting), or `None` on the console path.
     fn rest_joined(&self, from: usize) -> Option<String> {
         if from >= self.tokens.len() {
-            return None;
+            return self.invoker.map(str::to_string);
         }
         Some(self.tokens[from..].join(" "))
     }
@@ -1219,6 +1260,98 @@ mod tests {
         let (cmd, _db) = fixture().await;
         let out = cmd.run("revive Nobody").await.unwrap();
         assert_eq!(out, "unknown character: Nobody");
+    }
+
+    #[test]
+    fn rest_joined_falls_back_to_invoker() {
+        let args = Args::new(vec!["100"], Some("First Last"));
+        assert_eq!(args.rest_joined(1).as_deref(), Some("First Last"));
+        // Explicit trailing name wins over the invoker.
+        let args = Args::new(vec!["100", "Real", "Target"], Some("First Last"));
+        assert_eq!(args.rest_joined(1).as_deref(), Some("Real Target"));
+        // Console path (no invoker) keeps <name> mandatory.
+        let args = Args::new(vec!["100"], None);
+        assert_eq!(args.rest_joined(1), None);
+    }
+
+    #[tokio::test]
+    async fn chat_invoker_is_implicit_target() {
+        let (cmd, db) = fixture().await;
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (43, 0, 0, 0, 'Implicit Hero')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // `!givegil 250` from chat — no trailing name, sender is target.
+        let out = cmd.run_as("givegil 250", Some("Implicit Hero")).await.unwrap();
+        assert!(out.contains("gave 250 gil to Implicit Hero"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn explicit_name_overrides_chat_invoker() {
+        let (cmd, db) = fixture().await;
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (44, 0, 0, 0, 'Real Target')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let out = cmd
+            .run_as("givegil 100 Real Target", Some("Somebody Else"))
+            .await
+            .unwrap();
+        assert!(out.contains("gave 100 gil to Real Target"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn warp_same_zone_form_targets_invoker() {
+        let (cmd, _db) = fixture().await;
+        // Three numeric args = Meteor's same-zone move. The invoker is
+        // the implicit target; unknown name proves the parse + target
+        // resolution path ran (no live registry in the fixture).
+        let out = cmd.run_as("warp 1 2 3", Some("Nobody")).await.unwrap();
+        assert_eq!(out, "unknown character: Nobody");
+    }
+
+    #[tokio::test]
+    async fn warp_same_zone_form_on_console_requires_name() {
+        let (cmd, _db) = fixture().await;
+        let out = cmd.run("warp 1 2 3").await.unwrap();
+        assert!(out.starts_with("usage: warp"), "got {out}");
+    }
+
+    #[tokio::test]
+    async fn warp_offline_target_is_reported() {
+        let (cmd, db) = fixture().await;
+        db.conn_for_test()
+            .call_db(|c| {
+                c.execute(
+                    r"INSERT INTO characters (id, userId, slot, serverId, name)
+                      VALUES (45, 0, 0, 0, 'Warp Target')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // Cross-zone form, name omitted → invoker; character exists in
+        // the DB but has no live ActorHandle.
+        let out = cmd.run_as("warp 166 0 0 0", Some("Warp Target")).await.unwrap();
+        assert_eq!(out, "Warp Target is not online");
     }
 
     #[tokio::test]

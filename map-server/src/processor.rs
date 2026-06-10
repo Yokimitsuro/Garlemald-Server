@@ -7912,18 +7912,47 @@ impl PacketProcessor {
                 cmd = %line,
                 "gm command from chat",
             );
-            if let Some(cmd) = &self.cmd {
-                match cmd.run(&line).await {
+            // The sender is the implicit target for commands whose
+            // trailing `<name>` arg is omitted — Meteor's command
+            // scripts receive the invoking session's player the same
+            // way (`onTrigger(player, ...)`).
+            let invoker = {
+                let c = handle.character.read().await;
+                c.base.display_name().to_string()
+            };
+            let feedback = if let Some(cmd) = &self.cmd {
+                match cmd.run_as(&line, Some(&invoker)).await {
                     Ok(response) if !response.is_empty() => {
                         tracing::info!(%response, "command result");
+                        Some((ChatKind::System, response))
                     }
-                    Ok(_) => {}
+                    Ok(_) => None,
                     Err(e) => {
                         tracing::warn!(error = %e, "gm command failed");
+                        Some((ChatKind::SystemError, format!("command failed: {e}")))
                     }
                 }
             } else {
                 tracing::warn!("gm command requested via chat but CommandProcessor is not wired",);
+                Some((
+                    ChatKind::SystemError,
+                    "GM commands are unavailable on this map-server".to_string(),
+                ))
+            };
+            // Echo the result into the sender's chat log so failures
+            // are visible in-game instead of only in the server log.
+            // Meteor does the same via `player:SendMessage(MESSAGE_TYPE_
+            // SYSTEM_ERROR, ...)` from each command script.
+            if let Some((kind, message)) = feedback {
+                let mut ob = SocialOutbox::new();
+                ob.push(SocialEvent::ChatSystemToPlayer {
+                    target_actor_id: handle.actor_id,
+                    kind,
+                    message,
+                });
+                for e in ob.drain() {
+                    dispatch_social_event(&e, &self.registry, &self.world, &self.db).await;
+                }
             }
             return Ok(());
         }
