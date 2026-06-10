@@ -12303,3 +12303,281 @@ async fn content_on_update_send_signal_resumes_parked_coroutine() {
         "the coroutine parked on \"x\" must have been resumed by the onUpdate sendSignal",
     );
 }
+
+/// #28 S2.1 — seed cross-check: the joined spawn DTO marks Papalymo
+/// (bnpc 7) a caster (pool currentJob 22) and Yda (bnpc 6) melee
+/// (currentJob 2), both with combatDelay 4200, and the level-1 ally HP
+/// fallback (`min_level * 100`) keeps the roster HP bars non-zero (the
+/// seed groups carry hp = 0).
+#[tokio::test]
+async fn s2_1_seed_pool_jobs_mark_papalymo_caster_and_yda_melee() {
+    let db = crate::database::Database::open(tempdb()).await.expect("db");
+
+    let papalymo = db
+        .load_battle_npc_spawn(7)
+        .await
+        .expect("query")
+        .expect("bnpc 7 seeded");
+    assert_eq!(papalymo.current_job, 22, "Papalymo pool job = THM");
+    assert_eq!(papalymo.combat_delay, 4200);
+
+    let yda = db
+        .load_battle_npc_spawn(6)
+        .await
+        .expect("query")
+        .expect("bnpc 6 seeded");
+    assert!(
+        !matches!(yda.current_job, 22 | 23),
+        "Yda must stay melee, got job {}",
+        yda.current_job,
+    );
+    assert_eq!(yda.combat_delay, 4200);
+
+    let wolf = db
+        .load_battle_npc_spawn(3)
+        .await
+        .expect("query")
+        .expect("bnpc 3 seeded");
+    assert!(!matches!(wolf.current_job, 22 | 23));
+
+    // Ally HP fallback (B's roster-HP dependency): the spawn path's
+    // level-scaled default replaces the seed's hp=0 so the zone-in
+    // `build_npc_property_init` emits real hp/hpMax.
+    assert_eq!(yda.hp, 0, "seed group ships hp 0 — fallback must cover it");
+    let fallback = yda.min_level.max(1).saturating_mul(100).max(100);
+    assert!(
+        fallback >= 100,
+        "fallback HP must be non-zero, got {fallback}"
+    );
+}
+
+/// #28 S2.5 — the real `SimpleContent30010.lua` onUpdate against the
+/// real script tree: once the player engages, allies spread across the
+/// live wolves, the wolves turn proactive, and a dead wolf's attacker
+/// re-engages a live one on the next period (S0.5 roster dead-filter +
+/// the corpse-disengage sweep's state clear).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2_5_content_onupdate_engages_roster_and_reengages_on_death() {
+    use crate::data::Session as MapSession;
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    let lua = Arc::new(crate::lua::LuaEngine::new(&script_root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let mut zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0003u32;
+    let yda_id = 0x4534_0006u32;
+    let papalymo_id = 0x4534_0007u32;
+    let wolves = [0x4534_0003u32, 0x4534_0004, 0x4534_0005];
+    let session_id = 7u32;
+
+    // Seed-shaped arena coords (021_server_battlenpc_spawn_locations).
+    let coords: Vec<(u32, ActorKind, f32, f32, f32)> = vec![
+        (player_id, ActorKind::Player, 369.54, 4.21, -706.11),
+        (yda_id, ActorKind::Ally, 365.27, 4.12, -700.73),
+        (papalymo_id, ActorKind::Ally, 365.89, 4.09, -706.72),
+        (wolves[0], ActorKind::BattleNpc, 374.43, 4.4, -698.71),
+        (wolves[1], ActorKind::BattleNpc, 375.38, 4.4, -700.25),
+        (wolves[2], ActorKind::BattleNpc, 375.13, 4.4, -703.59),
+    ];
+    let mut ob = AreaOutbox::new();
+    for (id, kind, x, y, z) in &coords {
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: *id,
+                kind: *kind,
+                position: common::Vector3::new(*x, *y, *z),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone).await;
+
+    // Player: engaged on wolf 1 with a live target (the S2.5 latch
+    // reads `player:IsEngaged() and player.target`).
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player.base.position_x = 369.54;
+    player.base.position_y = 4.21;
+    player.base.position_z = -706.11;
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    player.chara.current_target = wolves[0];
+    player
+        .ai_container
+        .internal_engage(wolves[0], crate::runtime::clock::server_now_ms(), 2500);
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+
+    // Allies + wolves with spawn-shaped controllers (S2.1 defaults:
+    // Yda melee, Papalymo caster, wolves hostile melee).
+    for (id, kind, x, y, z) in coords.iter().skip(1) {
+        let mut c = Character::new(*id);
+        c.base.zone_id = 166;
+        c.base.position_x = *x;
+        c.base.position_y = *y;
+        c.base.position_z = *z;
+        c.chara.hp = 1000;
+        c.chara.max_hp = 1000;
+        let controller_kind = if *kind == ActorKind::Ally {
+            crate::battle::controller::ControllerKind::Ally
+        } else {
+            crate::battle::controller::ControllerKind::BattleNpc
+        };
+        let mut ctrl = crate::battle::controller::Controller::new(controller_kind, *id);
+        ctrl.battle.neutral = *kind == ActorKind::Ally;
+        if *id == papalymo_id {
+            ctrl.battle.is_caster = true;
+            ctrl.auto_attack_enabled = false;
+            let mut spell = crate::battle::BattleCommand::new(27313, "thunder");
+            spell.range = 20.0;
+            spell.cast_time_ms = 2000;
+            spell.recast_time_ms = 6000;
+            spell.cast_type = 2;
+            ctrl.battle.spell = Some(spell);
+        }
+        c.ai_container.controller = Some(ctrl);
+        let tag = if *kind == ActorKind::Ally {
+            ActorKindTag::Ally
+        } else {
+            ActorKindTag::BattleNpc
+        };
+        registry.insert(ActorHandle::new(*id, tag, 166, 0, c)).await;
+    }
+
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(512);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    let mut session = MapSession {
+        id: session_id,
+        current_zone_id: 166,
+        active_content_script: Some(crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+            director_name: "Quest/QuestDirectorMan0g001".to_string(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0x6534_0002,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+            spawned_actor_ids: Vec::new(),
+        }),
+        ..MapSession::default()
+    };
+    session.transient_director_members.insert(
+        director_id,
+        vec![
+            player_id,
+            director_id,
+            yda_id,
+            papalymo_id,
+            wolves[0],
+            wolves[1],
+            wolves[2],
+        ],
+    );
+    world.upsert_session(session).await;
+
+    let ticker = GameTicker::with_lua(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+        Some(lua.clone()),
+    );
+
+    // First content period: the latch opens (player engaged) and the
+    // whole roster engages within two periods.
+    ticker.tick_once(600).await;
+    ticker.tick_once(1_200).await;
+
+    let engaged = |id: u32| {
+        let registry = registry.clone();
+        async move {
+            let handle = registry.get(id).await.unwrap();
+            let c = handle.character.read().await;
+            (
+                c.ai_container.is_engaged(),
+                c.ai_container
+                    .current_state()
+                    .map(|s| s.target_actor_id)
+                    .unwrap_or(0),
+            )
+        }
+    };
+    let (yda_engaged, yda_target) = engaged(yda_id).await;
+    assert!(yda_engaged, "Yda must engage once the player commits");
+    assert!(
+        wolves.contains(&yda_target),
+        "Yda's target must be a wolf, got 0x{yda_target:08X}",
+    );
+    let (papa_engaged, _) = engaged(papalymo_id).await;
+    assert!(papa_engaged, "Papalymo must engage (cast pending)");
+    for w in wolves {
+        let (w_engaged, w_target) = engaged(w).await;
+        assert!(w_engaged, "wolf 0x{w:08X} must turn proactive");
+        assert!(
+            w_target == player_id || w_target == yda_id,
+            "wolf foe must be the engaged player or the first ally, got 0x{w_target:08X}",
+        );
+    }
+
+    // Kill Yda's wolf + replay the corpse-disengage sweep's effect on
+    // Yda (state + hate cleared). Next period: S0.5 drops the corpse
+    // from `GetMonsters()` and Yda re-engages a live wolf.
+    let dead_wolf = yda_target;
+    {
+        let handle = registry.get(dead_wolf).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+        c.chara.hp = 0;
+    }
+    {
+        let handle = registry.get(yda_id).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.ai_container.clear_states();
+        c.hate.clear_hate(None);
+    }
+    ticker.tick_once(1_800).await;
+
+    let (yda_engaged, yda_target) = engaged(yda_id).await;
+    assert!(yda_engaged, "Yda must re-engage after her wolf died");
+    assert_ne!(yda_target, dead_wolf, "the corpse must not be re-targeted");
+    assert!(
+        wolves.contains(&yda_target),
+        "Yda's new target must be a live wolf, got 0x{yda_target:08X}",
+    );
+}

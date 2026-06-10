@@ -293,10 +293,43 @@ pub async fn dispatch_battle_event(
             let sub = tx::actor_battle::build_command_result_x00(*owner_actor_id, *animation, 0);
             broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
         }
-        BattleEvent::CastStart { owner_actor_id, .. }
-        | BattleEvent::CastComplete { owner_actor_id, .. }
+        BattleEvent::CastStart {
+            owner_actor_id,
+            target_actor_id,
+            command_id,
+            cast_time_ms: _,
+            cast_type,
+        } => {
+            // #28 S2.4 — pmeteor `MagicState.OnStart` (MagicState.cs:61-105):
+            // chant glow on (0x0144 chantId 0xF0) + the "You begin
+            // casting" line as a 0x0139 whose animation is
+            // `0x6F000000 | castType` (6F000002 = BLM/THM, 6F000003 =
+            // WHM, 6F000008 = BRD), text 30128, param 1. The anim value
+            // is self-consistent with the seed's castType but visually
+            // unverified — flagged for the live pass.
+            let chant = tx::actor::build_set_actor_sub_state(*owner_actor_id, 0, 0xF0, 0, 0, 0, 0);
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, chant.to_bytes()).await;
+            let row = tx::actor_battle::CommandResult {
+                target_id: *target_actor_id,
+                worldmaster_text_id: 30128,
+                param: 1,
+                hit_num: 1,
+                ..Default::default()
+            };
+            let begin = tx::actor_battle::build_command_result_x01(
+                *owner_actor_id,
+                0x6F00_0000 | *cast_type as u32,
+                *command_id,
+                &row,
+            );
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, begin.to_bytes()).await;
+        }
+        BattleEvent::CastComplete { owner_actor_id, .. }
         | BattleEvent::CastInterrupted { owner_actor_id, .. } => {
-            tracing::debug!(owner = owner_actor_id, "battle: cast-bar (TODO)");
+            // Chant glow off (pmeteor `MagicState.Cleanup`: chantId = 0).
+            // Completion damage rides the separate ResolveAction event.
+            let sub = tx::actor::build_set_actor_sub_state(*owner_actor_id, 0, 0, 0, 0, 0, 0);
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
         }
         BattleEvent::HateAdd {
             owner_actor_id,

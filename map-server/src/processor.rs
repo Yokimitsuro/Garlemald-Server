@@ -2195,7 +2195,36 @@ impl PacketProcessor {
         //     respawn) and attach the AI Controller so the ticker drives
         //     aggro and engagement. See `BattleNpc::apply_spawn_metadata`
         //     for the full per-field mapping + the Meteor parity notes.
-        bnpc.apply_spawn_metadata(&spawn, bnpc_id, actor_id);
+        //
+        //     #28 S2.4 — pool-job casters (currentJob 22 THM / 23 CNJ)
+        //     get their loop spell pre-resolved out of the boot-time
+        //     battle-command catalog. The seed pools carry no spellListId,
+        //     so the tutorial caster (Papalymo) uses THM lvl-1 `thunder`
+        //     27313 (range 20, cast 2000 ms, recast 6 s) — report C §5.
+        const CASTER_DEFAULT_SPELL_ID: u16 = 27313;
+        let caster_spell = if matches!(spawn.current_job, 22 | 23) {
+            self.lua
+                .as_ref()
+                .and_then(|l| {
+                    l.catalogs()
+                        .battle_commands
+                        .read()
+                        .ok()
+                        .and_then(|m| m.get(&CASTER_DEFAULT_SPELL_ID).cloned())
+                })
+                .map(|gd| gd.to_battle_command())
+        } else {
+            None
+        };
+        if matches!(spawn.current_job, 22 | 23) && caster_spell.is_none() {
+            tracing::warn!(
+                bnpc_id,
+                spell_id = CASTER_DEFAULT_SPELL_ID,
+                "SpawnBattleNpcById: caster pool job but spell not in catalog — \
+                 caster will stand back without casting",
+            );
+        }
+        bnpc.apply_spawn_metadata(&spawn, bnpc_id, actor_id, caster_spell);
 
         // 5. Insert the spatial projection into the parent zone's grid.
         let Some(zone_arc) = self.world.zone(parent_zone_id).await else {

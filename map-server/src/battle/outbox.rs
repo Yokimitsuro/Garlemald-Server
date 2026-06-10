@@ -81,11 +81,16 @@ pub enum BattleEvent {
         defender_actor_id: u32,
         command: BattleCommand,
     },
-    /// Cast-bar notification.
+    /// Cast-start notification (#28 S2.4). The dispatcher renders the
+    /// chant glow (0x0144 chantId 0xF0) plus the "begins casting" line
+    /// (0x0139, animation `0x6F000000 | cast_type`, text 30128) —
+    /// pmeteor `MagicState.OnStart` parity.
     CastStart {
         owner_actor_id: u32,
+        target_actor_id: u32,
         command_id: u16,
         cast_time_ms: u32,
+        cast_type: u8,
     },
     CastComplete {
         owner_actor_id: u32,

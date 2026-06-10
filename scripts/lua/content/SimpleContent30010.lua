@@ -63,46 +63,58 @@ function onDestroy()
 
 end
 
+-- #28 S2.5 — everyone fights once the player commits. Per-script VM
+-- global: persists across onUpdate calls (each content area gets its
+-- own VM, so the latch is naturally per-instance).
+battleStarted = false;
+
 function onUpdate(tick, area)
-	if area then
-		local players = area:GetPlayers()
-		local mobs = area:GetMonsters()
-		local allies = area:GetAllies()
-		local resumeChecks = true
-		for player in players do
-			if player then
-				local exitLoop = false
-				
-				if allies then
-					for i = 0, #allies - 1 do
-						if allies[i] then							
-							if not allies[i]:IsEngaged() then
-								if player:IsEngaged() and player.target then
-									
-									allies[i].neutral = false
-									allies[i].isAutoAttackEnabled = true
-									-- modifiers.lua has no `Speed`; the real id is
-									-- MovementSpeed (61). `SetMod(nil, 8)` silently
-									-- no-opped inside the onUpdate partial. (#28 S0.4)
-									allies[i]:SetMod(modifiersGlobal.MovementSpeed, 8)
-									allyGlobal.EngageTarget(allies[i], player.target)
-									exitLoop = true
-									break
-								-- todo: support scripted paths
-								elseif allies[i]:GetSpeed() > 0 then									
-								end
-							end
-						end
-					end
-				end
-				if exitLoop then
-					resumeChecks = false
-					break
-				end
-			end
+	if not area then return end
+	local players = area:GetPlayers()
+	local mobs    = area:GetMonsters()   -- live-only (dead filtered by S0.5)
+	local allies  = area:GetAllies()
+
+	local engagedPlayer = nil
+	for player in players do
+		if player and player:IsEngaged() and player.target then
+			engagedPlayer = player
+			break
 		end
-		if not resumeChecks then
-			return
+	end
+	if not battleStarted then
+		-- Nothing moves until the player attacks. Latching on the
+		-- player's engagement (not the F press) keeps the wolves alive
+		-- and targetable through processTtrBtl002's targeting tutorial
+		-- (plan R8 — allies killing wolves early could soft-lock
+		-- _waitForTargetTutorial client-side).
+		if not engagedPlayer then return end
+		battleStarted = true
+	end
+
+	-- The roster tables are 1-indexed (GetAllies/GetMonsters populate
+	-- Lua-standard arrays); iterate 1..#t, not the legacy 0-based form.
+
+	-- Allies: spread across live wolves; re-engage as wolves die (the
+	-- corpse-disengage sweep clears their state, S0.5 drops the corpse
+	-- from `mobs`).
+	local mi = 0
+	for i = 1, #allies do
+		local ally = allies[i]
+		if ally and not ally:IsEngaged() and #mobs > 0 then
+			local target = mobs[(mi % #mobs) + 1]
+			mi = mi + 1
+			ally:SetMod(modifiersGlobal.MovementSpeed, 8)
+			allyGlobal.EngageTarget(ally, target)   -- Engage + AddBaseHate (ally.lua)
+		end
+	end
+	-- Wolves: proactive once battle starts (retaliation hate already
+	-- covers the struck wolf; this brings the bystanders in).
+	for i = 1, #mobs do
+		local mob = mobs[i]
+		if mob and not mob:IsEngaged() then
+			local foe = (i % 2 == 0 and #allies > 0) and allies[1]
+						or (engagedPlayer or (#allies > 0 and allies[1]))
+			if foe then allyGlobal.EngageTarget(mob, foe) end
 		end
 	end
 end

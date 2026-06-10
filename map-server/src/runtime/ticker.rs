@@ -400,12 +400,25 @@ impl GameTicker {
             };
 
             // AIContainer::update needs an ActorArena — the zone itself.
-            {
+            // The movement intent (#28 S2.2) is taken in the same lock
+            // scope, gated on `can_change_state()` — a Magic state on
+            // top suppresses the step (pmeteor's HasMoved cast-interrupt
+            // rule, satisfied without implementing interrupts).
+            let movement = {
                 let zone_read = zone.read().await;
                 let mut chara = handle.character.write().await;
                 chara
                     .ai_container
                     .update(now_ms, owner_view, &*zone_read, &mut battle_outbox);
+                if chara.ai_container.can_change_state() {
+                    chara.ai_container.pending_movement.take()
+                } else {
+                    chara.ai_container.pending_movement = None;
+                    None
+                }
+            };
+            if let Some(step) = movement {
+                apply_npc_movement_step(&self.world, &self.registry, zone, &handle, step).await;
             }
 
             // Chocobo rental expiry — port of Meteor commit `8687e431`'s
@@ -681,6 +694,135 @@ pub(crate) async fn build_content_rosters(
     (players_vec, allies_vec, monsters_vec)
 }
 
+/// pmeteor `Actor.LookAt` (Actor.cs:688-704): face `(x, z)` from
+/// `(owner_x, owner_z)` — `rotation = π - atan2(dz, dx) + π/2` with the
+/// deltas measured owner − target.
+pub(crate) fn look_at_rotation(owner_x: f32, owner_z: f32, x: f32, z: f32) -> f32 {
+    if owner_x == x && owner_z == z {
+        return 0.0;
+    }
+    let d_x = owner_x - x;
+    let d_z = owner_z - z;
+    std::f32::consts::PI - d_z.atan2(d_x) + std::f32::consts::FRAC_PI_2
+}
+
+/// #28 S2.2 — apply one straight-line movement step (Option B: the
+/// SEQ_005 arena is flat, ≤ 11 y across and obstacle-free; the `PathFind`
+/// port stays untouched for future zones). Per tick:
+///
+///   1. advance `min(speed * 0.1, dist)` toward the stop-ring destination
+///      (the controller already projected the ring point, so walking the
+///      full remaining distance can never overshoot — pmeteor
+///      `PathFind.StepTo` shape; LSB: mob_controller.cpp::Move (shape
+///      re-derived, GPL-3 — no verbatim copy));
+///   2. rotate toward the destination (same ray as the target);
+///   3. write `Character.base.position_*` then re-insert into the zone's
+///      spatial grid so `actors_around` (the AI arena + broadcast radii)
+///      stays truthful — the S0.3 sibling for the AI path;
+///   4. emit 0x00CF via `broadcast_around_actor` (per-recipient
+///      target-stamping handled there) on the FIRST step, every 3rd step
+///      after (~300 ms — pmeteor's observed 333-360 ms cadence; the
+///      client interpolates between waypoints), and on arrival.
+///      `move_state = 2` (running) while stepping, final packet at the
+///      ring with `move_state = 0` — moveState 2-vs-0 is the one
+///      empirical unknown (pmeteor ships 0; wiki says 2 = running); flip
+///      the constant if the live client double-plays the run animation.
+///
+/// Concrete wire shape per emission (wolf bnpc 3 closing on the player):
+///   SubPacket size=0x50 source=<wolf id> target=<stamped per recipient>
+///   opcode=0x00CF, body +0x00..07 zero | +0x08 f32 x | +0x0C f32 y |
+///   +0x10 f32 z | +0x14 f32 rot | +0x18 u16 moveState | +0x24
+///   floatingHeight = 0 (ground mobs).
+async fn apply_npc_movement_step(
+    world: &Arc<WorldManager>,
+    registry: &Arc<ActorRegistry>,
+    zone: &Arc<RwLock<Zone>>,
+    handle: &crate::runtime::actor_registry::ActorHandle,
+    step: crate::battle::ai_container::MovementStep,
+) {
+    use crate::battle::ai_container::MovementStep;
+
+    let (emit, x, y, z, rot, move_state) = {
+        let mut chara = handle.character.write().await;
+        let pos = chara.base.position();
+        match step {
+            MovementStep::Face { position } => {
+                // In range — rotation only, no translation, no wire (the
+                // arrival packet already carried the facing; combat
+                // result packets keep the client's pose fresh).
+                chara.base.rotation = look_at_rotation(pos.x, pos.z, position.x, position.z);
+                chara.ai_container.movement_step_count = 0;
+                return;
+            }
+            MovementStep::MoveTo { destination } => {
+                let dx = destination.x - pos.x;
+                let dz = destination.z - pos.z;
+                let dist = (dx * dx + dz * dz).sqrt();
+                // speed 5.0 → 0.5 y per 100 ms tick = the announced
+                // 0x00D0 run band, so client animation ≈ server step.
+                let step_len = chara.get_speed() * 0.1;
+                let arrived = step_len >= dist;
+                let advance = step_len.min(dist);
+                let (nx, ny, nz) = if dist > f32::EPSILON {
+                    let t = advance / dist;
+                    (
+                        pos.x + dx * t,
+                        pos.y + (destination.y - pos.y) * t,
+                        pos.z + dz * t,
+                    )
+                } else {
+                    (pos.x, pos.y, pos.z)
+                };
+                let rot = look_at_rotation(pos.x, pos.z, destination.x, destination.z);
+                chara.base.position_x = nx;
+                chara.base.position_y = ny;
+                chara.base.position_z = nz;
+                chara.base.rotation = rot;
+                chara.ai_container.movement_step_count += 1;
+                let count = chara.ai_container.movement_step_count;
+                let emit = arrived || count % 3 == 1;
+                if arrived {
+                    chara.ai_container.movement_step_count = 0;
+                }
+                let move_state = if arrived { 0u16 } else { 2u16 };
+                (emit, nx, ny, nz, rot, move_state)
+            }
+        }
+    };
+
+    // Grid re-insert — keeps `actors_around` (AI arena, broadcast radii)
+    // in sync with the authoritative position we just wrote.
+    {
+        let mut zone_w = zone.write().await;
+        let mut ob = AreaOutbox::new();
+        zone_w
+            .core
+            .update_actor_position(handle.actor_id, common::Vector3::new(x, y, z), &mut ob);
+        // ActorMoved grid events are visibility bookkeeping; the player
+        // position path drops them too (world_manager.rs:2280-2298).
+        let _ = ob.drain();
+    }
+
+    if emit {
+        let sub = crate::packets::send::actor::build_move_actor_to_position(
+            handle.actor_id,
+            x,
+            y,
+            z,
+            rot,
+            move_state,
+        );
+        crate::runtime::broadcast::broadcast_around_actor(
+            world,
+            registry,
+            zone,
+            handle.actor_id,
+            sub.to_bytes(),
+        )
+        .await;
+    }
+}
+
 fn tick_status(chara: &mut Character, now_ms: u64, outbox: &mut StatusOutbox) {
     // Clone the ModifierMap so we can hand it in without aliasing — the
     // underlying HashMap is small enough that this is essentially free.
@@ -736,6 +878,7 @@ pub(crate) fn build_owner_view(
         is_close_to_spawn: true,
         target_is_locked: false,
         attack_delay_ms: chara.get_attack_delay_ms(),
+        attack_range: chara.get_attack_range(),
     }
 }
 
@@ -1060,6 +1203,335 @@ mod tests {
                 "default corpse must respawn once the wall-clock window elapses",
             );
         }
+    }
+
+    /// Shared harness for the #28 S2.2/S2.4 movement + caster tests:
+    /// one zone (100) with a Player (id 1, session 42, client channel
+    /// captured) and one controller-driven NPC (id 2) at `npc_x`,
+    /// engaged on the player with seeded hate.
+    async fn setup_engaged_npc_vs_player(
+        npc_x: f32,
+        configure: impl FnOnce(&mut crate::battle::controller::Controller),
+    ) -> (
+        GameTicker,
+        Arc<RwLock<Zone>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        let db = Arc::new(Database::open(tempdb()).await.expect("database stub"));
+
+        let mut zone = Zone::new(
+            100,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 2,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::new(npc_x, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+
+        let mut player = Character::new(1);
+        player.chara.hp = 1000;
+        player.chara.max_hp = 1000;
+        player.chara.level = 10;
+        registry
+            .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, player))
+            .await;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        world
+            .register_client(42, crate::data::ClientHandle::new(42, tx))
+            .await;
+        world
+            .upsert_session(crate::data::Session {
+                id: 42,
+                current_zone_id: 100,
+                ..crate::data::Session::default()
+            })
+            .await;
+
+        let mut npc = Character::new(2);
+        npc.chara.hp = 1000;
+        npc.chara.max_hp = 1000;
+        npc.chara.level = 10;
+        npc.base.position_x = npc_x;
+        let mut ctrl = crate::battle::controller::BattleNpcController::new_for(2);
+        configure(&mut ctrl);
+        npc.ai_container.controller = Some(ctrl);
+        npc.hate.update_hate(1, 10);
+        npc.ai_container.internal_engage(1, 0, 2500);
+        registry
+            .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, npc))
+            .await;
+
+        let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry, db);
+        let zone_arc = world.zone(100).await.unwrap();
+        (ticker, zone_arc, rx)
+    }
+
+    fn drain_subpackets(
+        rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> Vec<common::subpacket::SubPacket> {
+        let mut out = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                match common::subpacket::SubPacket::parse(&bytes, &mut offset) {
+                    Ok(sub) => out.push(sub),
+                    Err(_) => break,
+                }
+            }
+        }
+        out
+    }
+
+    /// #28 S2.2 (a)+(b)+(c) — an engaged wolf 9 y out converges to the
+    /// 2.8 y melee ring in < 2 s of ticks, never steps inside it, keeps
+    /// the spatial grid in sync, and emits 0x00CF on the first step,
+    /// every 3rd step after, and at arrival (final move_state 0).
+    #[tokio::test]
+    async fn s2_2_wolf_pursuit_converges_to_ring_with_throttled_wire() {
+        let (ticker, zone, mut rx) = setup_engaged_npc_vs_player(9.0, |_| {}).await;
+
+        for i in 1..=20u64 {
+            ticker.tick_once(i * 100).await;
+        }
+
+        let handle = ticker.registry.get(2).await.unwrap();
+        let (x, z) = {
+            let c = handle.character.read().await;
+            (c.base.position_x, c.base.position_z)
+        };
+        let dist = (x * x + z * z).sqrt();
+        assert!(
+            (dist - 2.8).abs() < 1e-3,
+            "wolf must park exactly on the 2.8 y stop ring, got {dist}",
+        );
+
+        // Spatial grid tracked the authoritative position.
+        {
+            let zr = zone.read().await;
+            let stored = zr.core.find_actor(2).expect("wolf in grid");
+            assert!(
+                (stored.position.x - x).abs() < 1e-3,
+                "grid x {} must track authoritative x {x}",
+                stored.position.x,
+            );
+        }
+
+        // Wire: 0x00CF at steps 1,4,7,10 (move_state 2) + arrival 13
+        // (move_state 0). 13 steps × 100 ms = 1.3 s < 2 s.
+        let moves: Vec<(f32, u16)> = drain_subpackets(&mut rx)
+            .into_iter()
+            .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_MOVE_ACTOR_TO_POSITION)
+            .map(|s| {
+                let x = f32::from_le_bytes(s.data[0x08..0x0C].try_into().unwrap());
+                let state = u16::from_le_bytes(s.data[0x18..0x1A].try_into().unwrap());
+                (x, state)
+            })
+            .collect();
+        assert_eq!(
+            moves.len(),
+            5,
+            "first step + every 3rd + arrival = 5 emissions, got {moves:?}",
+        );
+        assert!(
+            moves[..4].iter().all(|(_, st)| *st == 2),
+            "in-flight packets run with move_state 2, got {moves:?}",
+        );
+        assert_eq!(moves[4].1, 0, "arrival packet must carry move_state 0");
+        assert!(
+            (moves[4].0 - 2.8).abs() < 1e-3,
+            "arrival packet x must sit on the ring, got {moves:?}",
+        );
+        // Monotonic approach — never inside the ring.
+        for (x, _) in &moves {
+            assert!(
+                *x >= 2.8 - 1e-3,
+                "no packet may report a position inside the ring"
+            );
+        }
+    }
+
+    /// #28 S2.2 (d) — a caster (standback_range 15) closes from 20 y to
+    /// the 15 y ring and parks there.
+    #[tokio::test]
+    async fn s2_2_caster_standoff_stops_at_standback_ring() {
+        let (ticker, _zone, _rx) = setup_engaged_npc_vs_player(20.0, |ctrl| {
+            ctrl.battle.is_caster = true;
+            ctrl.auto_attack_enabled = false;
+            // No spell resolved — the caster stands back without casting.
+        })
+        .await;
+
+        for i in 1..=20u64 {
+            ticker.tick_once(i * 100).await;
+        }
+        let handle = ticker.registry.get(2).await.unwrap();
+        let x = handle.character.read().await.base.position_x;
+        assert!(
+            (x - 15.0).abs() < 1e-3,
+            "caster must park on the 15 y standback ring, got {x}",
+        );
+    }
+
+    /// #28 S2.2 (e) — a Magic state on top suppresses the movement step
+    /// (`can_change_state` gate): the actor holds position for the whole
+    /// cast.
+    #[tokio::test]
+    async fn s2_2_magic_state_suppresses_movement_step() {
+        let (ticker, _zone, _rx) = setup_engaged_npc_vs_player(9.0, |_| {}).await;
+        {
+            let handle = ticker.registry.get(2).await.unwrap();
+            let mut c = handle.character.write().await;
+            let mut cmd = crate::battle::BattleCommand::new(100, "stone");
+            cmd.cast_time_ms = 60_000;
+            assert!(c.ai_container.internal_cast(1, cmd, 0));
+        }
+        for i in 1..=10u64 {
+            ticker.tick_once(i * 100).await;
+        }
+        let handle = ticker.registry.get(2).await.unwrap();
+        let x = handle.character.read().await.base.position_x;
+        assert_eq!(x, 9.0, "casting actor must not take a single step");
+    }
+
+    /// #28 S2.4 — the full caster loop against the REAL seed catalog:
+    /// thunder 27313 resolves through the gamedata→battle converter,
+    /// CastStart renders chant 0xF0 (0x0144) + begin-cast 0x0139 (anim
+    /// 0x6F000002, cmd 27313, text 30128), completion clears the chant
+    /// and lands ResolveAction damage, and the recast clock holds the
+    /// next cast ≥ 8 s after the first.
+    #[tokio::test]
+    async fn s2_4_caster_loop_chants_casts_and_damages() {
+        let (ticker, _zone, mut rx) = setup_engaged_npc_vs_player(10.0, |_| {}).await;
+
+        // Resolve thunder out of the seeded battle-command catalog and
+        // pin the converter's load-bearing fields (report C §5).
+        let (catalog, _) = ticker
+            .db
+            .load_global_battle_command_list()
+            .await
+            .expect("battle command catalog");
+        let thunder = catalog.get(&27313).expect("thunder 27313 seeded");
+        let spell = thunder.to_battle_command();
+        assert_eq!(spell.range, 20.0);
+        assert_eq!(spell.cast_time_ms, 2000);
+        assert_eq!(spell.recast_time_ms, 6000);
+        assert_eq!(spell.cast_type, 2);
+        assert_eq!(spell.battle_animation, 16781815);
+        assert_eq!(spell.base_potency, 100);
+        assert_eq!(spell.command_type, crate::battle::CommandType::SPELL);
+        assert_eq!(spell.action_type, crate::battle::ActionType::Magic);
+
+        {
+            let handle = ticker.registry.get(2).await.unwrap();
+            let mut c = handle.character.write().await;
+            let ctrl = c.ai_container.controller.as_mut().unwrap();
+            ctrl.battle.is_caster = true;
+            ctrl.battle.spell = Some(spell);
+            ctrl.auto_attack_enabled = false;
+        }
+
+        let player_initial_hp = {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let c = handle.character.read().await;
+            c.get_hp()
+        };
+
+        // First tick fires the Cast decision (10 y < range 20, inside the
+        // 15 y ring → no movement); cast completes at 100 + 2000; the
+        // second cast unlocks at 8100 (tick 81).
+        for i in 1..=82u64 {
+            ticker.tick_once(i * 100).await;
+        }
+
+        let subs = drain_subpackets(&mut rx);
+        let substates: Vec<u8> = subs
+            .iter()
+            .filter(|s| {
+                s.game_message.opcode == crate::packets::opcodes::OP_SET_ACTOR_SUB_STATE
+                    && s.header.source_id == 2
+            })
+            .map(|s| s.data[1]) // chant_id byte
+            .collect();
+        assert!(
+            substates.starts_with(&[0xF0, 0x00]),
+            "chant glow on at cast start, off at completion; got {substates:?}",
+        );
+
+        let begin_casts: Vec<(u32, u16, u32, u16)> = subs
+            .iter()
+            .filter(|s| {
+                s.game_message.opcode == crate::packets::opcodes::OP_COMMAND_RESULT_X01
+                    && s.header.source_id == 2
+            })
+            .map(|s| {
+                let anim = u32::from_le_bytes(s.data[0x04..0x08].try_into().unwrap());
+                let cmd = u16::from_le_bytes(s.data[0x24..0x26].try_into().unwrap());
+                let target = u32::from_le_bytes(s.data[0x28..0x2C].try_into().unwrap());
+                let text = u16::from_le_bytes(s.data[0x2E..0x30].try_into().unwrap());
+                (anim, cmd, target, text)
+            })
+            .collect();
+        assert!(
+            begin_casts.contains(&(0x6F00_0002, 27313, 1, 30128)),
+            "begin-cast 0x0139: anim 0x6F000002, cmd 27313, target player, text 30128; got {begin_casts:?}",
+        );
+        assert!(
+            begin_casts
+                .iter()
+                .any(|(anim, cmd, ..)| *anim == 16781815 && *cmd == 27313),
+            "completion damage X01 must ride battleAnimation 16781815; got {begin_casts:?}",
+        );
+
+        // Damage landed on the target.
+        let player_hp = {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let c = handle.character.read().await;
+            c.get_hp()
+        };
+        assert!(
+            player_hp < player_initial_hp,
+            "thunder completion must damage the target ({player_initial_hp} → {player_hp})",
+        );
+
+        // Recast: first cast at t=100 → next no earlier than 8100. Two
+        // chant-on packets across 8 s of ticks (t=100 and t=8100), never
+        // a third.
+        let chant_ons = substates.iter().filter(|b| **b == 0xF0).count();
+        assert_eq!(
+            chant_ons, 2,
+            "exactly two casts in 8 s (recast = cast 2 s + 6 s); got {substates:?}",
+        );
     }
 
     #[tokio::test]

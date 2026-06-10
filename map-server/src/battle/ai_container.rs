@@ -32,6 +32,8 @@
 
 #![allow(dead_code)]
 
+use common::Vector3;
+
 use super::command::BattleCommand;
 use super::controller::{Controller, ControllerDecision, ControllerKind, ControllerOwnerView};
 use super::hate::HateContainer;
@@ -39,6 +41,21 @@ use super::outbox::{BattleEvent, BattleOutbox};
 use super::path_find::PathFind;
 use super::state::{BattleState, BattleStateKind, MAX_STATE_STACK, StateTickResult};
 use super::target_find::ActorArena;
+
+/// One tick's worth of movement intent, produced by `apply_decision` from
+/// the controller's `MoveTo` / `FaceTarget` decisions and consumed by the
+/// game ticker (#28 S2.2 Option B — straight-line step integration; the
+/// `PathFind` port stays unused for this flat arena). The ticker applies
+/// the step only when `can_change_state()` holds — a Magic state on top
+/// suppresses movement, which also satisfies pmeteor's HasMoved
+/// cast-interrupt rule without implementing interrupts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MovementStep {
+    /// Walk `speed * tick` toward this stop-ring destination.
+    MoveTo { destination: Vector3 },
+    /// Already at the ring — face this position, no translation.
+    Face { position: Vector3 },
+}
 
 /// Action-queue entry — a scheduled callback to fire after `fire_at_ms`.
 #[derive(Debug, Clone)]
@@ -95,6 +112,12 @@ pub struct AIContainer {
     pub controller: Option<Controller>,
     pub path_find: Option<PathFind>,
     pub action_queue: ActionQueue,
+    /// This tick's movement intent (#28 S2.2) — cleared at the top of
+    /// every `update`, set by `apply_decision`, taken by the ticker.
+    pub pending_movement: Option<MovementStep>,
+    /// Steps taken since the current pursuit started — drives the
+    /// ticker's every-3rd-step 0x00CF throttle.
+    pub movement_step_count: u32,
 
     states: Vec<BattleState>,
     last_action_time_ms: u64,
@@ -113,6 +136,8 @@ impl AIContainer {
             controller,
             path_find,
             action_queue: ActionQueue::new(),
+            pending_movement: None,
+            movement_step_count: 0,
             states: Vec::new(),
             last_action_time_ms: 0,
             latest_update_ms: 0,
@@ -149,9 +174,16 @@ impl AIContainer {
     }
 
     pub fn is_engaged(&self) -> bool {
-        self.current_state()
-            .map(|s| s.kind == BattleStateKind::Attack)
-            .unwrap_or(false)
+        // Any Attack state in the STACK counts, not just the top — a
+        // casting NPC carries [Attack, Magic] and is still engaged. The
+        // top-only read made `is_engaged()` flip false mid-cast, which
+        // (a) let the controller's retaliate branch force-push a second
+        // Attack on top of the Magic state and (b) made the content
+        // script's `not ally:IsEngaged()` guard re-engage a busy caster.
+        // (#28 S2.4.)
+        self.states
+            .iter()
+            .any(|s| s.kind == BattleStateKind::Attack)
     }
 
     pub fn is_dead(&self) -> bool {
@@ -333,6 +365,10 @@ impl AIContainer {
     ) {
         self.prev_update_ms = self.latest_update_ms;
         self.latest_update_ms = now_ms;
+        // Movement intent is one-tick state — stale intents from a tick
+        // whose step never applied (cast gate, lock contention) must not
+        // replay. (#28 S2.2.)
+        self.pending_movement = None;
 
         // Controller-less actors just follow paths (C#: plain FollowPath
         // without the controller).
@@ -360,6 +396,18 @@ impl AIContainer {
         // resolve events for the dispatcher to fan into CommandResult packets.
         let owner_id = self.owner_actor_id;
         let swing_delay_ms = owner_view.attack_delay_ms.max(500);
+        // Swing gates (#28 S2.3, pmeteor `AttackState.CanAttack` parity):
+        // the owner must have auto-attack enabled (players have no
+        // controller → default true) and the target must be inside
+        // attack range. The swing clock re-arms regardless — arriving
+        // mid-window waits out the window. Facing gate DEFERRED (the
+        // movement step already faces the target).
+        let auto_attack_enabled = self
+            .controller
+            .as_ref()
+            .is_none_or(|c| c.auto_attack_enabled);
+        let attack_range = owner_view.attack_range;
+        let owner_pos = owner_view.actor.position;
         while let Some(top) = self.states.last_mut() {
             let kind = top.kind;
             let target_actor_id = top.target_actor_id;
@@ -368,7 +416,12 @@ impl AIContainer {
                 StateTickResult::Continue => {
                     if kind == BattleStateKind::Attack && top.is_attack_ready(now_ms) {
                         top.schedule_next_swing(now_ms, swing_delay_ms);
-                        if target_actor_id != 0 {
+                        let in_range = arena.get(target_actor_id).is_some_and(|t| {
+                            let dx = t.position.x - owner_pos.x;
+                            let dz = t.position.z - owner_pos.z;
+                            (dx * dx + dz * dz) <= attack_range * attack_range
+                        });
+                        if target_actor_id != 0 && auto_attack_enabled && in_range {
                             outbox.push(BattleEvent::ResolveAutoAttack {
                                 attacker_actor_id: owner_id,
                                 defender_actor_id: target_actor_id,
@@ -386,6 +439,15 @@ impl AIContainer {
                     ) && target_actor_id != 0
                         && let Some(cmd) = top.command().cloned()
                     {
+                        // Chant-glow teardown rides ahead of the damage
+                        // fan-out (pmeteor `MagicState.Cleanup` order).
+                        // (#28 S2.4.)
+                        if kind == BattleStateKind::Magic {
+                            outbox.push(BattleEvent::CastComplete {
+                                owner_actor_id: owner_id,
+                                command_id: cmd.id,
+                            });
+                        }
                         outbox.push(BattleEvent::ResolveAction {
                             attacker_actor_id: owner_id,
                             defender_actor_id: target_actor_id,
@@ -395,6 +457,12 @@ impl AIContainer {
                     self.states.pop();
                 }
                 StateTickResult::Interrupted => {
+                    if kind == BattleStateKind::Magic {
+                        outbox.push(BattleEvent::CastInterrupted {
+                            owner_actor_id: owner_id,
+                            command_id: top.command().map(|c| c.id).unwrap_or(0),
+                        });
+                    }
                     self.states.pop();
                 }
             }
@@ -437,14 +505,50 @@ impl AIContainer {
                     owner_actor_id: owner_id,
                 });
             }
-            ControllerDecision::MoveTo { position: _ } => {
-                // The game loop picks this up by inspecting the container's
-                // path_find state after update.
+            ControllerDecision::MoveTo { position } => {
+                // Handed to the ticker (#28 S2.2) — it steps the actor
+                // `speed * 0.1` per 100 ms tick toward the stop-ring
+                // destination, updates the spatial grid, and emits the
+                // throttled 0x00CF fan-out.
+                self.pending_movement = Some(MovementStep::MoveTo {
+                    destination: position,
+                });
             }
-            ControllerDecision::FaceTarget => {
-                // Same — consumed by the movement side of the game loop.
+            ControllerDecision::FaceTarget { position } => {
+                self.pending_movement = Some(MovementStep::Face { position });
             }
             ControllerDecision::Roam => {}
+            ControllerDecision::Cast { target_actor_id } => {
+                // #28 S2.4 — Papalymo caster loop. The spell is
+                // pre-resolved onto the controller at spawn; a Magic
+                // state already on top means a cast is in flight, so
+                // skip (the controller's `next_cast_ms` gate is only
+                // re-armed on success).
+                if self.is_current(BattleStateKind::Magic) {
+                    return;
+                }
+                let Some(cmd) = self
+                    .controller
+                    .as_ref()
+                    .and_then(|c| c.battle.spell.clone())
+                else {
+                    return;
+                };
+                let (cmd_id, cast_ms, recast_ms, cast_type) =
+                    (cmd.id, cmd.cast_time_ms, cmd.recast_time_ms, cmd.cast_type);
+                if self.internal_cast(target_actor_id, cmd, now_ms) {
+                    if let Some(ctrl) = self.controller.as_mut() {
+                        ctrl.battle.next_cast_ms = now_ms + cast_ms as u64 + recast_ms as u64;
+                    }
+                    outbox.push(BattleEvent::CastStart {
+                        owner_actor_id: owner_id,
+                        target_actor_id,
+                        command_id: cmd_id,
+                        cast_time_ms: cast_ms,
+                        cast_type,
+                    });
+                }
+            }
             ControllerDecision::ChangeTarget { target_actor_id } => {
                 outbox.push(BattleEvent::TargetChange {
                     owner_actor_id: owner_id,
@@ -508,6 +612,7 @@ mod tests {
             is_close_to_spawn: true,
             target_is_locked: false,
             attack_delay_ms: 2500,
+            attack_range: 3.0,
         }
     }
 
@@ -607,5 +712,217 @@ mod tests {
     fn suppress_hate_unused() {
         // Quiet the unused-import lint warning in the test module.
         let _ = HateContainer::new(1);
+    }
+
+    fn arena_view(id: u32, x: f32, allegiance: u32) -> ActorView {
+        ActorView {
+            actor_id: id,
+            position: Vector3::new(x, 0.0, 0.0),
+            rotation: 0.0,
+            is_alive: true,
+            is_static: false,
+            allegiance,
+            party_id: 0,
+            zone_id: 1,
+            is_updates_locked: false,
+            is_player: allegiance == 1,
+            is_battle_npc: allegiance != 1,
+        }
+    }
+
+    fn engaged_owner_view(target: u32) -> ControllerOwnerView {
+        let mut v = owner_view();
+        v.actor = arena_view(1, 0.0, 2);
+        v.is_engaged = true;
+        v.most_hated_actor_id = Some(target);
+        v.current_target_actor_id = Some(target);
+        v
+    }
+
+    /// #28 S2.3 — swings require the target inside attack range; the
+    /// swing clock re-arms regardless (arriving mid-window waits out the
+    /// window, pmeteor `AttackState.CanAttack` parity).
+    #[test]
+    fn s2_3_swing_gated_on_attack_range_and_rearms() {
+        use crate::battle::controller::BattleNpcController;
+        let mut ai = AIContainer::new(1, Some(BattleNpcController::new_for(1)), None);
+        ai.internal_engage(2, 0, 2000);
+
+        // Out of range (10 y, range 3.0): ready swing is swallowed.
+        let arena: HashMap<u32, ActorView> =
+            [(1, arena_view(1, 0.0, 2)), (2, arena_view(2, 10.0, 1))]
+                .into_iter()
+                .collect();
+        let mut ob = BattleOutbox::new();
+        ai.update(2_000, engaged_owner_view(2), &arena, &mut ob);
+        assert!(
+            !ob.events
+                .iter()
+                .any(|e| matches!(e, BattleEvent::ResolveAutoAttack { .. })),
+            "out-of-range swing must not resolve",
+        );
+        // Clock re-armed: an immediately-following in-range tick stays
+        // quiet until the window elapses again.
+        let arena_close: HashMap<u32, ActorView> =
+            [(1, arena_view(1, 0.0, 2)), (2, arena_view(2, 2.0, 1))]
+                .into_iter()
+                .collect();
+        let mut ob2 = BattleOutbox::new();
+        ai.update(2_100, engaged_owner_view(2), &arena_close, &mut ob2);
+        assert!(
+            !ob2.events
+                .iter()
+                .any(|e| matches!(e, BattleEvent::ResolveAutoAttack { .. })),
+            "swing clock must have re-armed on the gated swing",
+        );
+        // Next window, in range → swing.
+        let mut ob3 = BattleOutbox::new();
+        ai.update(4_600, engaged_owner_view(2), &arena_close, &mut ob3);
+        assert!(
+            ob3.events
+                .iter()
+                .any(|e| matches!(e, BattleEvent::ResolveAutoAttack { .. })),
+            "in-range ready swing must resolve",
+        );
+    }
+
+    /// #28 S2.3 — `auto_attack_enabled = false` (the Papalymo shape)
+    /// never swings, even point-blank.
+    #[test]
+    fn s2_3_auto_attack_disabled_never_swings() {
+        use crate::battle::controller::AllyController;
+        let mut ctrl = AllyController::new_for(1);
+        ctrl.auto_attack_enabled = false;
+        let mut ai = AIContainer::new(1, Some(ctrl), None);
+        ai.internal_engage(2, 0, 2000);
+        let arena: HashMap<u32, ActorView> =
+            [(1, arena_view(1, 0.0, 3)), (2, arena_view(2, 1.0, 2))]
+                .into_iter()
+                .collect();
+        let mut ob = BattleOutbox::new();
+        for now in [2_000u64, 4_500, 7_000] {
+            ai.update(now, engaged_owner_view(2), &arena, &mut ob);
+        }
+        assert!(
+            !ob.events
+                .iter()
+                .any(|e| matches!(e, BattleEvent::ResolveAutoAttack { .. })),
+            "auto-attack-disabled caster must never swing",
+        );
+    }
+
+    /// #28 S2.3 — players carry no controller: auto-attack defaults on
+    /// (the `is_none_or(true)` read) and the range gate still applies.
+    #[test]
+    fn s2_3_player_without_controller_swings_in_range() {
+        let mut ai = AIContainer::new(1, None, None);
+        ai.internal_engage(2, 0, 2000);
+        let arena: HashMap<u32, ActorView> =
+            [(1, arena_view(1, 0.0, 1)), (2, arena_view(2, 2.0, 2))]
+                .into_iter()
+                .collect();
+        let mut ob = BattleOutbox::new();
+        ai.update(2_000, engaged_owner_view(2), &arena, &mut ob);
+        assert!(
+            ob.events
+                .iter()
+                .any(|e| matches!(e, BattleEvent::ResolveAutoAttack { .. })),
+        );
+    }
+
+    /// #28 S2.4 — the Cast decision arm: pushes a Magic state via
+    /// `internal_cast`, emits `CastStart`, re-arms `next_cast_ms` to
+    /// `now + cast + recast`, and completion emits `CastComplete` ahead
+    /// of `ResolveAction`.
+    #[test]
+    fn s2_4_cast_arm_pushes_magic_and_emits_lifecycle_events() {
+        use crate::battle::controller::AllyController;
+        let mut ctrl = AllyController::new_for(1);
+        ctrl.auto_attack_enabled = false;
+        ctrl.battle.is_caster = true;
+        let mut spell = BattleCommand::new(27313, "thunder");
+        spell.range = 20.0;
+        spell.cast_time_ms = 2000;
+        spell.recast_time_ms = 6000;
+        spell.cast_type = 2;
+        ctrl.battle.spell = Some(spell);
+        let mut ai = AIContainer::new(1, Some(ctrl), None);
+        ai.internal_engage(2, 100, 2000);
+
+        let arena: HashMap<u32, ActorView> =
+            [(1, arena_view(1, 0.0, 3)), (2, arena_view(2, 10.0, 2))]
+                .into_iter()
+                .collect();
+        let mut ob = BattleOutbox::new();
+        ai.update(100, engaged_owner_view(2), &arena, &mut ob);
+        assert!(
+            ob.events.iter().any(|e| matches!(
+                e,
+                BattleEvent::CastStart {
+                    target_actor_id: 2,
+                    command_id: 27313,
+                    cast_type: 2,
+                    ..
+                }
+            )),
+            "CastStart must carry target + command + cast_type; got {:?}",
+            ob.events,
+        );
+        assert!(ai.is_current(BattleStateKind::Magic));
+        assert_eq!(
+            ai.controller.as_ref().unwrap().battle.next_cast_ms,
+            100 + 2000 + 6000,
+            "recast clock = now + cast + recast",
+        );
+
+        // Cast completes 2000 ms later: CastComplete rides ahead of the
+        // damage ResolveAction; the Magic state pops.
+        let mut ob2 = BattleOutbox::new();
+        ai.update(2_200, engaged_owner_view(2), &arena, &mut ob2);
+        let kinds: Vec<&'static str> = ob2
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                BattleEvent::CastComplete { .. } => Some("complete"),
+                BattleEvent::ResolveAction { .. } => Some("resolve"),
+                BattleEvent::CastStart { .. } => Some("start"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["complete", "resolve"],
+            "chant teardown ahead of damage, no re-cast inside the recast window",
+        );
+        assert!(!ai.is_current(BattleStateKind::Magic));
+    }
+
+    /// #28 S2.2 — MoveTo/FaceTarget decisions land on `pending_movement`
+    /// for the ticker; intents are one-tick state.
+    #[test]
+    fn s2_2_pending_movement_set_and_cleared_per_tick() {
+        use crate::battle::controller::BattleNpcController;
+        let mut ai = AIContainer::new(1, Some(BattleNpcController::new_for(1)), None);
+        ai.internal_engage(2, 0, 2000);
+        let arena: HashMap<u32, ActorView> =
+            [(1, arena_view(1, 0.0, 2)), (2, arena_view(2, 9.0, 1))]
+                .into_iter()
+                .collect();
+        let mut ob = BattleOutbox::new();
+        ai.update(100, engaged_owner_view(2), &arena, &mut ob);
+        assert!(
+            matches!(ai.pending_movement, Some(MovementStep::MoveTo { .. })),
+            "pursuit decision must surface as a pending MoveTo",
+        );
+        // A tick whose decision is no longer movement clears the intent.
+        let arena_close: HashMap<u32, ActorView> =
+            [(1, arena_view(1, 0.0, 2)), (2, arena_view(2, 2.0, 1))]
+                .into_iter()
+                .collect();
+        ai.update(200, engaged_owner_view(2), &arena_close, &mut ob);
+        assert!(
+            matches!(ai.pending_movement, Some(MovementStep::Face { .. })),
+            "in-range decision degrades to a Face intent",
+        );
     }
 }
