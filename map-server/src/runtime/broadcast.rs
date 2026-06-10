@@ -107,7 +107,16 @@ pub async fn broadcast_around_actor(
         let Some(client) = world.client(handle.session_id).await else {
             continue;
         };
-        client.send_bytes(packet_bytes.clone()).await;
+        // Stamp the recipient's session id into any untargeted subpacket.
+        // The world-server proxy routes map-server replies by subpacket
+        // `target_id` and silently DROPS `target_id == 0` — most callers
+        // hand us builder output that never set a target, so without this
+        // every broadcast packet (SetActorState/ChangeState poses, enmity
+        // gems, battle actions, …) died at the proxy and the client never
+        // rendered them. (Garlemald-Server #28.)
+        let mut bytes = packet_bytes.clone();
+        common::subpacket::SubPacket::stamp_target_id_if_zero(&mut bytes, handle.session_id);
+        client.send_bytes(bytes).await;
         sent += 1;
     }
     sent
@@ -219,6 +228,82 @@ mod tests {
         assert_eq!(sent, 1);
         let got = rx.recv().await.unwrap();
         assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    /// Untargeted subpackets must be stamped with the RECIPIENT's session
+    /// id before they hit the wire — the world-server proxy fan-out drops
+    /// `target_id == 0` subpackets, so an unstamped broadcast never
+    /// reaches any client (the SEQ_005 "allies stay knocked out" /
+    /// invisible-combat class of bugs, Garlemald-Server #28).
+    #[tokio::test]
+    async fn broadcast_stamps_recipient_session_into_untargeted_subpackets() {
+        let world = WorldManager::new();
+        let registry = ActorRegistry::new();
+
+        let mut zone = Zone::new(
+            100,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 10,
+                kind: ActorKind::Player,
+                position: Vector3::new(10.0, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        let zone_arc = Arc::new(RwLock::new(zone));
+
+        registry
+            .insert(ActorHandle::new(
+                10,
+                ActorKindTag::Player,
+                100,
+                42,
+                character(),
+            ))
+            .await;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        world.register_client(42, ClientHandle::new(42, tx)).await;
+
+        // Builder output carries target_id == 0 (the default header).
+        let sub = crate::packets::send::actor::build_set_actor_state(1, 2, 0);
+        assert_eq!(sub.header.target_id, 0);
+
+        let sent = broadcast_around_actor(&world, &registry, &zone_arc, 1, sub.to_bytes()).await;
+        assert_eq!(sent, 1);
+
+        let got = rx.recv().await.unwrap();
+        let mut off = 0usize;
+        let parsed = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
+        assert_eq!(
+            parsed.header.target_id, 42,
+            "broadcast must stamp the recipient session id into untargeted subpackets",
+        );
     }
 
     /// Private-area isolation contract: a player whose session is

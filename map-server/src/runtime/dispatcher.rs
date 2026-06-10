@@ -1088,12 +1088,19 @@ pub async fn dispatch_area_event(
             target_actor_id,
             zone_wide,
         } => {
+            // Per-recipient target stamp — untargeted subpackets are
+            // dropped by the world-server proxy fan-out.
             let payload = tx::build_set_weather(*area_id, *weather_id, *transition_time).to_bytes();
             if let (Some(aid), false) = (target_actor_id, zone_wide) {
                 if let Some(handle) = registry.get(*aid).await
                     && let Some(client) = world.client(handle.session_id).await
                 {
-                    client.send_bytes(payload).await;
+                    let mut bytes = payload;
+                    common::subpacket::SubPacket::stamp_target_id_if_zero(
+                        &mut bytes,
+                        handle.session_id,
+                    );
+                    client.send_bytes(bytes).await;
                 }
             } else {
                 // Zone-wide — queue to every player in this zone.
@@ -1103,7 +1110,12 @@ pub async fn dispatch_area_event(
                         continue;
                     }
                     if let Some(client) = world.client(p.session_id).await {
-                        client.send_bytes(payload.clone()).await;
+                        let mut bytes = payload.clone();
+                        common::subpacket::SubPacket::stamp_target_id_if_zero(
+                            &mut bytes,
+                            p.session_id,
+                        );
+                        client.send_bytes(bytes).await;
                     }
                 }
             }
@@ -1861,6 +1873,11 @@ pub(crate) async fn send_to_self_if_player(
         return;
     }
     if let Some(client) = world.client(handle.session_id).await {
+        // Same proxy rule as `broadcast_around_actor`: untargeted
+        // subpackets are dropped by the world-server fan-out, so stamp
+        // the recipient's session id into any header still carrying 0.
+        let mut bytes = bytes;
+        common::subpacket::SubPacket::stamp_target_id_if_zero(&mut bytes, handle.session_id);
         client.send_bytes(bytes).await;
     }
 }

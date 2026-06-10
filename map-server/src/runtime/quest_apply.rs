@@ -608,6 +608,32 @@ async fn apply_change_state(
         let mut c = handle.character.write().await;
         c.base.current_main_state = main_state;
     }
+    // 1b. Pre-warp content NPCs: suppress the wire broadcast (keep the
+    //     stored-state mutation above). `SimpleContent30010.lua::onCreate`
+    //     fires `ChangeState(2)` on the tutorial roster BEFORE the
+    //     `DoZoneChangeContent` warp, while the client has not been sent
+    //     those actors (their AddActor fan-out is deliberately skipped to
+    //     keep the pre-kick window byte-clean — pmeteor's reference
+    //     capture shows ZERO actor packets there). The post-warp zone-in
+    //     bundle re-emits SetActorState from the stored value, so nothing
+    //     is lost; mid-fight state changes happen post-warp and broadcast
+    //     normally. (Garlemald-Server #28.)
+    for snap in world.all_sessions().await {
+        if let Some(active) = snap.active_content_script.as_ref()
+            && !active.warp_complete
+            && snap
+                .transient_director_members
+                .get(&active.director_actor_id)
+                .is_some_and(|roster| roster.contains(&actor_id))
+        {
+            tracing::debug!(
+                actor = format!("0x{actor_id:08X}"),
+                main_state,
+                "ChangeState stored; broadcast suppressed (pre-warp content roster)",
+            );
+            return;
+        }
+    }
     // 2. Broadcast 0x0134 SetActorState (main_state | sub_state<<8).
     let Some(zone_arc) = world.zone(handle.zone_id).await else {
         tracing::debug!(

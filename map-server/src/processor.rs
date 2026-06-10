@@ -1875,6 +1875,10 @@ impl PacketProcessor {
                 director_actor_id,
                 content_area_actor_id,
                 content_script: content_script.clone(),
+                // Pre-warp window: content NPCs not yet AddActor'd on the
+                // client; roster broadcasts stay suppressed until
+                // `apply_do_zone_change_content` finishes the warp bundle.
+                warp_complete: false,
             });
             self.world.upsert_session(snap).await;
         }
@@ -2990,14 +2994,53 @@ impl PacketProcessor {
             self.world.upsert_session(snap).await;
         }
 
-        client
-            .send_bytes(
-                crate::packets::send::handshake::build_delete_all_actors(actor_id).to_bytes(),
-            )
-            .await;
-        client
-            .send_bytes(crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes())
-            .await;
+        // pmeteor's content-warp burst opens with a "you have entered an
+        // instance" system message (`SendGameMessage(WorldMaster, 34108,
+        // 0x20)`, WorldManager.cs:999) immediately before DeleteAllActors.
+        // Byte parity with the reference capture
+        // (captures/pmeteor-quest/20260426-160210-gridania-manual3,
+        // map-packets.log ~31938): header source AND body textOwner are both
+        // WorldMaster 0x5FF80001 — the client dispatches game messages
+        // through per-actor receivers keyed on the header source, so
+        // sourcing this from the player would route it to the wrong
+        // receiver class.
+        {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                34108,
+                0x20,
+            );
+            msg.set_target_id(session_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
+
+        // DeleteAllActors + 0x00E2(0x10) — THE same-zone reload trigger.
+        //
+        // These two were previously sent UNTAGGED (`target_id == 0`), and
+        // every map-server subpacket crosses the world-server proxy, whose
+        // fan-out drops untargeted subpackets (`if target == 0 { continue; }`,
+        // world-server/src/server.rs). So the client never received either
+        // packet: no actor wipe, and — critically — no 0x00E2. The decompiled
+        // client (FUN_0058cca0, case 0x00E2) sets the MapLayoutElement's
+        // force-reload latch [+0xbc]=1 for any subcode except 0x15/0x16; the
+        // SetMap handler (FUN_0059ced0) then schedules a scene reload when
+        // `latch != 0 OR region != resident [+0x94]`. With the 0x00E2 dropped,
+        // a same-region SetMap(106) took the no-op arm and "Now Loading" hung
+        // forever — which is what the high-16 region tag (now removed, see
+        // send_zone_in_bundle) was papering over by forcing the
+        // region-mismatch arm at the cost of committing an invalid resident
+        // region. Tagging the pair delivers the latch, so the unmodified
+        // parent region reloads exactly like pmeteor's capture.
+        // (Garlemald-Server #28.)
+        {
+            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+            wipe.set_target_id(session_id);
+            client.send_bytes(wipe.to_bytes()).await;
+            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
+            e2.set_target_id(session_id);
+            client.send_bytes(e2.to_bytes()).await;
+        }
 
         // 4. Replay the zone-in bundle. `send_zone_in_bundle` reads from
         //    the session + character we just updated, so the bundle
@@ -3005,6 +3048,16 @@ impl PacketProcessor {
         self.world
             .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
             .await;
+
+        // The bundle has now AddActor'd + state-synced the content NPCs on
+        // the client; lift the pre-warp suppression of roster broadcasts
+        // (see `ActiveContentScript::warp_complete`).
+        if let Some(mut snap) = self.world.session(session_id).await {
+            if let Some(active) = snap.active_content_script.as_mut() {
+                active.warp_complete = true;
+            }
+            self.world.upsert_session(snap).await;
+        }
 
         // 5. B7 of the SEQ_005 unblock plan — fire the content
         //    script's `onZoneIn(player, contentArea, isLogin)`
@@ -3312,14 +3365,24 @@ impl PacketProcessor {
             tracing::warn!(player = player_id, "DoZoneChange: no client");
             return;
         };
-        client
-            .send_bytes(
-                crate::packets::send::handshake::build_delete_all_actors(actor_id).to_bytes(),
-            )
-            .await;
-        client
-            .send_bytes(crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes())
-            .await;
+        // Tagged with the session id — untargeted subpackets are dropped by
+        // the world-server proxy fan-out, so this pair never reached the
+        // client before (see the matching block + decomp notes in
+        // `apply_do_zone_change_content`). Cross-zone warps still completed
+        // because a real region change takes the SetMap handler's
+        // region-mismatch arm; delivering the wipe + 0x00E2 restores pmeteor
+        // parity (`DoZoneChange`, WorldManager.cs:877-879). Subcode 0x02 is
+        // what pmeteor sends for full zone changes (0x10 is the in-place /
+        // content-instance variant) — both set the client's force-reload
+        // latch, so the distinction is parity-only. (Garlemald-Server #28.)
+        {
+            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+            wipe.set_target_id(session_id);
+            client.send_bytes(wipe.to_bytes()).await;
+            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
+            e2.set_target_id(session_id);
+            client.send_bytes(e2.to_bytes()).await;
+        }
 
         // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
         //    from the session + character we just updated, so the
@@ -3327,6 +3390,22 @@ impl PacketProcessor {
         self.world
             .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
             .await;
+
+        // 6. pmeteor sends the 34108 "instance" message AFTER the bundle
+        //    when the destination is a PrivateArea (`if (newArea is
+        //    PrivateArea)`, WorldManager.cs:887-888) — the SEQ_005 return
+        //    warp into zone 155's PrivateAreaMasterPast takes this branch
+        //    in the reference capture. (Garlemald-Server #28.)
+        if private_area.is_some() {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                34108,
+                0x20,
+            );
+            msg.set_target_id(session_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
 
         tracing::info!(
             player = player_id,
@@ -3373,9 +3452,11 @@ impl PacketProcessor {
             )
         };
         let (x, y, z, rotation) = target.unwrap_or((cur_x, cur_y, cur_z, cur_rot));
-        // spawn_type=2 == "warp" (matches Meteor's WarpToPublicArea
-        // path which passes 2 to DoZoneChange).
-        self.apply_do_zone_change(player_id, zone_id, None, 0, 2, x, y, z, rotation)
+        // spawn_type=15 — pmeteor's WarpToPublicArea passes 15 to
+        // DoZoneChange (WorldManager.cs:935-939); the earlier comment
+        // claiming it passes 2 was wrong, and the value feeds the 0x00CE
+        // SetActorPosition tail. (Garlemald-Server #28 review.)
+        self.apply_do_zone_change(player_id, zone_id, None, 0, 15, x, y, z, rotation)
             .await;
     }
 
@@ -3412,12 +3493,14 @@ impl PacketProcessor {
             )
         };
         let (x, y, z, rotation) = target.unwrap_or((cur_x, cur_y, cur_z, cur_rot));
+        // spawn_type=15 — matches pmeteor's WarpToPrivateArea
+        // (WorldManager.cs:925-928).
         self.apply_do_zone_change(
             player_id,
             zone_id,
             Some(area_class),
             area_index,
-            2,
+            15,
             x,
             y,
             z,
@@ -4087,13 +4170,21 @@ impl PacketProcessor {
             2 => crate::packets::send::player::build_set_current_mount_goobbue(handle.actor_id, 1),
             _ => return,
         };
-        if let Ok(base) = common::BasePacket::create_from_subpacket(&pkt, true, false) {
-            let bytes = base.to_bytes();
+        // Raw subpacket bytes — the map-server writer task owns BasePacket
+        // framing (`wrap_subpackets_in_basepacket`); pre-framing here both
+        // double-wrapped the frame AND hid the zero `target_id` from the
+        // stamp helper, so the packet died at the world-server proxy.
+        {
+            let mut self_bytes = pkt.to_bytes();
             // Self-emit — the mount owner needs the packet for their
             // own HUD regardless of whether any neighbours are
             // around to see them.
             if let Some(client) = self.world.client(handle.session_id).await {
-                client.send_bytes(bytes.clone()).await;
+                common::subpacket::SubPacket::stamp_target_id_if_zero(
+                    &mut self_bytes,
+                    handle.session_id,
+                );
+                client.send_bytes(self_bytes).await;
             }
             // Fan to every nearby Player via the shared zone-grid
             // broadcast (source is auto-excluded by `actors_around`).
@@ -4103,7 +4194,7 @@ impl PacketProcessor {
                     &self.registry,
                     &zone,
                     handle.actor_id,
-                    bytes,
+                    pkt.to_bytes(),
                 )
                 .await;
                 tracing::debug!(
@@ -4634,7 +4725,7 @@ impl PacketProcessor {
             && let Some(handle) = self.registry.get(player_id).await
             && let Some(client) = self.world.client(handle.session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
                 handle.actor_id,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25118,
@@ -4642,6 +4733,7 @@ impl PacketProcessor {
                 &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
             tracing::debug!(
                 player = player_id,
@@ -4718,7 +4810,7 @@ impl PacketProcessor {
         if let Some(handle) = self.registry.get(player_id).await
             && let Some(client) = self.world.client(handle.session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
                 handle.actor_id,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30603,
@@ -4729,6 +4821,7 @@ impl PacketProcessor {
                 ],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
     }
@@ -4791,7 +4884,7 @@ impl PacketProcessor {
             && session_id != 0
             && let Some(client) = self.world.client(session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
                 player_id,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30604,
@@ -4802,6 +4895,7 @@ impl PacketProcessor {
                 ],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
     }
@@ -4960,7 +5054,7 @@ impl PacketProcessor {
         if let Some(handle) = self.registry.get(player_id).await
             && let Some(client) = self.world.client(handle.session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
                 handle.actor_id,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30603,
@@ -4971,6 +5065,7 @@ impl PacketProcessor {
                 ],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
     }
@@ -5254,7 +5349,7 @@ impl PacketProcessor {
             self.world.upsert_session(session).await;
         }
         if let Some(client) = self.world.client(session_id).await {
-            let pkt = crate::packets::send::build_set_actor_position(
+            let mut pkt = crate::packets::send::build_set_actor_position(
                 actor_id,
                 actor_id as i32,
                 x,
@@ -5264,6 +5359,10 @@ impl PacketProcessor {
                 spawn_type.into(),
                 false,
             );
+            // Untargeted subpackets are dropped by the world-server proxy
+            // fan-out — without the tag this in-zone warp never moved the
+            // client. (Garlemald-Server #28.)
+            pkt.set_target_id(session_id);
             client.send_bytes(pkt.to_bytes()).await;
             tracing::info!(
                 actor = actor_id,
@@ -5743,12 +5842,19 @@ impl PacketProcessor {
         // `apply_send_mount_appearance:1719-1745`.
         const RANKUP_ANIMATION_ID: u32 = 0x0400_0FFB;
         let sub = tx::actor::build_play_animation_on_actor(handle.actor_id, RANKUP_ANIMATION_ID);
-        if let Ok(base) = common::BasePacket::create_from_subpacket(&sub, true, false) {
-            let bytes = base.to_bytes();
+        // Raw subpacket bytes — the writer task owns BasePacket framing;
+        // pre-framing double-wrapped AND hid the zero `target_id` from the
+        // stamp helper, so the packet died at the world-server proxy.
+        {
+            let mut self_bytes = sub.to_bytes();
             // Self-emit so the promoting player sees the salute
             // regardless of how far from any neighbour they are.
             if let Some(client) = self.world.client(handle.session_id).await {
-                client.send_bytes(bytes.clone()).await;
+                common::subpacket::SubPacket::stamp_target_id_if_zero(
+                    &mut self_bytes,
+                    handle.session_id,
+                );
+                client.send_bytes(self_bytes).await;
             }
             if let Some(zone) = self.world.zone(handle.zone_id).await {
                 let sent = crate::runtime::broadcast::broadcast_around_actor(
@@ -5756,7 +5862,7 @@ impl PacketProcessor {
                     &self.registry,
                     &zone,
                     handle.actor_id,
-                    bytes,
+                    sub.to_bytes(),
                 )
                 .await;
                 tracing::debug!(
@@ -6334,7 +6440,7 @@ impl PacketProcessor {
         // owning client only (no broadcast — this is a personal
         // system message).
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
                 handle.actor_id,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25224,
@@ -6342,6 +6448,7 @@ impl PacketProcessor {
                 &[common::luaparam::LuaParam::UInt32(quest_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
 
@@ -6401,7 +6508,7 @@ impl PacketProcessor {
         // Mirror C# `Quest.OnComplete`'s
         // `SendGameMessage(WorldMaster, 25086, 0x20, GetQuestId())`.
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
                 handle.actor_id,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25086,
@@ -6409,6 +6516,7 @@ impl PacketProcessor {
                 &[common::luaparam::LuaParam::UInt32(quest_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
     }
@@ -6455,7 +6563,7 @@ impl PacketProcessor {
         // Mirror C# `WorldManager.AbandonQuest`'s
         // `SendGameMessage(this, WorldMaster, 25236, 0x20, abandoned.GetQuestId())`.
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
                 handle.actor_id,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25236,
@@ -6463,6 +6571,7 @@ impl PacketProcessor {
                 &[common::luaparam::LuaParam::UInt32(quest_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
     }

@@ -8091,11 +8091,15 @@ async fn promote_gc_happy_path_spends_seals_and_bumps_rank() {
     //     widget the client renders top-right),
     // (2) `PlayAnimationOnActor` (0x00DA, raw subpacket — the salute
     //     fanfare neighbours also see via the broadcast helper).
+    // The channel carries raw subpacket streams (the map-server writer
+    // task owns BasePacket framing) — parse subpackets directly.
     let mut opcodes = Vec::new();
     while let Ok(bytes) = rx.try_recv() {
         let mut offset = 0;
-        let base = common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse");
-        for sub in base.get_subpackets().expect("subs") {
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
             // Game-message subs carry their opcode in `game_message.opcode`;
             // raw subs carry it in `header.r#type`. Capture both so the
             // assertion below is wire-layout-agnostic.
@@ -8274,11 +8278,14 @@ async fn promote_gc_salute_broadcasts_to_nearby_player() {
     // at present (it currently fans through the same broadcast for
     // some upstream code paths) — but the salute opcode must be
     // there.
+    // Raw subpacket stream (no BasePacket frame) — parse directly.
     let mut witness_opcodes = Vec::new();
     while let Ok(bytes) = rx_witness.try_recv() {
         let mut offset = 0;
-        let base = common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse");
-        for sub in base.get_subpackets().expect("subs") {
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
             witness_opcodes.push(sub.header.r#type);
             witness_opcodes.push(sub.game_message.opcode);
         }
