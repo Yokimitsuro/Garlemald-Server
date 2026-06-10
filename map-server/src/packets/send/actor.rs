@@ -726,17 +726,31 @@ pub fn build_player_property_init(
     b.add_byte("charaWork.battleSave.negotiationFlag[0]", 1);
 
     // Project Meteor's Player ctor pre-binds `charaWork.command[0..15]`
-    // with 16 starter commands (`0xA0F00000 | id`). Emitting those caused
-    // the 1.23b client to advance *past* the DepictionJudge nameplate
-    // error but fail a step later in `ActionMenuWidget:addSlot()` —
-    // `DesktopWidget:isStackIntoActionMenu()` line 12448 calls
-    // `processCanFireWithoutTarget` on a nil command, which means the
-    // id->command lookup in the client's own data archive returned nil
-    // for at least one of our bound ids. Leaving the command slots
-    // unpopulated takes the ActionMenu down an empty-slot branch instead
-    // of an invalid-slot branch. We still emit `commandAcquired` and
-    // `additionalCommandAcquired` because those are plain flag arrays
-    // that don't require the client to resolve any command id.
+    // with 16 starter commands (`0xA0F00000 | id`, Player.cs:235-251), and
+    // `GetInitPackets` emits every non-zero slot (Player.cs:478-490). This
+    // table is what populates the client's ready-command map — slots 0/1
+    // hold 21001, the main-state Activate toggle — so WITHOUT it the F key
+    // / sword icon resolves to no command and the client never emits the
+    // `0x012D EventStart owner=0xA0F05209 commandForced` that
+    // `commands/ActivateCommand.lua` (and the SEQ_005 combat tutorial's
+    // `waitForSignal("playerActive")`) depend on.
+    //
+    // History: an earlier attempt to emit these crashed the client in
+    // `ActionMenuWidget:addSlot()` (nil command in
+    // `processCanFireWithoutTarget`), and the emission was removed. That
+    // crash predated the `state_mainSkillLevel` byte-vs-short encoding fix
+    // above — the mis-sized field corrupted every property read that
+    // followed it in the 0x0137 stream, which is exactly the failure shape
+    // of "the id->command lookup returned nil". pmeteor ships these exact
+    // bytes to the same 1.23b client without crashing.
+    // (Garlemald-Server #28.)
+    const STARTER_COMMANDS: [u32; 16] = [
+        21001, 21001, 21002, 12004, 21005, 21006, 21007, 12009, 12010, 12005, 12007, 12011, 22012,
+        22013, 29497, 22015,
+    ];
+    for (i, id) in STARTER_COMMANDS.iter().enumerate() {
+        b.add_int(&format!("charaWork.command[{}]", i), 0xA0F0_0000 | *id);
+    }
     b.add_byte("charaWork.commandAcquired[1150]", 1);
     for i in 0..36 {
         b.add_byte(&format!("charaWork.additionalCommandAcquired[{}]", i), 1);
@@ -999,5 +1013,30 @@ mod reset_head_tests {
         assert!(pkt.data.iter().all(|b| *b == 0));
         assert_eq!(pkt.game_message.opcode, OP_RESET_HEAD);
         assert_eq!(pkt.header.source_id, 0x44D0_35D5);
+    }
+}
+
+#[cfg(test)]
+mod player_property_init_tests {
+    use super::*;
+
+    /// The init property stream must carry pmeteor's 16 starter command
+    /// bindings (`charaWork.command[0..15]`, Player.cs:235-251). Slot 0/1
+    /// are `0xA0F00000 | 21001 = 0xA0F05209` — the main-state Activate
+    /// toggle, i.e. the exact actor id the client puts in its
+    /// `0x012D EventStart owner=0xA0F05209 commandForced` when F / the
+    /// sword icon is pressed. Without these properties the client's
+    /// ready-command table is empty and F is dead (Garlemald-Server #28).
+    #[test]
+    fn init_properties_carry_starter_commands() {
+        let subs =
+            build_player_property_init(7, 100, 100, 100, 100, 0, 2, 1, 32, 0, 0, 1, 1, 1, 0, &[]);
+        let stream: Vec<u8> = subs.iter().flat_map(|s| s.to_bytes()).collect();
+        let activate = 0xA0F0_5209u32.to_le_bytes();
+        let hits = stream.windows(4).filter(|w| *w == activate).count();
+        assert!(
+            hits >= 2,
+            "expected charaWork.command[0] and [1] to carry 0xA0F05209 (Activate); found {hits} occurrence(s)",
+        );
     }
 }
