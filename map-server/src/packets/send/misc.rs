@@ -20,7 +20,6 @@
 //! SendMessage.
 
 use std::io::Cursor;
-use std::io::Write as _;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use common::luaparam::{self, LuaParam};
