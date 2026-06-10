@@ -28,6 +28,7 @@
 
 pub mod actor_registry;
 pub mod broadcast;
+pub mod clock;
 pub mod dispatcher;
 pub mod quest_apply;
 pub mod quest_hook;

@@ -264,7 +264,8 @@ pub async fn dispatch_battle_event(
 
             let mut offset = 0;
             while offset < wire.len() {
-                let sub = if wire.len() - offset <= 16 {
+                // X10 carries 10 rows max post-S0.6 (pmeteor capacity).
+                let sub = if wire.len() - offset <= 10 {
                     tx::actor_battle::build_command_result_x10(
                         *owner_actor_id,
                         *battle_animation,
@@ -489,9 +490,20 @@ async fn resolve_auto_attack(
         }
     }
 
+    // Swing animation per attacker kind — pmeteor `AttackState.cs:141-146`:
+    // `(25 << 24 | 1 << 12)` for players, `(17 << 24 | 1 << 12)` for NPCs.
+    // Retail confirms the player value (combat_skills.pcapng record #3,
+    // anim 0x19001000); the NPC value is pmeteor-source INFERENCE flagged
+    // for the live A/B (#28 S0.6).
+    let battle_animation = if attacker_handle.is_player() {
+        0x1900_1000
+    } else {
+        0x1100_1000
+    };
     broadcast_results(
         attacker_actor_id,
-        0, // battle_animation — auto-attacks have no distinct animation id
+        battle_animation,
+        AUTO_ATTACK_COMMAND_ID,
         &container.main_results,
         registry,
         world,
@@ -634,6 +646,7 @@ async fn resolve_action(
     broadcast_results(
         attacker_actor_id,
         command.battle_animation,
+        command.id, // raw catalog id — retail stamps it on every row
         &container.main_results,
         registry,
         world,
@@ -653,9 +666,16 @@ async fn resolve_action(
     .await;
 }
 
+/// pmeteor `CommandResultX01PacketCommand.Attack` — the synthetic
+/// command id retail stamps on every auto-attack result row
+/// (`/Command/Game/AttackCommand`; byte-confirmed in
+/// `combat_skills.pcapng` record #3, cmd 0x5658).
+pub(crate) const AUTO_ATTACK_COMMAND_ID: u16 = 22104;
+
 async fn broadcast_results(
     source_actor_id: u32,
     battle_animation: u32,
+    command_id: u16,
     results: &[CommandResult],
     registry: &ActorRegistry,
     world: &WorldManager,
@@ -668,11 +688,24 @@ async fn broadcast_results(
         results.iter().map(battle_result_to_wire).collect();
     let mut offset = 0;
     while offset < wire.len() {
-        let sub = if wire.len() - offset <= 16 {
+        // pmeteor container choice: X01 for the single-row case (what
+        // retail ships per skill press / swing), X10 up to 10 rows,
+        // X18 beyond.
+        let remaining = wire.len() - offset;
+        let sub = if remaining == 1 {
+            let row = &wire[offset];
+            offset += 1;
+            tx::actor_battle::build_command_result_x01(
+                source_actor_id,
+                battle_animation,
+                command_id,
+                row,
+            )
+        } else if remaining <= 10 {
             tx::actor_battle::build_command_result_x10(
                 source_actor_id,
                 battle_animation,
-                0,
+                command_id,
                 &wire,
                 &mut offset,
             )
@@ -680,12 +713,18 @@ async fn broadcast_results(
             tx::actor_battle::build_command_result_x18(
                 source_actor_id,
                 battle_animation,
-                0,
+                command_id,
                 &wire,
                 &mut offset,
             )
         };
-        broadcast_around_actor(world, registry, zone, source_actor_id, sub.to_bytes()).await;
+        let bytes = sub.to_bytes();
+        // The acting player must SEE their own result —
+        // `broadcast_around_actor` excludes the source (same bug class
+        // as the draw trio, quest_apply.rs). The helper stamps the
+        // session id into the target_id (proxy drop rule). (#28 S0.6.)
+        send_to_self_if_player(registry, world, source_actor_id, bytes.clone()).await;
+        broadcast_around_actor(world, registry, zone, source_actor_id, bytes).await;
     }
 }
 

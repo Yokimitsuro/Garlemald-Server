@@ -1676,6 +1676,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// #28 S0.4 — drive the REAL `SimpleContent30010.lua::onUpdate`
+    /// with an engaged player + an unengaged ally and assert the
+    /// `SetMod(modifiersGlobal.MovementSpeed, 8)` line reaches the
+    /// command stream as `SetActorMod{modifier_key: 61}`. Pins two
+    /// script bugs at once: the script previously read
+    /// `modifiersGlobal.Speed` (nil — modifiers.lua only defines
+    /// `MovementSpeed = 61`) so the SetMod silently no-opped, and it
+    /// never `require`d "ally" so `allyGlobal.EngageTarget` raised on
+    /// every tick (swallowed by the ticker's onUpdate drain).
+    #[test]
+    fn real_simple_content_30010_on_update_sets_movement_speed_mod() {
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/lua"));
+        let script_path = root.join("content/SimpleContent30010.lua");
+        assert!(script_path.exists());
+        let engine = LuaEngine::new(root);
+
+        let dummy_queue = CommandQueue::new();
+        let mut area = sample_content_area(dummy_queue.clone());
+        let mut player = sample_snapshot();
+        player.is_engaged = true;
+        player.target_actor_id = 0x4000_2099; // the wolf
+        area.players.push(player);
+        // Two allies, like production (Yda + Papalymo): the script's
+        // `for i = 0, #allies - 1` loop over the 1-indexed roster table
+        // skips the nil `allies[0]`, so the first REAL entry it
+        // processes is `allies[1]` — the first ally pushed here.
+        for (id, name) in [(0x4000_2001u32, "yda"), (0x4000_2002u32, "papalymo")] {
+            area.allies.push(userdata::LuaActor {
+                actor_id: id,
+                name: name.to_string(),
+                class_name: String::new(),
+                class_path: String::new(),
+                unique_id: String::new(),
+                zone_id: 166,
+                zone_name: String::new(),
+                state: 2,
+                pos: (365.266, 4.122, -700.73),
+                rotation: 0.0,
+                queue: dummy_queue.clone(),
+                is_engaged: false,
+                speed: 5.0,
+                target_actor_id: 0,
+            });
+        }
+        area.monsters.push(userdata::LuaActor {
+            actor_id: 0x4000_2099,
+            name: "bloodthirsty_wolf".to_string(),
+            class_name: String::new(),
+            class_path: String::new(),
+            unique_id: String::new(),
+            zone_id: 166,
+            zone_name: String::new(),
+            state: 2,
+            pos: (374.427, 4.4, -698.711),
+            rotation: 0.0,
+            queue: dummy_queue,
+            is_engaged: false,
+            speed: 5.0,
+            target_actor_id: 0,
+        });
+
+        let result = engine.call_content_on_update(&script_path, 1, area);
+        assert!(
+            result.error.is_none(),
+            "real onUpdate errored: {:?}",
+            result.error,
+        );
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::SetActorMod {
+                    actor_id: 0x4000_2001,
+                    modifier_key: 61, // Modifier::MovementSpeed
+                    value: 8,
+                }
+            )),
+            "ally SetMod(MovementSpeed, 8) must reach the command stream; got {:?}",
+            result.commands,
+        );
+        // The engage pair rides the same drain (allyGlobal.EngageTarget).
+        assert!(
+            result.commands.iter().any(|c| matches!(
+                c,
+                LuaCommand::ActorEngage {
+                    actor_id: 0x4000_2001,
+                    ..
+                }
+            )),
+            "ally engage must follow the speed mod; got {:?}",
+            result.commands,
+        );
+    }
+
     /// B7: `call_content_hook(.., "onZoneIn", ..)` runs a script's
     /// `onZoneIn(player, contentArea, director)` hook and drains
     /// commands. Mirrors the

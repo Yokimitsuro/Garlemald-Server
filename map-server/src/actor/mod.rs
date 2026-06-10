@@ -195,6 +195,11 @@ pub struct CharaState {
     /// time, the ticker's NPC respawn pass reads it to decide when
     /// to bring a BattleNpc back. Cleared by `apply_revive`.
     pub time_of_death_utc: u32,
+    /// Opt-out of the ticker's default BNpc respawn pass. Set at spawn
+    /// for content-area NPCs (SEQ_005 tutorial roster): they are
+    /// one-shots, and a wolf respawning at full HP mid-tutorial would
+    /// keep the all-wolves-dead gate from ever firing. (#28 S0.5.)
+    pub respawn_disabled: bool,
     // Mount / chocobo state — the runtime-mutable slice of
     // `PlayerState.has_chocobo` / `chocobo_appearance` /
     // `chocobo_name` / `mount_state` / `rental_expire_time` /
@@ -323,6 +328,7 @@ impl Default for CharaState {
             rest_bonus_exp_rate: 0,
             last_rest_accrual_utc: 0,
             time_of_death_utc: 0,
+            respawn_disabled: false,
             has_chocobo: false,
             mount_state: 0,
             chocobo_appearance: 0,

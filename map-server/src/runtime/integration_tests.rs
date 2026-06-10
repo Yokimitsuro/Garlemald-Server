@@ -5079,7 +5079,10 @@ async fn battle_npc_respawns_after_default_delay() {
     // tick snaps it back.
     chara.base.position_x = 9.0;
     chara.base.position_z = 9.0;
-    let now_secs = 5_000_000u64;
+    // `time_of_death_utc` is a wall-clock field; the death-tick
+    // compares it against wall-clock `unix_timestamp()` regardless of
+    // the `now_ms` fed to `tick_once` (#28 S0.2 single-domain rule).
+    let now_secs = common::utils::unix_timestamp() as u64;
     chara.chara.time_of_death_utc = (now_secs - 100) as u32;
     registry
         .insert(ActorHandle::new(
@@ -5159,8 +5162,10 @@ async fn battle_npc_does_not_respawn_before_delay() {
     chara.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
     chara.chara.hp = 0;
     chara.chara.max_hp = 100;
-    let now_secs = 6_000_000u64;
-    // Died 5 seconds ago — well under the 30s default delay.
+    // Died 5 wall-clock seconds ago — well under the 30s default
+    // delay. Wall-clock anchor per the #28 S0.2 single-domain rule
+    // (the death-tick never reads `tick_once`'s now_ms for this).
+    let now_secs = common::utils::unix_timestamp() as u64;
     chara.chara.time_of_death_utc = (now_secs - 5) as u32;
     registry
         .insert(ActorHandle::new(

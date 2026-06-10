@@ -113,6 +113,18 @@ pub fn build_set_actor_position(
 }
 
 /// 0x00CF MoveActorToPositionPacket — server-driven path-to.
+///
+/// Body layout (wiki "Move Actor to Position" + pmeteor
+/// `MoveActorToPositionPacket.cs:36-50`, which seeks to 0x8 before the
+/// float writes; byte-verified against the pmeteor capture's Yda
+/// warp-in 0x00CF, map-packets.log:33617):
+///   +0x00  u32 ×2  unknown, zero
+///   +0x08  f32     x
+///   +0x0C  f32     y
+///   +0x10  f32     z
+///   +0x14  f32     rotation
+///   +0x18  u16     move_state — 0 = standing, 1 = walking, 2 = running
+///   +0x24  f32     floatingHeight — stays 0 for ground mobs
 pub fn build_move_actor_to_position(
     actor_id: u32,
     x: f32,
@@ -123,6 +135,7 @@ pub fn build_move_actor_to_position(
 ) -> SubPacket {
     let mut data = body(0x50);
     let mut c = Cursor::new(&mut data[..]);
+    c.set_position(0x08);
     c.write_f32::<LittleEndian>(x).unwrap();
     c.write_f32::<LittleEndian>(y).unwrap();
     c.write_f32::<LittleEndian>(z).unwrap();
@@ -1013,6 +1026,51 @@ mod reset_head_tests {
         assert!(pkt.data.iter().all(|b| *b == 0));
         assert_eq!(pkt.game_message.opcode, OP_RESET_HEAD);
         assert_eq!(pkt.header.source_id, 0x44D0_35D5);
+    }
+}
+
+#[cfg(test)]
+mod move_actor_to_position_tests {
+    use super::*;
+
+    /// Reproduce Yda's warp-in 0x00CF from the pmeteor reference capture
+    /// (`captures/pmeteor-quest/20260426-160210-gridania-manual3/
+    /// map-packets.log:33617-33621`) — src 0x40080007, x=365.266 @ +0x08
+    /// behind an 8-byte zero prefix, y=4.1219, z=-700.730, rot=1.5659,
+    /// moveState=0. Pins the +0x08 float offset: writing x at +0x00 (the
+    /// pre-#28 layout) makes the client decode garbage coordinates for
+    /// every NPC movement packet.
+    #[test]
+    fn move_actor_to_position_matches_pmeteor_capture() {
+        let x = f32::from_le_bytes([0x0C, 0xA2, 0xB6, 0x43]); // 365.266
+        let y = f32::from_le_bytes([0x6D, 0xE7, 0x83, 0x40]); // 4.1219
+        let z = f32::from_le_bytes([0xB8, 0x2E, 0x2F, 0xC4]); // -700.730
+        let rot = f32::from_le_bytes([0x69, 0x6F, 0xC8, 0x3F]); // 1.5659
+        let pkt = build_move_actor_to_position(0x4008_0007, x, y, z, rot, 0);
+
+        assert_eq!(pkt.game_message.opcode, OP_MOVE_ACTOR_TO_POSITION);
+        assert_eq!(pkt.header.source_id, 0x4008_0007);
+        assert_eq!(pkt.data.len(), 0x30);
+        // +0x00..0x08: the two unknown u32 stay zero.
+        assert!(pkt.data[..0x08].iter().all(|b| *b == 0));
+        // Floats from +0x08, capture bytes verbatim.
+        assert_eq!(
+            &pkt.data[0x08..0x18],
+            &[
+                0x0C, 0xA2, 0xB6, 0x43, // x
+                0x6D, 0xE7, 0x83, 0x40, // y
+                0xB8, 0x2E, 0x2F, 0xC4, // z
+                0x69, 0x6F, 0xC8, 0x3F, // rot
+            ],
+        );
+        // +0x18 moveState; everything after (incl. +0x24 floatingHeight)
+        // stays zero for ground mobs.
+        assert_eq!(&pkt.data[0x18..0x1A], &[0x00, 0x00]);
+        assert!(pkt.data[0x1A..].iter().all(|b| *b == 0));
+
+        // Running variant: moveState=2 lands at +0x18.
+        let run = build_move_actor_to_position(0x4008_0007, x, y, z, rot, 2);
+        assert_eq!(&run.data[0x18..0x1A], &[0x02, 0x00]);
     }
 }
 

@@ -556,10 +556,11 @@ async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &Acto
         );
         return;
     };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    // Shared battle-clock anchor (`runtime/clock.rs`) — the ticker drives
+    // `AIContainer::update` in this domain. Arming the swing clock with
+    // epoch ms (the pre-#28 bug) parked `is_attack_ready` ~56 years out:
+    // script-engaged allies entered the engaged state but never swung.
+    let now_ms = crate::runtime::clock::server_now_ms();
     let mut c = handle.character.write().await;
     let delay = c.get_attack_delay_ms();
     let started = c
@@ -1097,11 +1098,11 @@ async fn apply_hate_container_add_base_hate(
 ///     MoveActorToPositionPacket.BuildPacket(Id, x, y, z, rot, moveState));
 /// ```
 ///
-/// `move_state` values follow pmeteor's wiki notes (0 = walk, 1 =
-/// run, 2 = sprint, 3 = mounted). The dispatch is best-effort: if
-/// the actor isn't in the registry or has no zone we just log and
-/// drop, matching the C# implicit silent-skip when CurrentArea is
-/// null.
+/// `move_state` values follow the wiki + pmeteor
+/// `UpdatePlayerPositionPacket.cs:33` (0 = standing, 1 = walking,
+/// 2 = running). The dispatch is best-effort: if the actor isn't in
+/// the registry or has no zone we just log and drop, matching the C#
+/// implicit silent-skip when CurrentArea is null.
 #[allow(clippy::too_many_arguments)]
 async fn apply_move_actor_to_position(
     actor_id: u32,
@@ -1142,6 +1143,19 @@ async fn apply_move_actor_to_position(
         );
         return;
     };
+    // 2b. Re-insert into the zone's spatial grid — `actors_around`
+    //     (the AI arena + broadcast radius source) reads the grid, not
+    //     `Character.base.position_*`, so without this every scripted
+    //     move desyncs aggro/visibility from the authoritative
+    //     position. Mirrors the player path
+    //     (`world_manager.rs::update_actor_position`). (#28 S0.3.)
+    {
+        let mut zone_write = zone_arc.write().await;
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone_write
+            .core
+            .update_actor_position(actor_id, common::Vector3::new(x, y, z), &mut ob);
+    }
     let sub = crate::packets::send::actor::build_move_actor_to_position(
         actor_id, x, y, z, rotation, move_state,
     );
@@ -5013,18 +5027,210 @@ mod change_state_self_send_tests {
         );
         assert_eq!(sub.data[0], 2, "main_state byte");
         // pmeteor parity: the draw-animation battle actions ride along.
+        // Byte layout re-pinned to the retail/pmeteor container after
+        // the S0.6 re-lay (pmeteor capture map-packets.log:38304ff —
+        // F-press 0x13C + 0x139 trio members): sourceActorId at +0x00,
+        // animationId at +0x04, commandId at +0x24, row from +0x28.
         let x00 = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
         assert_eq!(x00.game_message.opcode, 0x013C);
         assert_eq!(x00.header.target_id, 7);
-        assert_eq!(&x00.data[..4], &0x7200_0062u32.to_le_bytes());
+        assert_eq!(&x00.data[..4], &1u32.to_le_bytes());
+        assert_eq!(&x00.data[4..8], &0x7200_0062u32.to_le_bytes());
         let x01 = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
         assert_eq!(x01.game_message.opcode, 0x0139);
-        assert_eq!(&x01.data[..4], &0x7C00_0062u32.to_le_bytes());
-        assert_eq!(&x01.data[4..6], &21001u16.to_le_bytes());
+        assert_eq!(&x01.data[..4], &1u32.to_le_bytes());
+        assert_eq!(&x01.data[4..8], &0x7C00_0062u32.to_le_bytes());
+        assert_eq!(&x01.data[0x24..0x26], &21001u16.to_le_bytes());
+        assert_eq!(
+            &x01.data[0x28..0x2C],
+            &1u32.to_le_bytes(),
+            "self-targeted draw row"
+        );
+        assert_eq!(&x01.data[0x30..0x34], &1u32.to_le_bytes(), "effectId 1");
+        assert_eq!(x01.data[0x35], 1, "hitNum 1");
 
         // Stored state mutated too.
         let handle = registry.get(1).await.unwrap();
         let c = handle.character.read().await;
         assert_eq!(c.base.current_main_state, 2);
+    }
+}
+
+#[cfg(test)]
+mod actor_engage_clock_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::battle::outbox::{BattleEvent, BattleOutbox};
+    use crate::runtime::actor_registry::ActorKindTag;
+    use crate::zone::area::StoredActor;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::{ActorKind, Zone};
+    use common::Vector3;
+
+    /// Regression test for "Yda engages but never swings" (#28 S0.2):
+    /// `apply_actor_engage` must arm `AttackState.next_swing_ms` in the
+    /// same clock domain the ticker drives `AIContainer::update` with
+    /// (`runtime/clock.rs`). With the old epoch-ms arming, the swing
+    /// stayed ~56 years out and this test's single update tick emitted
+    /// nothing.
+    #[tokio::test]
+    async fn script_engage_swings_on_the_shared_clock() {
+        let world = WorldManager::new();
+        let registry = ActorRegistry::new();
+
+        let mut zone = Zone::new(
+            166,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        for (id, pos) in [(1u32, Vector3::ZERO), (2u32, Vector3::new(2.0, 0.0, 0.0))] {
+            zone.core.add_actor(
+                StoredActor {
+                    actor_id: id,
+                    kind: ActorKind::BattleNpc,
+                    position: pos,
+                    grid: (0, 0),
+                    is_alive: true,
+                },
+                &mut ob,
+            );
+        }
+        world.register_zone(zone).await;
+
+        for (id, kind) in [(1u32, ActorKindTag::Ally), (2u32, ActorKindTag::BattleNpc)] {
+            let mut c = Character::new(id);
+            c.chara.hp = 100;
+            c.chara.max_hp = 100;
+            registry
+                .insert(crate::runtime::actor_registry::ActorHandle::new(
+                    id, kind, 166, 0, c,
+                ))
+                .await;
+        }
+
+        // Script-driven engage (the `allyGlobal.EngageTarget` path).
+        apply_actor_engage(1, 2, &registry).await;
+
+        let handle = registry.get(1).await.unwrap();
+        let delay = { handle.character.read().await.get_attack_delay_ms() };
+        // One AI update past the swing window, in the shared domain.
+        let now_ms = crate::runtime::clock::server_now_ms() + delay as u64 + 10;
+        let zone_arc = world.zone(166).await.unwrap();
+        let mut outbox = BattleOutbox::new();
+        {
+            let zone_read = zone_arc.read().await;
+            let mut c = handle.character.write().await;
+            let view = crate::runtime::ticker::build_owner_view(&c, 1, 166);
+            c.ai_container
+                .update(now_ms, view, &*zone_read, &mut outbox);
+        }
+        let events = outbox.drain();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                BattleEvent::ResolveAutoAttack {
+                    attacker_actor_id: 1,
+                    defender_actor_id: 2,
+                }
+            )),
+            "engaged ally must emit ResolveAutoAttack on the first ready tick; got {events:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod move_actor_grid_sync_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::runtime::actor_registry::ActorKindTag;
+    use crate::zone::area::StoredActor;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::{ActorKind, Zone};
+    use common::Vector3;
+
+    /// `apply_move_actor_to_position` must re-insert the actor into the
+    /// zone's spatial grid — `actors_around*` (the AI arena) reads the
+    /// grid, and without the sync it diverges from the authoritative
+    /// `Character.base.position_*` the moment anything moves. (#28 S0.3.)
+    #[tokio::test]
+    async fn move_actor_updates_the_spatial_grid() {
+        let world = WorldManager::new();
+        let registry = ActorRegistry::new();
+
+        let mut zone = Zone::new(
+            166,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 9,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+        registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                9,
+                ActorKindTag::BattleNpc,
+                166,
+                0,
+                Character::new(9),
+            ))
+            .await;
+
+        // Move far enough to cross grid cells (BOUNDING_GRID_SIZE = 50).
+        apply_move_actor_to_position(9, 500.0, 4.0, 500.0, 0.0, 2, &registry, &world).await;
+
+        let zone_arc = world.zone(166).await.unwrap();
+        let zone_read = zone_arc.read().await;
+        let at_new: Vec<u32> = zone_read
+            .core
+            .actors_around_point(500.0, 500.0, 10.0)
+            .iter()
+            .map(|a| a.actor_id)
+            .collect();
+        let at_old: Vec<u32> = zone_read
+            .core
+            .actors_around_point(0.0, 0.0, 10.0)
+            .iter()
+            .map(|a| a.actor_id)
+            .collect();
+        assert!(at_new.contains(&9), "grid must track the new position");
+        assert!(!at_old.contains(&9), "grid must drop the old position");
+        // The stored Character position moved too.
+        let c = registry.get(9).await.unwrap();
+        let c = c.character.read().await;
+        assert_eq!(
+            (c.base.position_x, c.base.position_z),
+            (500.0, 500.0),
+            "authoritative position must match the grid",
+        );
     }
 }

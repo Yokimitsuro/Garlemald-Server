@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tokio::time::{Instant, interval};
+use tokio::time::interval;
 
 use crate::actor::Character;
 use crate::actor::modifier::ModifierMap;
@@ -120,8 +120,6 @@ pub struct GameTicker {
     /// up Catalogs just to run the ticker. The dispatchers consume this
     /// (gear-paramBonus summer reads `items`).
     pub catalogs: Arc<crate::lua::Catalogs>,
-    /// Server-start wall-clock — `now_ms` on each tick is relative to this.
-    start: Instant,
     /// Last `now_ms` the per-content-area `onUpdate` driver fired —
     /// delta-gated (see `tick_once`).
     last_content_update_ms: tokio::sync::Mutex<u64>,
@@ -148,6 +146,9 @@ impl GameTicker {
             .as_ref()
             .map(|l| l.catalogs().clone())
             .unwrap_or_else(|| Arc::new(crate::lua::Catalogs::default()));
+        // Anchor the shared battle clock now so AI deadlines armed
+        // before the first frame (login-time engages) share the domain.
+        let _ = crate::runtime::clock::server_now_ms();
         Self {
             config,
             world,
@@ -155,7 +156,6 @@ impl GameTicker {
             db,
             lua,
             catalogs,
-            start: Instant::now(),
             last_content_update_ms: tokio::sync::Mutex::new(0),
         }
     }
@@ -174,7 +174,11 @@ impl GameTicker {
         let mut frames: u64 = 0;
         loop {
             int.tick().await;
-            let now_ms = self.start.elapsed().as_millis() as u64;
+            // Shared battle-clock anchor (`runtime/clock.rs`) — the same
+            // domain `apply_actor_engage` / the set-target engage arm use
+            // to arm `AttackState.next_swing_ms`. The loop arithmetic
+            // below is unchanged; only the anchor is shared. (#28 S0.2.)
+            let now_ms = crate::runtime::clock::server_now_ms();
             self.tick_once(now_ms).await;
             frames += 1;
             // Liveness heartbeat — a frozen/starved ticker (the SEQ_005
@@ -306,107 +310,14 @@ impl GameTicker {
                 if !script_path.exists() {
                     continue;
                 }
-                // Phase C2b — build real roster snapshots so the
-                // script's `area:GetPlayers()` / `:GetAllies()` /
-                // `:GetMonsters()` iterators yield real userdata
-                // instead of empty tables. Source the roster from
-                // `session.transient_director_members[director_id]`
-                // (Phase B4 records the director's member list there)
-                // + the live `ActorRegistry`. Classify members by
-                // their `ActorKindTag` so the script's separate
-                // `allies` / `monsters` loops see the right
-                // partition. The session-owning player is always in
-                // `players`.
                 let placeholder_queue = crate::lua::command::CommandQueue::new();
-                let mut players_vec = Vec::new();
-                let mut allies_vec = Vec::new();
-                let mut monsters_vec = Vec::new();
-
-                // Resolve the owning player → PlayerSnapshot.
-                if let Some(player_handle) = self.registry.by_session(session.id).await {
-                    let snap = {
-                        let c = player_handle.character.read().await;
-                        crate::processor::build_player_snapshot_from_character(&c)
-                    };
-                    players_vec.push(snap);
-                }
-
-                // Resolve every director member → LuaActor /
-                // PlayerSnapshot, classified by ActorKindTag.
-                let member_ids = if active.director_actor_id.ne(&0) {
-                    {
-                        session
-                            .transient_director_members
-                            .get(&active.director_actor_id)
-                            .cloned()
-                            .unwrap_or_default()
-                    }
-                } else {
-                    Default::default()
-                };
-                for mid in member_ids {
-                    let Some(handle) = self.registry.get(mid).await else {
-                        continue;
-                    };
-                    let c = handle.character.read().await;
-                    match handle.kind {
-                        crate::runtime::actor_registry::ActorKindTag::Player => {
-                            // Skip the session-owner — already in
-                            // players_vec from the by_session branch.
-                            if mid != players_vec.first().map(|p| p.actor_id).unwrap_or(0) {
-                                players_vec.push(
-                                    crate::processor::build_player_snapshot_from_character(&c),
-                                );
-                            }
-                        }
-                        kind @ (crate::runtime::actor_registry::ActorKindTag::Ally
-                        | crate::runtime::actor_registry::ActorKindTag::BattleNpc
-                        | crate::runtime::actor_registry::ActorKindTag::Npc
-                        | crate::runtime::actor_registry::ActorKindTag::Pet) => {
-                            let actor = crate::lua::userdata::LuaActor {
-                                actor_id: mid,
-                                name: c.base.actor_name.clone(),
-                                class_name: String::new(),
-                                class_path: String::new(),
-                                unique_id: String::new(),
-                                zone_id: handle.zone_id,
-                                zone_name: String::new(),
-                                state: c.base.current_main_state,
-                                pos: (c.base.position_x, c.base.position_y, c.base.position_z),
-                                rotation: c.base.rotation,
-                                queue: placeholder_queue.clone(),
-                                // Engagement = an active AttackState (pmeteor
-                                // `aiContainer.IsEngaged()`), NOT
-                                // `Character::is_engaged()` which reads
-                                // `current_target != INVALID_ACTORID` and
-                                // defaults to `0 != 0xC0000000` = always-true
-                                // for NPCs that never get a `current_target`.
-                                // With the buggy value the content script's
-                                // `if not allies[i]:IsEngaged()` guard never
-                                // passes and allies never engage. (Garlemald #28.)
-                                is_engaged: c.ai_container.is_engaged(),
-                                speed: c.get_speed(),
-                                target_actor_id: c
-                                    .ai_container
-                                    .current_state()
-                                    .map(|s| s.target_actor_id)
-                                    .filter(|id| *id != 0)
-                                    .unwrap_or(0),
-                            };
-                            // Ally if the registered kind says so
-                            // OR the BattleNpc was spawned with
-                            // allegiance==1 (we can't read that from
-                            // ActorKindTag::BattleNpc alone, but B1
-                            // tags ally BNpcs as `Ally`).
-                            match kind {
-                                crate::runtime::actor_registry::ActorKindTag::Ally => {
-                                    allies_vec.push(actor)
-                                }
-                                _ => monsters_vec.push(actor),
-                            }
-                        }
-                    }
-                }
+                let (players_vec, allies_vec, monsters_vec) = build_content_rosters(
+                    &self.registry,
+                    &session,
+                    &active,
+                    placeholder_queue.clone(),
+                )
+                .await;
 
                 let area = crate::lua::userdata::LuaContentArea {
                     parent_zone_id: active.parent_zone_id,
@@ -565,8 +476,15 @@ impl GameTicker {
                     if raise > 0.0 {
                         DeathTickAction::AutoRevive
                     } else if !matches!(handle.kind, ActorKindTag::Player)
+                        && !chara.chara.respawn_disabled
                         && chara.chara.time_of_death_utc != 0
-                        && (now_ms / 1000) as u32
+                        // `time_of_death_utc` is wall-clock (apply_die
+                        // stamps `unix_timestamp()`), so the comparison
+                        // must read wall-clock too — never the ticker's
+                        // server-start-relative `now_ms`. (#28 S0.2:
+                        // one clock domain per field, asserted in
+                        // `respawn_timer_compares_wall_clock`.)
+                        && common::utils::unix_timestamp() as u32
                             >= chara
                                 .chara
                                 .time_of_death_utc
@@ -632,6 +550,117 @@ impl GameTicker {
     }
 }
 
+/// Phase C2b — build the content-area roster snapshots for the 500 ms
+/// `onUpdate(tick, area)` driver, so the script's `area:GetPlayers()` /
+/// `:GetAllies()` / `:GetMonsters()` iterators yield real userdata
+/// instead of empty tables. Sources the roster from
+/// `session.transient_director_members[director_id]` (Phase B4 records
+/// the director's member list there) + the live `ActorRegistry`,
+/// classified by `ActorKindTag`. The session-owning player is always in
+/// `players`.
+///
+/// #28 S0.5 — dead actors are filtered out of the ally/monster vectors:
+/// "in the roster table ≡ alive", so the content script needs no
+/// liveness checks and corpses leave `GetMonsters()` the tick they die.
+pub(crate) async fn build_content_rosters(
+    registry: &ActorRegistry,
+    session: &crate::data::Session,
+    active: &crate::data::ActiveContentScript,
+    placeholder_queue: std::sync::Arc<std::sync::Mutex<crate::lua::command::CommandQueue>>,
+) -> (
+    Vec<crate::lua::userdata::PlayerSnapshot>,
+    Vec<crate::lua::userdata::LuaActor>,
+    Vec<crate::lua::userdata::LuaActor>,
+) {
+    let mut players_vec = Vec::new();
+    let mut allies_vec = Vec::new();
+    let mut monsters_vec = Vec::new();
+
+    // Resolve the owning player → PlayerSnapshot.
+    if let Some(player_handle) = registry.by_session(session.id).await {
+        let snap = {
+            let c = player_handle.character.read().await;
+            crate::processor::build_player_snapshot_from_character(&c)
+        };
+        players_vec.push(snap);
+    }
+
+    // Resolve every director member → LuaActor / PlayerSnapshot,
+    // classified by ActorKindTag.
+    let member_ids = if active.director_actor_id.ne(&0) {
+        session
+            .transient_director_members
+            .get(&active.director_actor_id)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    for mid in member_ids {
+        let Some(handle) = registry.get(mid).await else {
+            continue;
+        };
+        let c = handle.character.read().await;
+        match handle.kind {
+            crate::runtime::actor_registry::ActorKindTag::Player => {
+                // Skip the session-owner — already in players_vec from
+                // the by_session branch.
+                if mid != players_vec.first().map(|p| p.actor_id).unwrap_or(0) {
+                    players_vec.push(crate::processor::build_player_snapshot_from_character(&c));
+                }
+            }
+            kind @ (crate::runtime::actor_registry::ActorKindTag::Ally
+            | crate::runtime::actor_registry::ActorKindTag::BattleNpc
+            | crate::runtime::actor_registry::ActorKindTag::Npc
+            | crate::runtime::actor_registry::ActorKindTag::Pet) => {
+                // S0.5 dead-filter (see fn doc).
+                if c.base.current_main_state == crate::actor::MAIN_STATE_DEAD {
+                    continue;
+                }
+                let actor = crate::lua::userdata::LuaActor {
+                    actor_id: mid,
+                    name: c.base.actor_name.clone(),
+                    class_name: String::new(),
+                    class_path: String::new(),
+                    unique_id: String::new(),
+                    zone_id: handle.zone_id,
+                    zone_name: String::new(),
+                    state: c.base.current_main_state,
+                    pos: (c.base.position_x, c.base.position_y, c.base.position_z),
+                    rotation: c.base.rotation,
+                    queue: placeholder_queue.clone(),
+                    // Engagement = an active AttackState (pmeteor
+                    // `aiContainer.IsEngaged()`), NOT
+                    // `Character::is_engaged()` which reads
+                    // `current_target != INVALID_ACTORID` and
+                    // defaults to `0 != 0xC0000000` = always-true
+                    // for NPCs that never get a `current_target`.
+                    // With the buggy value the content script's
+                    // `if not allies[i]:IsEngaged()` guard never
+                    // passes and allies never engage. (Garlemald #28.)
+                    is_engaged: c.ai_container.is_engaged(),
+                    speed: c.get_speed(),
+                    target_actor_id: c
+                        .ai_container
+                        .current_state()
+                        .map(|s| s.target_actor_id)
+                        .filter(|id| *id != 0)
+                        .unwrap_or(0),
+                };
+                // Ally if the registered kind says so OR the BattleNpc
+                // was spawned with allegiance==1 (we can't read that
+                // from ActorKindTag::BattleNpc alone, but B1 tags ally
+                // BNpcs as `Ally`).
+                match kind {
+                    crate::runtime::actor_registry::ActorKindTag::Ally => allies_vec.push(actor),
+                    _ => monsters_vec.push(actor),
+                }
+            }
+        }
+    }
+    (players_vec, allies_vec, monsters_vec)
+}
+
 fn tick_status(chara: &mut Character, now_ms: u64, outbox: &mut StatusOutbox) {
     // Clone the ModifierMap so we can hand it in without aliasing — the
     // underlying HashMap is small enough that this is essentially free.
@@ -639,7 +668,11 @@ fn tick_status(chara: &mut Character, now_ms: u64, outbox: &mut StatusOutbox) {
     chara.status_effects.update(now_ms, &mods_snapshot, outbox);
 }
 
-fn build_owner_view(chara: &Character, actor_id: u32, zone_id: u32) -> ControllerOwnerView {
+pub(crate) fn build_owner_view(
+    chara: &Character,
+    actor_id: u32,
+    zone_id: u32,
+) -> ControllerOwnerView {
     let is_engaged = chara.ai_container.is_engaged();
     let current_target = chara
         .ai_container
@@ -901,6 +934,111 @@ mod tests {
             final_hp < initial_hp,
             "npc hp should have dropped after 10 swings, got {final_hp}"
         );
+    }
+
+    /// #28 S0.5(a) — dead actors leave the onUpdate roster: a wolf at
+    /// `MAIN_STATE_DEAD` must be excluded from the monsters vector so
+    /// the content script's "in the table ≡ alive" invariant holds.
+    #[tokio::test]
+    async fn dead_actor_excluded_from_content_rosters() {
+        let registry = ActorRegistry::new();
+        let director_id = 0x6608_0001u32;
+
+        for (id, kind, dead) in [
+            (0x4000_0010u32, ActorKindTag::BattleNpc, false),
+            (0x4000_0011u32, ActorKindTag::BattleNpc, true),
+            (0x4000_0012u32, ActorKindTag::Ally, true),
+        ] {
+            let mut c = Character::new(id);
+            if dead {
+                c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+            }
+            registry.insert(ActorHandle::new(id, kind, 166, 0, c)).await;
+        }
+
+        let mut session = crate::data::Session::new(7);
+        session
+            .transient_director_members
+            .insert(director_id, vec![0x4000_0010, 0x4000_0011, 0x4000_0012]);
+        let active = crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: String::new(),
+            director_name: String::new(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+        };
+
+        let (players, allies, monsters) = super::build_content_rosters(
+            &registry,
+            &session,
+            &active,
+            crate::lua::command::CommandQueue::new(),
+        )
+        .await;
+        assert!(players.is_empty(), "no player session registered");
+        let monster_ids: Vec<u32> = monsters.iter().map(|m| m.actor_id).collect();
+        assert_eq!(
+            monster_ids,
+            vec![0x4000_0010],
+            "dead wolf must be filtered out of the monsters roster",
+        );
+        assert!(
+            allies.is_empty(),
+            "dead ally must be filtered out of the allies roster",
+        );
+    }
+
+    /// #28 S0.5(b) — `respawn_disabled` corpses stay dead past
+    /// `BNPC_DEFAULT_RESPAWN_SECS`; without the flag the same corpse
+    /// respawns. Also asserts the S0.2 domain choice: the death-tick
+    /// compares wall-clock `unix_timestamp()` against the wall-clock
+    /// `time_of_death_utc` apply_die stamps — never the ticker's
+    /// relative `now_ms` (which is 0 here and would never trigger).
+    #[tokio::test]
+    async fn respawn_timer_compares_wall_clock() {
+        let (ticker, _zone) = setup_one_zone_one_actor().await;
+        let died_at = common::utils::unix_timestamp() as u32 - (BNPC_DEFAULT_RESPAWN_SECS + 1);
+
+        // Respawn-disabled corpse: still dead after the window.
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let mut c = handle.character.write().await;
+            c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+            c.chara.hp = 0;
+            c.chara.time_of_death_utc = died_at;
+            c.chara.respawn_disabled = true;
+        }
+        ticker.tick_once(0).await;
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let c = handle.character.read().await;
+            assert_eq!(
+                c.base.current_main_state,
+                crate::actor::MAIN_STATE_DEAD,
+                "respawn-disabled corpse must stay dead",
+            );
+        }
+
+        // Same corpse with the flag cleared: the elapsed wall-clock
+        // window revives it even though the tick's now_ms is 0.
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let mut c = handle.character.write().await;
+            c.chara.respawn_disabled = false;
+        }
+        ticker.tick_once(0).await;
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let c = handle.character.read().await;
+            assert_ne!(
+                c.base.current_main_state,
+                crate::actor::MAIN_STATE_DEAD,
+                "default corpse must respawn once the wall-clock window elapses",
+            );
+        }
     }
 
     #[tokio::test]

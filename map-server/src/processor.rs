@@ -2220,7 +2220,27 @@ impl PacketProcessor {
         }
 
         // 6. Register the live Character in the ActorRegistry.
-        let character = bnpc.npc.character.clone();
+        let mut character = bnpc.npc.character.clone();
+        // #28 S0.5 — content-spawned NPCs are one-shots: opt them out of
+        // the ticker's default 30 s BNpc respawn. A tutorial wolf
+        // respawning at full HP mid-fight would keep the all-wolves-dead
+        // gate from ever firing (seed `respawnTime` is 0 for all five
+        // anyway). Detection: the spawn fires from a content script's
+        // onCreate, which runs after `active_content_script` is set on
+        // the owning session for this parent zone.
+        let content_spawn = {
+            let mut found = false;
+            for snap in self.world.all_sessions().await {
+                if let Some(active) = snap.active_content_script.as_ref()
+                    && active.parent_zone_id == parent_zone_id
+                {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        character.chara.respawn_disabled = content_spawn;
         // Phase C1/C2b — tag ally-allegiance BNpcs as `Ally` in the
         // registry. C# Meteor instantiates `Ally` as a separate
         // subclass of `BattleNpc` (`Map Server/Actors/Chara/Npc/Ally.cs`);
@@ -7653,10 +7673,10 @@ impl PacketProcessor {
                 && selected_target != crate::actor::INVALID_ACTORID;
 
             if valid_combat_target {
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
+                // Shared battle-clock anchor — same fix as
+                // `apply_actor_engage` (#28 S0.2): epoch ms here armed
+                // the player's swing clock past the ticker's domain.
+                let now_ms = crate::runtime::clock::server_now_ms();
                 let delay = c.get_attack_delay_ms();
                 let cur = c
                     .ai_container

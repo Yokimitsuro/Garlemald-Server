@@ -1,5 +1,9 @@
 require ("global")
 require ("modifiers")
+-- onUpdate calls allyGlobal.EngageTarget; without this require the
+-- global is nil and every onUpdate tick errored right after the
+-- speed SetMod (errors swallowed by the ticker drain). (#28 S0.4)
+require ("ally")
 
 function onCreate(starterPlayer, contentArea, director)
 	--papalymo = contentArea:SpawnActor(2290005, "papalymo", 365.89, 4.0943, -706.72, -0.718);
@@ -33,6 +37,12 @@ function onCreate(starterPlayer, contentArea, director)
 	-- broadcasts in the SEQ_005 warp window — only the single 0x0183
 	-- content trio.
 	starterPlayer:SetMod(modifiersGlobal.MinimumHpLock, 1);
+	-- Allies are unkillable for the tutorial too (Modifier::MinimumHpLock
+	-- floor-1 clamp, actor/chara.rs): a dead Yda/Papalymo would otherwise
+	-- ride the default BNpc respawn weirdness mid-fight. The player's lock
+	-- above is cleared at teardown (ContentFinished).
+	yda:SetMod(modifiersGlobal.MinimumHpLock, 1);
+	papalymo:SetMod(modifiersGlobal.MinimumHpLock, 1);
 	
 	
 	openingStoper = contentArea:SpawnActor(1090384, "openingstoper", 356.09, 3.74, -701.62, -1.41);
@@ -71,7 +81,10 @@ function onUpdate(tick, area)
 									
 									allies[i].neutral = false
 									allies[i].isAutoAttackEnabled = true
-									allies[i]:SetMod(modifiersGlobal.Speed, 8)
+									-- modifiers.lua has no `Speed`; the real id is
+									-- MovementSpeed (61). `SetMod(nil, 8)` silently
+									-- no-opped inside the onUpdate partial. (#28 S0.4)
+									allies[i]:SetMod(modifiersGlobal.MovementSpeed, 8)
 									allyGlobal.EngageTarget(allies[i], player.target)
 									exitLoop = true
 									break
