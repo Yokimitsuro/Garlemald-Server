@@ -734,54 +734,61 @@ async fn dispatch_director_event_started(
     // on `_WAIT_EVENT` and the scheduler parks it until the client's
     // `EventUpdate` packet wakes it through `fire_player_event`.
     let result = tokio::task::spawn_blocking(move || {
-        lua_clone.spawn_director_on_event_started(&script_path_clone, |lua_vm, queue| {
-            let player = crate::lua::userdata::LuaPlayer {
-                snapshot,
-                queue: queue.clone(),
-            };
-            let player_ud = lua_vm
-                .create_userdata(player)
-                .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
-            let director = crate::lua::userdata::LuaDirectorHandle {
-                name: actor_name_owned,
-                actor_id: director_actor_id,
-                class_path: class_path_owned,
-                queue: queue.clone(),
-            };
-            let director_ud = lua_vm
-                .create_userdata(director)
-                .map_err(|e| anyhow::anyhow!("create_userdata(LuaDirectorHandle): {e}"))?;
-
-            let mut mv = MultiValue::new();
-            mv.push_back(Value::UserData(player_ud));
-            mv.push_back(Value::UserData(director_ud));
-            mv.push_back(Value::String(
-                lua_vm
-                    .create_string(&event_name_owned)
-                    .map_err(|e| anyhow::anyhow!("create_string(eventName): {e}"))?,
-            ));
-            for p in &lua_params_owned {
-                let v = match p {
-                    LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
-                    LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
-                    LuaParam::String(s) => Value::String(
-                        lua_vm
-                            .create_string(s)
-                            .map_err(|e| anyhow::anyhow!("create_string(lparam): {e}"))?,
-                    ),
-                    LuaParam::True => Value::Boolean(true),
-                    LuaParam::False => Value::Boolean(false),
-                    LuaParam::Nil => Value::Nil,
-                    LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
-                    LuaParam::Type7 { actor_id, .. } => Value::Integer(*actor_id as mlua::Integer),
-                    LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
-                    LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
-                    LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
+        let owner_player_id = snapshot.actor_id;
+        lua_clone.spawn_director_on_event_started(
+            &script_path_clone,
+            owner_player_id,
+            |lua_vm, queue| {
+                let player = crate::lua::userdata::LuaPlayer {
+                    snapshot,
+                    queue: queue.clone(),
                 };
-                mv.push_back(v);
-            }
-            Ok(mv)
-        })
+                let player_ud = lua_vm
+                    .create_userdata(player)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+                let director = crate::lua::userdata::LuaDirectorHandle {
+                    name: actor_name_owned,
+                    actor_id: director_actor_id,
+                    class_path: class_path_owned,
+                    queue: queue.clone(),
+                };
+                let director_ud = lua_vm
+                    .create_userdata(director)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaDirectorHandle): {e}"))?;
+
+                let mut mv = MultiValue::new();
+                mv.push_back(Value::UserData(player_ud));
+                mv.push_back(Value::UserData(director_ud));
+                mv.push_back(Value::String(
+                    lua_vm
+                        .create_string(&event_name_owned)
+                        .map_err(|e| anyhow::anyhow!("create_string(eventName): {e}"))?,
+                ));
+                for p in &lua_params_owned {
+                    let v = match p {
+                        LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
+                        LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
+                        LuaParam::String(s) => Value::String(
+                            lua_vm
+                                .create_string(s)
+                                .map_err(|e| anyhow::anyhow!("create_string(lparam): {e}"))?,
+                        ),
+                        LuaParam::True => Value::Boolean(true),
+                        LuaParam::False => Value::Boolean(false),
+                        LuaParam::Nil => Value::Nil,
+                        LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
+                        LuaParam::Type7 { actor_id, .. } => {
+                            Value::Integer(*actor_id as mlua::Integer)
+                        }
+                        LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
+                        LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
+                        LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
+                    };
+                    mv.push_back(v);
+                }
+                Ok(mv)
+            },
+        )
     })
     .await;
 

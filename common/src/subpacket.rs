@@ -166,6 +166,39 @@ impl SubPacket {
         self.header.target_id = target;
     }
 
+    /// Stamp `target` into the `target_id` field of every subpacket in a
+    /// serialized subpacket stream whose `target_id` is still 0. Returns
+    /// the number of headers stamped.
+    ///
+    /// The world-server proxy fans map-server replies out to client
+    /// sessions purely by each subpacket's `target_id`, and DROPS
+    /// untargeted (`target_id == 0`) subpackets (`world-server/src/
+    /// server.rs`). Builders construct subpackets with a zeroed header,
+    /// so any send path that forgets `set_target_id` produces packets
+    /// that silently never reach the client — this helper lets fan-out
+    /// helpers (`broadcast_around_actor`, `send_to_self_if_player`)
+    /// stamp the recipient's session id at send time instead of relying
+    /// on every call site to remember. Subpackets already carrying a
+    /// non-zero target are left untouched.
+    pub fn stamp_target_id_if_zero(bytes: &mut [u8], target: u32) -> usize {
+        let mut stamped = 0usize;
+        let mut off = 0usize;
+        while off + SUBPACKET_SIZE <= bytes.len() {
+            let size = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+            if size < SUBPACKET_SIZE || off + size > bytes.len() {
+                break;
+            }
+            // Header layout: size u16, type u16, source_id u32, target_id u32.
+            let t = off + 8;
+            if bytes[t..t + 4] == [0, 0, 0, 0] {
+                bytes[t..t + 4].copy_from_slice(&target.to_le_bytes());
+                stamped += 1;
+            }
+            off += size;
+        }
+        stamped
+    }
+
     pub fn parse(bytes: &[u8], offset: &mut usize) -> Result<SubPacket, PacketError> {
         if bytes.len() < *offset + SUBPACKET_SIZE {
             return Err(PacketError::TooSmall {
@@ -175,6 +208,24 @@ impl SubPacket {
         }
 
         let header = SubPacketHeader::read(&bytes[*offset..*offset + SUBPACKET_SIZE])?;
+
+        // A declared size smaller than the header(s) means the buffer is
+        // not a subpacket stream (e.g. a BasePacket frame fed in by
+        // mistake — its first u16 is the is_authenticated/is_compressed
+        // pair). Without this check the data-slice arithmetic below
+        // underflows and panics the caller (the world-server's zone reply
+        // pump parses untrusted map-server bytes on a spawned task).
+        let min_size = if header.r#type == SUBPACKET_TYPE_GAMEMESSAGE {
+            SUBPACKET_SIZE + GAMEMESSAGE_SIZE
+        } else {
+            SUBPACKET_SIZE
+        };
+        if (header.subpacket_size as usize) < min_size {
+            return Err(PacketError::SizeMismatch {
+                declared: header.subpacket_size as usize,
+                available: bytes.len() - *offset,
+            });
+        }
 
         if bytes.len() < *offset + header.subpacket_size as usize {
             return Err(PacketError::SizeMismatch {
@@ -267,5 +318,32 @@ mod tests {
         let parsed = SubPacket::parse(&bytes, &mut off).unwrap();
         assert_eq!(parsed.header.r#type, 0x01);
         assert_eq!(parsed.data, vec![9, 8, 7]);
+    }
+
+    #[test]
+    fn stamp_target_id_if_zero_stamps_untargeted_only() {
+        // Two-subpacket stream: first untargeted, second pre-tagged.
+        let untagged = SubPacket::new(0x0134, 0x1111, vec![0u8; 8]);
+        let mut tagged = SubPacket::new(0x0134, 0x2222, vec![0u8; 8]);
+        tagged.set_target_id(0xDEAD_BEEF);
+        let mut stream = untagged.to_bytes();
+        stream.extend(tagged.to_bytes());
+
+        let stamped = SubPacket::stamp_target_id_if_zero(&mut stream, 42);
+        assert_eq!(stamped, 1);
+
+        let mut off = 0usize;
+        let first = SubPacket::parse(&stream, &mut off).unwrap();
+        let second = SubPacket::parse(&stream, &mut off).unwrap();
+        assert_eq!(first.header.target_id, 42);
+        assert_eq!(second.header.target_id, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn stamp_target_id_if_zero_ignores_non_subpacket_bytes() {
+        // Garbage / truncated buffers must be left untouched.
+        let mut short = vec![1u8, 2, 3];
+        assert_eq!(SubPacket::stamp_target_id_if_zero(&mut short, 42), 0);
+        assert_eq!(short, vec![1, 2, 3]);
     }
 }

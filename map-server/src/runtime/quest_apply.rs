@@ -32,8 +32,13 @@
 //! like `onStateChange` from a `QuestStartSequence` command).
 //!
 //! Login-flow-only commands (`SetLoginDirector`, `CreateDirector`,
-//! `KickEvent`, `SetPos` during tutorial spawn) stay on the processor
-//! because they mutate session state this module doesn't see.
+//! `SetPos` during tutorial spawn) stay on the processor because they
+//! mutate session state this module doesn't see. `KickEvent` has TWO
+//! homes by design: the processor's login arm captures into
+//! `session.pending_kick_event` (deferred emission at the end of the
+//! zone-in bundle / pre-warp window), while the runtime arm here sends
+//! immediately — the mid-flow `kickEventContinue` shape drained from
+//! ticker/signal contexts where no bundle is coming. (#28 S1.1.)
 
 #![allow(dead_code)]
 
@@ -525,6 +530,51 @@ pub async fn apply_runtime_lua_command(
                 .await;
             true
         }
+        LC::KickEvent {
+            player_id,
+            actor_id,
+            trigger,
+            args,
+        } => {
+            apply_kick_event(player_id, actor_id, &trigger, &args, registry, world).await;
+            true
+        }
+        LC::DoZoneChange {
+            player_id,
+            zone_id,
+            private_area,
+            private_area_type,
+            spawn_type,
+            x,
+            y,
+            z,
+            rotation,
+        } => {
+            apply_do_zone_change(
+                player_id,
+                zone_id,
+                private_area,
+                private_area_type,
+                spawn_type,
+                x,
+                y,
+                z,
+                rotation,
+                registry,
+                db,
+                world,
+                lua,
+            )
+            .await;
+            true
+        }
+        LC::ContentFinished {
+            parent_zone_id,
+            area_name,
+        } => {
+            apply_content_finished(parent_zone_id, &area_name, registry, world, lua).await;
+            true
+        }
         _ => false,
     }
 }
@@ -556,10 +606,11 @@ async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &Acto
         );
         return;
     };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
+    // Shared battle-clock anchor (`runtime/clock.rs`) — the ticker drives
+    // `AIContainer::update` in this domain. Arming the swing clock with
+    // epoch ms (the pre-#28 bug) parked `is_attack_ready` ~56 years out:
+    // script-engaged allies entered the engaged state but never swung.
+    let now_ms = crate::runtime::clock::server_now_ms();
     let mut c = handle.character.write().await;
     let delay = c.get_attack_delay_ms();
     let started = c
@@ -608,6 +659,32 @@ async fn apply_change_state(
         let mut c = handle.character.write().await;
         c.base.current_main_state = main_state;
     }
+    // 1b. Pre-warp content NPCs: suppress the wire broadcast (keep the
+    //     stored-state mutation above). `SimpleContent30010.lua::onCreate`
+    //     fires `ChangeState(2)` on the tutorial roster BEFORE the
+    //     `DoZoneChangeContent` warp, while the client has not been sent
+    //     those actors (their AddActor fan-out is deliberately skipped to
+    //     keep the pre-kick window byte-clean — pmeteor's reference
+    //     capture shows ZERO actor packets there). The post-warp zone-in
+    //     bundle re-emits SetActorState from the stored value, so nothing
+    //     is lost; mid-fight state changes happen post-warp and broadcast
+    //     normally. (Garlemald-Server #28.)
+    for snap in world.all_sessions().await {
+        if let Some(active) = snap.active_content_script.as_ref()
+            && !active.warp_complete
+            && snap
+                .transient_director_members
+                .get(&active.director_actor_id)
+                .is_some_and(|roster| roster.contains(&actor_id))
+        {
+            tracing::debug!(
+                actor = format!("0x{actor_id:08X}"),
+                main_state,
+                "ChangeState stored; broadcast suppressed (pre-warp content roster)",
+            );
+            return;
+        }
+    }
     // 2. Broadcast 0x0134 SetActorState (main_state | sub_state<<8).
     let Some(zone_arc) = world.zone(handle.zone_id).await else {
         tracing::debug!(
@@ -617,21 +694,51 @@ async fn apply_change_state(
         );
         return;
     };
-    let sub =
+    // pmeteor's State-flag flush (Character.cs PostUpdate:411-419) ships a
+    // TRIO, not just the 0x0134: SetActorState + CommandResultX00 (anim
+    // 0x72000062) + CommandResultX01 (anim 0x7C000062, command 21001
+    // Activate, one self-hit `CommandResult(Id, 0, 1)`). The 1.x client
+    // plays the draw-/sheathe-weapon animation off the X00/X01 battle
+    // actions — a bare 0x0134 changes the logical state but the model
+    // never draws (the SEQ_005 live test: state toggled 2->0->2 with no
+    // visible weapon). Byte-verified against pmeteor's capture at its
+    // tutorial F-press (map-packets.log:38247ff: 0x134 + 0x13C + 0x139).
+    // (Garlemald-Server #28.)
+    let state_sub =
         crate::packets::send::actor::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
-    let recipients = crate::runtime::broadcast::broadcast_around_actor(
-        world,
-        registry,
-        &zone_arc,
+    let x00 =
+        crate::packets::send::actor_battle::build_command_result_x00(actor_id, 0x7200_0062, 0);
+    let x01 = crate::packets::send::actor_battle::build_command_result_x01(
         actor_id,
-        sub.to_bytes(),
+        0x7C00_0062,
+        21001,
+        &crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            hit_num: 1,
+            hit_effect: 1,
+            ..Default::default()
+        },
+    );
+    let mut bytes = state_sub.to_bytes();
+    bytes.extend(x00.to_bytes());
+    bytes.extend(x01.to_bytes());
+    // Send to the actor's OWN client first when it's a player —
+    // `broadcast_around_actor`'s `actors_around` excludes the source, so
+    // a player's own state change (the F-press Engage drawing the
+    // weapon) otherwise never reaches their client (`recipients=0` in
+    // the SEQ_005 live test). Mirrors `apply_die` / `apply_revive`.
+    // (Garlemald-Server #28.)
+    crate::runtime::dispatcher::send_to_self_if_player(registry, world, actor_id, bytes.clone())
+        .await;
+    let recipients = crate::runtime::broadcast::broadcast_around_actor(
+        world, registry, &zone_arc, actor_id, bytes,
     )
     .await;
     tracing::debug!(
         actor = format!("0x{actor_id:08X}"),
         main_state,
         recipients,
-        "ChangeState applied",
+        "ChangeState applied (0x134 + draw-anim X00/X01 trio)",
     );
 }
 
@@ -990,9 +1097,18 @@ async fn apply_despawn_actor(
         sub.to_bytes(),
     )
     .await;
-    // Remove from registry after the broadcast so spatial-grid lookups
-    // during fan-out still see it.
+    // Remove from registry AND the zone's spatial grid after the
+    // broadcast (so spatial-grid lookups during fan-out still see it).
+    // The grid removal mirrors the spawn appliers' `zone.core.add_actor`
+    // insertion — without it a despawned actor leaks a ghost entry that
+    // `actors_around` keeps yielding to AI/broadcast radius queries.
+    // (#28 S1.3.)
     registry.remove(actor_id).await;
+    {
+        let mut zone_write = zone_arc.write().await;
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone_write.core.remove_actor(actor_id, &mut ob);
+    }
     tracing::debug!(
         actor = format!("0x{actor_id:08X}"),
         zone,
@@ -1041,11 +1157,11 @@ async fn apply_hate_container_add_base_hate(
 ///     MoveActorToPositionPacket.BuildPacket(Id, x, y, z, rot, moveState));
 /// ```
 ///
-/// `move_state` values follow pmeteor's wiki notes (0 = walk, 1 =
-/// run, 2 = sprint, 3 = mounted). The dispatch is best-effort: if
-/// the actor isn't in the registry or has no zone we just log and
-/// drop, matching the C# implicit silent-skip when CurrentArea is
-/// null.
+/// `move_state` values follow the wiki + pmeteor
+/// `UpdatePlayerPositionPacket.cs:33` (0 = standing, 1 = walking,
+/// 2 = running). The dispatch is best-effort: if the actor isn't in
+/// the registry or has no zone we just log and drop, matching the C#
+/// implicit silent-skip when CurrentArea is null.
 #[allow(clippy::too_many_arguments)]
 async fn apply_move_actor_to_position(
     actor_id: u32,
@@ -1086,6 +1202,19 @@ async fn apply_move_actor_to_position(
         );
         return;
     };
+    // 2b. Re-insert into the zone's spatial grid — `actors_around`
+    //     (the AI arena + broadcast radius source) reads the grid, not
+    //     `Character.base.position_*`, so without this every scripted
+    //     move desyncs aggro/visibility from the authoritative
+    //     position. Mirrors the player path
+    //     (`world_manager.rs::update_actor_position`). (#28 S0.3.)
+    {
+        let mut zone_write = zone_arc.write().await;
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone_write
+            .core
+            .update_actor_position(actor_id, common::Vector3::new(x, y, z), &mut ob);
+    }
     let sub = crate::packets::send::actor::build_move_actor_to_position(
         actor_id, x, y, z, rotation, move_state,
     );
@@ -1156,6 +1285,208 @@ async fn apply_set_actor_target_animated(
         target = format!("0x{target_actor_id:08X}"),
         recipients,
         "SetActorTargetAnimated applied",
+    );
+}
+
+/// `player:KickEvent(director, trigger, ...)` drained from a runtime /
+/// event-bridge context (ticker resume, signal resume, death path) —
+/// the mid-flow `kickEventContinue` shape. Builds + sends the 0x012F
+/// immediately, copying the post-zone-in direct-dispatch shape
+/// (`processor::apply_post_zone_in_lua_command`). This is deliberately
+/// NOT the login-bundle capture: `apply_login_lua_command`'s KickEvent
+/// arm defers emission to the zone-in bundle / pre-warp window, which
+/// never comes for a director resumed mid-flow. `event_type` is always
+/// 5 — the "noticeEvent" tag the client's kick receiver[+0x80] gate
+/// requires; any other value is a silent client-side drop. The
+/// event-bridge translator keeps its deliberate KickEvent exclusion
+/// (`event/lua_bridge.rs`); this arm is the one runtime home. (#28 S1.1.)
+async fn apply_kick_event(
+    player_id: u32,
+    actor_id: u32,
+    trigger: &str,
+    args: &[crate::lua::command::LuaCommandArg],
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    if actor_id == 0 {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            trigger,
+            "KickEvent skipped — no owner actor id",
+        );
+        return;
+    }
+    let Some(handle) = registry.get(player_id).await else {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            trigger,
+            "KickEvent skipped — player not in registry",
+        );
+        return;
+    };
+    let session_id = handle.session_id;
+    if session_id == 0 {
+        tracing::debug!(
+            player = format!("0x{player_id:08X}"),
+            trigger,
+            "KickEvent skipped — player has no session",
+        );
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        tracing::warn!(
+            session = session_id,
+            trigger,
+            "KickEvent dropped — no client handle",
+        );
+        return;
+    };
+    let lua_params: Vec<common::luaparam::LuaParam> = args
+        .iter()
+        .map(crate::event::lua_bridge::arg_to_lua_param)
+        .collect();
+    let mut sub = crate::packets::send::events::build_kick_event(
+        player_id,
+        actor_id,
+        trigger,
+        5,
+        &lua_params,
+    );
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::info!(
+        session = session_id,
+        trigger_actor = format!("0x{player_id:08X}"),
+        owner_actor = format!("0x{actor_id:08X}"),
+        event = %trigger,
+        args = lua_params.len(),
+        "KickEvent dispatched directly to client (runtime drain)",
+    );
+}
+
+/// `zone:ContentFinished()` / `area:ContentFinished()` — full teardown
+/// of the active scripted content. pmeteor's `PrivateAreaContent.
+/// ContentFinished` only sets `isContentFinished` and defers the real
+/// cleanup to the next `DoZoneChange`'s CheckDestroy sweep; garlemald's
+/// fixed director command order (ContentFinished immediately followed
+/// by DoZoneChange in the same drained batch) lets us be eager here
+/// (#28 S1.3, report E §3.2):
+///
+/// 1. resolve the owning session by `active_content_script` scan
+///    (`area_name` is empty from the LuaZone binding — the live area is
+///    whatever the session carries);
+/// 2. despawn the content NPCs: director-roster members with kind ∈
+///    {BattleNpc, Ally} plus every id the spawn appliers recorded on
+///    `spawned_actor_ids` (catches the `openingstoper` trigger that is
+///    SpawnActor'd but never AddMember'd). RemoveActor packets pre-warp
+///    are harmless — the warp's DeleteAllActors wipes client state;
+/// 3. clear the director roster + (defensively) the transient party;
+/// 4. `active_content_script = None` — stops the 500 ms onUpdate driver
+///    and the 0x0133 `/_init` content branch;
+/// 5. clear the player's tutorial `MinimumHpLock` (set in onCreate;
+///    mods survive warps — without this the player is unkillable
+///    forever);
+/// 6. purge the player's parked coroutines so a stale `_WAIT_EVENT`
+///    director can't resume into the torn-down instance.
+///
+/// Wire: nothing mandatory — the reference capture carries zero 0x0143
+/// DeleteGroup in 60,232 lines; the warp's DeleteAllActors resets
+/// client group state and the post-warp zone-in bundle re-sends the
+/// solo party trio.
+pub(crate) async fn apply_content_finished(
+    parent_zone_id: u32,
+    area_name: &str,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    // 1. Owning session — the one whose active content matches this
+    //    parent zone (+ area name when the caller knew it).
+    let mut owner: Option<crate::data::Session> = None;
+    for snap in world.all_sessions().await {
+        if let Some(active) = snap.active_content_script.as_ref()
+            && active.parent_zone_id == parent_zone_id
+            && (area_name.is_empty() || active.area_name == area_name)
+        {
+            owner = Some(snap);
+            break;
+        }
+    }
+    let Some(mut snap) = owner else {
+        tracing::info!(
+            parent_zone = parent_zone_id,
+            area = %area_name,
+            "ContentFinished: no session with active content — nothing to tear down",
+        );
+        return;
+    };
+    let session_id = snap.id;
+    let Some(active) = snap.active_content_script.clone() else {
+        return;
+    };
+    let director_id = active.director_actor_id;
+
+    // 2. Despawn set: roster content-NPCs (never the player or the
+    //    director) + the spawn appliers' recorded ids, deduped.
+    let mut despawn: Vec<u32> = Vec::new();
+    if let Some(roster) = snap.transient_director_members.get(&director_id) {
+        for &member_id in roster {
+            let Some(member) = registry.get(member_id).await else {
+                continue;
+            };
+            if matches!(member.kind, ActorKindTag::BattleNpc | ActorKindTag::Ally)
+                && !despawn.contains(&member_id)
+            {
+                despawn.push(member_id);
+            }
+        }
+    }
+    for &spawned_id in &active.spawned_actor_ids {
+        if !despawn.contains(&spawned_id) {
+            despawn.push(spawned_id);
+        }
+    }
+    let despawn_count = despawn.len();
+    for actor_id in despawn {
+        apply_despawn_actor(parent_zone_id, actor_id, registry, world).await;
+    }
+
+    // 3 + 4. Roster + content-script clears.
+    snap.transient_director_members.remove(&director_id);
+    snap.transient_party_members.clear();
+    snap.active_content_script = None;
+    world.upsert_session(snap).await;
+
+    // 5. Player teardown — MinimumHpLock off.
+    let player_id = match registry.by_session(session_id).await {
+        Some(player) => {
+            {
+                let mut c = player.character.write().await;
+                c.chara.mods.set(crate::actor::Modifier::MinimumHpLock, 0.0);
+            }
+            player.actor_id
+        }
+        None => 0,
+    };
+
+    // 6. Scheduler purge.
+    let purged = match (player_id, lua) {
+        (0, _) | (_, None) => 0,
+        (pid, Some(engine)) => engine
+            .scheduler()
+            .lock()
+            .map(|mut s| s.purge_owner(pid))
+            .unwrap_or(0),
+    };
+
+    tracing::info!(
+        session = session_id,
+        parent_zone = parent_zone_id,
+        area = %active.area_name,
+        director = format!("0x{director_id:08X}"),
+        despawned = despawn_count,
+        purged_coroutines = purged,
+        "ContentFinished applied (full teardown)",
     );
 }
 
@@ -1293,6 +1624,282 @@ async fn apply_director_outbox_op<F>(
         op = op_name,
         "runtime director-outbox op applied",
     );
+}
+
+/// `GetWorldManager():DoZoneChange(player, zoneId, privateArea_or_nil,
+/// privateAreaType, spawnType, x, y, z, rot)` — full cross-zone warp.
+/// Extracted from the processor (#28 S1.2) so the runtime drain
+/// (ticker / signal resumes — the SEQ_005 director's final warp-out
+/// runs in a death-path call stack) can reach it; the processor's
+/// login arm delegates here.
+///
+/// Same-zone targets short-circuit the registry move and behave like a
+/// glorified `WarpToPosition` followed by a re-render. `private_area =
+/// Some` routes the actor into that `PrivateArea` instance's core pool
+/// (zone 155 ships a `PrivateAreaMasterPast` level-1 replica in the
+/// seed — `034_server_zones_privateareas.sql` row 5 — so the tutorial
+/// return warp resolves it rather than taking the parent-zone fallback
+/// logged by `do_zone_change_with_private_area`).
+///
+/// Every directly-built subpacket in the warp burst is target-stamped
+/// with the session id — untargeted subpackets are dropped by the
+/// world-server proxy fan-out.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_do_zone_change(
+    player_id: u32,
+    zone_id: u32,
+    private_area: Option<String>,
+    private_area_type: u32,
+    spawn_type: u8,
+    x: f32,
+    y: f32,
+    z: f32,
+    rotation: f32,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    let Some(handle) = registry.get(player_id).await else {
+        tracing::warn!(player = player_id, "DoZoneChange: actor missing");
+        return;
+    };
+    let session_id = handle.session_id;
+    let actor_id = handle.actor_id;
+    if session_id == 0 {
+        tracing::debug!(player = player_id, "DoZoneChange: no session (NPC?)");
+        return;
+    }
+
+    // 1. Migrate the actor between zones (no-op if zone_id is the
+    //    same as the current zone). `do_zone_change_with_private_area`
+    //    also updates the session's destination + zone +
+    //    private-area fields. `private_area = Some` routes the
+    //    actor into that PrivateArea instance's core pool;
+    //    `None` (or unknown name) goes to the parent zone's core.
+    let spawn = common::Vector3::new(x, y, z);
+    if let Err(e) = world
+        .do_zone_change_with_private_area(
+            actor_id,
+            session_id,
+            zone_id,
+            private_area.clone(),
+            private_area_type,
+            spawn,
+            rotation,
+        )
+        .await
+    {
+        tracing::error!(
+            error = %e,
+            player = player_id,
+            zone = zone_id,
+            ?private_area,
+            "DoZoneChange: world.do_zone_change_with_private_area failed"
+        );
+        return;
+    }
+
+    // 2. Update the character's persistent zone_id + position
+    //    (the registry move above only touches the spatial grid;
+    //    the Character row's `base.zone_id` is what `send_zone_in_bundle`
+    //    reads on the next login + what persists to disk). Also
+    //    purge any status effects tagged LOSE_ON_ZONING — mirrors
+    //    Meteor's `Player.CleanupAndSave`
+    //    (`Map Server/Actors/Chara/Player/Player.cs:844`) which
+    //    drops these effects unconditionally as the player crosses
+    //    the zone boundary.
+    let mut status_outbox = crate::status::StatusOutbox::new();
+    {
+        let mut c = handle.character.write().await;
+        c.base.zone_id = zone_id;
+        c.base.position_x = x;
+        c.base.position_y = y;
+        c.base.position_z = z;
+        c.base.rotation = rotation;
+        c.status_effects.remove_by_flag(
+            crate::status::StatusEffectFlags::LOSE_ON_ZONING,
+            &mut status_outbox,
+        );
+    }
+    // Same drain shape as the processor's `drain_status_outbox` —
+    // without the Lua engine the wire/save/recalc fan-out is dropped
+    // but the in-memory purge above has already landed.
+    if let Some(lua_ref) = lua {
+        for evt in status_outbox.drain() {
+            crate::runtime::dispatcher::dispatch_status_event(
+                &evt,
+                registry,
+                world,
+                db,
+                lua_ref.catalogs(),
+            )
+            .await;
+        }
+    }
+
+    // 3. Carry the requested spawn_type through to the zone-in
+    //    bundle so the client plays the right "you arrived" anim.
+    if let Some(mut snap) = world.session(session_id).await {
+        snap.destination_spawn_type = spawn_type;
+        world.upsert_session(snap).await;
+    }
+
+    // 4. Emit the zone-change packet trio — same order as
+    //    `apply_do_zone_change_content`.
+    let Some(client) = world.client(session_id).await else {
+        tracing::warn!(player = player_id, "DoZoneChange: no client");
+        return;
+    };
+    // Tagged with the session id — untargeted subpackets are dropped by
+    // the world-server proxy fan-out, so this pair never reached the
+    // client before (see the matching block + decomp notes in
+    // `apply_do_zone_change_content`). Cross-zone warps still completed
+    // because a real region change takes the SetMap handler's
+    // region-mismatch arm; delivering the wipe + 0x00E2 restores pmeteor
+    // parity (`DoZoneChange`, WorldManager.cs:877-879). Subcode 0x02 is
+    // what pmeteor sends for full zone changes (0x10 is the in-place /
+    // content-instance variant) — both set the client's force-reload
+    // latch, so the distinction is parity-only. (Garlemald-Server #28.)
+    {
+        let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+        wipe.set_target_id(session_id);
+        client.send_bytes(wipe.to_bytes()).await;
+        let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x02);
+        e2.set_target_id(session_id);
+        client.send_bytes(e2.to_bytes()).await;
+    }
+
+    // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
+    //    from the session + character we just updated, so the
+    //    bundle spawns the player at the new coords.
+    world
+        .send_zone_in_bundle(
+            registry,
+            db,
+            lua.map(|l| l.catalogs()),
+            session_id,
+            spawn_type as u16,
+        )
+        .await;
+
+    // 6. pmeteor sends the 34108 "instance" message AFTER the bundle
+    //    when the destination is a PrivateArea (`if (newArea is
+    //    PrivateArea)`, WorldManager.cs:887-888) — the SEQ_005 return
+    //    warp into zone 155's PrivateAreaMasterPast takes this branch
+    //    in the reference capture. (Garlemald-Server #28.)
+    if private_area.is_some() {
+        let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+            34108,
+            0x20,
+        );
+        msg.set_target_id(session_id);
+        client.send_bytes(msg.to_bytes()).await;
+    }
+
+    tracing::info!(
+        player = player_id,
+        zone = zone_id,
+        ?private_area,
+        private_area_type,
+        spawn_type,
+        x,
+        y,
+        z,
+        rotation,
+        "DoZoneChange applied (cross-zone warp + zone-in replay)",
+    );
+}
+
+/// Apply a script's drained `LuaCommand`s with EVENT-bridge routing —
+/// the shared engine behind `PacketProcessor::apply_event_script_commands`
+/// and the ticker's per-owner coroutine drains. Event-flavoured commands
+/// (`RunEventFunction` / `EndEvent` / `KickEvent` / ...) are translated
+/// through the `EventOutbox` + dispatcher so cinematic packets reach the
+/// wire (the plain runtime drain drops them at its catch-all); the rest
+/// go through the runtime; and any `SendSignal` resumes the coroutines
+/// parked on `waitForSignal(name)` (e.g. the combat tutorial director on
+/// "playerActive") and applies THEIR commands, recursively.
+/// (Garlemald-Server #28.)
+pub(crate) async fn apply_event_script_commands(
+    handle: &ActorHandle,
+    commands: Vec<crate::lua::command::LuaCommand>,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    use crate::lua::command::LuaCommand;
+    if commands.is_empty() {
+        return;
+    }
+    // Pull `SendSignal` out — it re-enters the engine (resumes parked
+    // coroutines) rather than being applied as a state mutation.
+    let mut signals: Vec<String> = Vec::new();
+    let mut rest: Vec<LuaCommand> = Vec::with_capacity(commands.len());
+    for c in commands {
+        match c {
+            LuaCommand::SendSignal { name } => signals.push(name),
+            other => rest.push(other),
+        }
+    }
+    if !rest.is_empty() {
+        let event_session_snapshot = {
+            let c = handle.character.read().await;
+            c.event_session.clone()
+        };
+        // Process commands in their ORIGINAL order, routing each to
+        // exactly one path — order is load-bearing on the wire (see the
+        // per-command interleave rationale in the PacketProcessor
+        // delegate's history).
+        for c in rest {
+            let mut outbox = crate::event::outbox::EventOutbox::new();
+            crate::event::lua_bridge::translate_lua_commands_into_outbox(
+                std::slice::from_ref(&c),
+                &event_session_snapshot,
+                &mut outbox,
+            );
+            let events = outbox.drain();
+            if events.is_empty() {
+                apply_runtime_lua_command(c, registry, db, world, lua).await;
+            } else {
+                for e in events {
+                    Box::pin(crate::event::dispatcher::dispatch_event_event(
+                        &e, registry, world, db, lua,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    if let Some(lua_engine) = lua {
+        for name in signals {
+            let resumed = lua_engine.fire_signal_and_drain(&name);
+            if resumed.is_empty() {
+                // Either nothing was parked on this signal, or the
+                // resumed coroutine queued no commands before its next
+                // yield (e.g. straight into `wait(1)`) — the
+                // `fire_signal: draining parked coroutines` line above
+                // disambiguates.
+                tracing::debug!(
+                    signal = %name,
+                    "sendSignal resumed no commands",
+                );
+            } else {
+                tracing::debug!(
+                    signal = %name,
+                    commands = resumed.len(),
+                    "sendSignal resumed parked coroutine(s)",
+                );
+                Box::pin(apply_event_script_commands(
+                    handle, resumed, registry, db, world, lua,
+                ))
+                .await;
+            }
+        }
+    }
 }
 
 /// Bulk-drain helper — calls [`apply_runtime_lua_command`] for every
@@ -4789,5 +5396,289 @@ mod tests {
         assert_eq!(pairs[0].1, 4030010, "main-hand catalog id");
         assert_eq!(pairs[1].0, 10);
         assert_eq!(pairs[1].1, 8050245, "legs catalog id");
+    }
+}
+
+#[cfg(test)]
+mod change_state_self_send_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::ActorKindTag;
+    use crate::zone::area::StoredActor;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::{ActorKind, Zone};
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tokio::sync::mpsc;
+
+    /// A player toggling their own main state (the F-press Engage) must
+    /// receive their own 0x0134 SetActorState — `broadcast_around_actor`
+    /// excludes the source, so without the explicit self-send the weapon
+    /// never draws on the acting client (`recipients=0` in the SEQ_005
+    /// live test). (Garlemald-Server #28.)
+    #[tokio::test]
+    async fn change_state_reaches_the_acting_player() {
+        let world = WorldManager::new();
+        let registry = ActorRegistry::new();
+
+        let mut zone = Zone::new(
+            166,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+
+        registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                1,
+                ActorKindTag::Player,
+                166,
+                7,
+                Character::new(1),
+            ))
+            .await;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        world.register_client(7, ClientHandle::new(7, tx)).await;
+
+        apply_change_state(1, 2, &registry, &world).await;
+
+        let got = rx.try_recv().expect("player should receive own state trio");
+        let mut off = 0usize;
+        let sub = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
+        assert_eq!(sub.game_message.opcode, 0x0134);
+        assert_eq!(
+            sub.header.target_id, 7,
+            "self-send must stamp the session id"
+        );
+        assert_eq!(sub.data[0], 2, "main_state byte");
+        // pmeteor parity: the draw-animation battle actions ride along.
+        // Byte layout re-pinned to the retail/pmeteor container after
+        // the S0.6 re-lay (pmeteor capture map-packets.log:38304ff —
+        // F-press 0x13C + 0x139 trio members): sourceActorId at +0x00,
+        // animationId at +0x04, commandId at +0x24, row from +0x28.
+        let x00 = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
+        assert_eq!(x00.game_message.opcode, 0x013C);
+        assert_eq!(x00.header.target_id, 7);
+        assert_eq!(&x00.data[..4], &1u32.to_le_bytes());
+        assert_eq!(&x00.data[4..8], &0x7200_0062u32.to_le_bytes());
+        let x01 = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
+        assert_eq!(x01.game_message.opcode, 0x0139);
+        assert_eq!(&x01.data[..4], &1u32.to_le_bytes());
+        assert_eq!(&x01.data[4..8], &0x7C00_0062u32.to_le_bytes());
+        assert_eq!(&x01.data[0x24..0x26], &21001u16.to_le_bytes());
+        assert_eq!(
+            &x01.data[0x28..0x2C],
+            &1u32.to_le_bytes(),
+            "self-targeted draw row"
+        );
+        assert_eq!(&x01.data[0x30..0x34], &1u32.to_le_bytes(), "effectId 1");
+        assert_eq!(x01.data[0x35], 1, "hitNum 1");
+
+        // Stored state mutated too.
+        let handle = registry.get(1).await.unwrap();
+        let c = handle.character.read().await;
+        assert_eq!(c.base.current_main_state, 2);
+    }
+}
+
+#[cfg(test)]
+mod actor_engage_clock_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::battle::outbox::{BattleEvent, BattleOutbox};
+    use crate::runtime::actor_registry::ActorKindTag;
+    use crate::zone::area::StoredActor;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::{ActorKind, Zone};
+    use common::Vector3;
+
+    /// Regression test for "Yda engages but never swings" (#28 S0.2):
+    /// `apply_actor_engage` must arm `AttackState.next_swing_ms` in the
+    /// same clock domain the ticker drives `AIContainer::update` with
+    /// (`runtime/clock.rs`). With the old epoch-ms arming, the swing
+    /// stayed ~56 years out and this test's single update tick emitted
+    /// nothing.
+    #[tokio::test]
+    async fn script_engage_swings_on_the_shared_clock() {
+        let world = WorldManager::new();
+        let registry = ActorRegistry::new();
+
+        let mut zone = Zone::new(
+            166,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        for (id, pos) in [(1u32, Vector3::ZERO), (2u32, Vector3::new(2.0, 0.0, 0.0))] {
+            zone.core.add_actor(
+                StoredActor {
+                    actor_id: id,
+                    kind: ActorKind::BattleNpc,
+                    position: pos,
+                    grid: (0, 0),
+                    is_alive: true,
+                },
+                &mut ob,
+            );
+        }
+        world.register_zone(zone).await;
+
+        for (id, kind) in [(1u32, ActorKindTag::Ally), (2u32, ActorKindTag::BattleNpc)] {
+            let mut c = Character::new(id);
+            c.chara.hp = 100;
+            c.chara.max_hp = 100;
+            registry
+                .insert(crate::runtime::actor_registry::ActorHandle::new(
+                    id, kind, 166, 0, c,
+                ))
+                .await;
+        }
+
+        // Script-driven engage (the `allyGlobal.EngageTarget` path).
+        apply_actor_engage(1, 2, &registry).await;
+
+        let handle = registry.get(1).await.unwrap();
+        let delay = { handle.character.read().await.get_attack_delay_ms() };
+        // One AI update past the swing window, in the shared domain.
+        let now_ms = crate::runtime::clock::server_now_ms() + delay as u64 + 10;
+        let zone_arc = world.zone(166).await.unwrap();
+        let mut outbox = BattleOutbox::new();
+        {
+            let zone_read = zone_arc.read().await;
+            let mut c = handle.character.write().await;
+            let view = crate::runtime::ticker::build_owner_view(&c, 1, 166);
+            c.ai_container
+                .update(now_ms, view, &*zone_read, &mut outbox);
+        }
+        let events = outbox.drain();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                BattleEvent::ResolveAutoAttack {
+                    attacker_actor_id: 1,
+                    defender_actor_id: 2,
+                }
+            )),
+            "engaged ally must emit ResolveAutoAttack on the first ready tick; got {events:?}",
+        );
+    }
+}
+
+#[cfg(test)]
+mod move_actor_grid_sync_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::runtime::actor_registry::ActorKindTag;
+    use crate::zone::area::StoredActor;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::{ActorKind, Zone};
+    use common::Vector3;
+
+    /// `apply_move_actor_to_position` must re-insert the actor into the
+    /// zone's spatial grid — `actors_around*` (the AI arena) reads the
+    /// grid, and without the sync it diverges from the authoritative
+    /// `Character.base.position_*` the moment anything moves. (#28 S0.3.)
+    #[tokio::test]
+    async fn move_actor_updates_the_spatial_grid() {
+        let world = WorldManager::new();
+        let registry = ActorRegistry::new();
+
+        let mut zone = Zone::new(
+            166,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 9,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+        registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                9,
+                ActorKindTag::BattleNpc,
+                166,
+                0,
+                Character::new(9),
+            ))
+            .await;
+
+        // Move far enough to cross grid cells (BOUNDING_GRID_SIZE = 50).
+        apply_move_actor_to_position(9, 500.0, 4.0, 500.0, 0.0, 2, &registry, &world).await;
+
+        let zone_arc = world.zone(166).await.unwrap();
+        let zone_read = zone_arc.read().await;
+        let at_new: Vec<u32> = zone_read
+            .core
+            .actors_around_point(500.0, 500.0, 10.0)
+            .iter()
+            .map(|a| a.actor_id)
+            .collect();
+        let at_old: Vec<u32> = zone_read
+            .core
+            .actors_around_point(0.0, 0.0, 10.0)
+            .iter()
+            .map(|a| a.actor_id)
+            .collect();
+        assert!(at_new.contains(&9), "grid must track the new position");
+        assert!(!at_old.contains(&9), "grid must drop the old position");
+        // The stored Character position moved too.
+        let c = registry.get(9).await.unwrap();
+        let c = c.character.read().await;
+        assert_eq!(
+            (c.base.position_x, c.base.position_z),
+            (500.0, 500.0),
+            "authoritative position must match the grid",
+        );
     }
 }

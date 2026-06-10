@@ -1,5 +1,12 @@
 # Man0g0 SEQ_005 hang — diagnosis, smoke-test journey, and remaining gap
 
+> **Partially superseded (2026-06-09, issue #28 RCA):** the "Now Loading"
+> hang's proven root cause is the proxy-dropped `DeleteAllActors` +
+> `0x00E2` pair (`target_id == 0`), not the 0x017A handler / KickEvent
+> theories explored below — see `captures/issue28-rca/06-synthesis.md`
+> (workspace root). The actor event-readiness findings here (+0x5c /
+> +0x7d gates, full post-AddActor sequence) remain valid.
+>
 > Drafted 2026-05-04 from meteor-decomp's Phase 7 cinematic-receiver
 > findings. End-to-end pre-work + smoke-test debugging for the man0g0
 > SimpleContent cinematic hang at "Now Loading" after talking to Yda

@@ -5079,7 +5079,10 @@ async fn battle_npc_respawns_after_default_delay() {
     // tick snaps it back.
     chara.base.position_x = 9.0;
     chara.base.position_z = 9.0;
-    let now_secs = 5_000_000u64;
+    // `time_of_death_utc` is a wall-clock field; the death-tick
+    // compares it against wall-clock `unix_timestamp()` regardless of
+    // the `now_ms` fed to `tick_once` (#28 S0.2 single-domain rule).
+    let now_secs = common::utils::unix_timestamp() as u64;
     chara.chara.time_of_death_utc = (now_secs - 100) as u32;
     registry
         .insert(ActorHandle::new(
@@ -5159,8 +5162,10 @@ async fn battle_npc_does_not_respawn_before_delay() {
     chara.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
     chara.chara.hp = 0;
     chara.chara.max_hp = 100;
-    let now_secs = 6_000_000u64;
-    // Died 5 seconds ago — well under the 30s default delay.
+    // Died 5 wall-clock seconds ago — well under the 30s default
+    // delay. Wall-clock anchor per the #28 S0.2 single-domain rule
+    // (the death-tick never reads `tick_once`'s now_ms for this).
+    let now_secs = common::utils::unix_timestamp() as u64;
     chara.chara.time_of_death_utc = (now_secs - 5) as u32;
     registry
         .insert(ActorHandle::new(
@@ -6675,13 +6680,20 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
     let resumed = tokio::task::spawn_blocking(move || lua_clone.tick())
         .await
         .unwrap();
+    // tick() returns per-owner batches: one coroutine resumed here.
     assert_eq!(
         resumed.len(),
         1,
-        "resumed slice should push exactly one EndGuildleve command; got {resumed:?}",
+        "resumed slice should push exactly one batch; got {resumed:?}",
+    );
+    let (_owner, batch) = resumed.into_iter().next().unwrap();
+    assert_eq!(
+        batch.len(),
+        1,
+        "batch should hold exactly one EndGuildleve command; got {batch:?}",
     );
     assert!(matches!(
-        resumed[0],
+        batch[0],
         LuaCommand::EndGuildleve {
             director_actor_id: _,
             was_completed: true,
@@ -6689,9 +6701,9 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
     ));
 
     // Drain the resumed commands through the runtime pipeline —
-    // this is what the ticker does on each frame.
+    // this is what the ticker does on each frame for ownerless batches.
     crate::runtime::quest_apply::apply_runtime_lua_commands(
-        resumed,
+        batch,
         &registry,
         &db,
         &world,
@@ -8091,11 +8103,15 @@ async fn promote_gc_happy_path_spends_seals_and_bumps_rank() {
     //     widget the client renders top-right),
     // (2) `PlayAnimationOnActor` (0x00DA, raw subpacket — the salute
     //     fanfare neighbours also see via the broadcast helper).
+    // The channel carries raw subpacket streams (the map-server writer
+    // task owns BasePacket framing) — parse subpackets directly.
     let mut opcodes = Vec::new();
     while let Ok(bytes) = rx.try_recv() {
         let mut offset = 0;
-        let base = common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse");
-        for sub in base.get_subpackets().expect("subs") {
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
             // Game-message subs carry their opcode in `game_message.opcode`;
             // raw subs carry it in `header.r#type`. Capture both so the
             // assertion below is wire-layout-agnostic.
@@ -8274,11 +8290,14 @@ async fn promote_gc_salute_broadcasts_to_nearby_player() {
     // at present (it currently fans through the same broadcast for
     // some upstream code paths) — but the salute opcode must be
     // there.
+    // Raw subpacket stream (no BasePacket frame) — parse directly.
     let mut witness_opcodes = Vec::new();
     while let Ok(bytes) = rx_witness.try_recv() {
         let mut offset = 0;
-        let base = common::BasePacket::from_buffer(&bytes, &mut offset).expect("parse");
-        for sub in base.get_subpackets().expect("subs") {
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
             witness_opcodes.push(sub.header.r#type);
             witness_opcodes.push(sub.game_message.opcode);
         }
@@ -11444,4 +11463,2328 @@ async fn apply_login_lua_command_routes_run_event_function_through_outbox() {
     let second = rx.try_recv().expect("EndEvent must reach the client");
     assert!(!second.is_empty(), "EndEvent packet must be non-empty");
     assert_ne!(first, second, "the two packets carry different opcodes");
+}
+
+/// Liveness repro for the SEQ_005 ticker mystery: drive the REAL
+/// `GameTicker::tick_once` (with the Lua engine attached) against the
+/// tutorial state — a player who just pressed F (engaged on TARGET 0,
+/// exactly what `commands/ActivateCommand.lua`'s `player.Engage(0, 2)`
+/// produces), five content BattleNpcs, an active content script
+/// session, and a director coroutine parked on `wait()`. The live
+/// failure signature is: the time park never drains and the ticker
+/// goes silent. If `tick_once` hangs, panics, or fails to resume the
+/// park here, this reproduces it deterministically. (Garlemald-Server #28.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticker_survives_tutorial_state_and_drains_time_parks() {
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaEngine;
+    use crate::lua::command::{CommandQueue, LuaCommand};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag, ActorRegistry};
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+    use crate::world_manager::WorldManager;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use crate::zone::{ActorKind, StoredActor};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    // Script root with the real bare-yield helpers + a director that
+    // parks on wait() — the same shape the live SEQ_005 director is in
+    // right after the F-press signal resume.
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-ticker-liveness-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+    std::fs::write(
+        root.join("global.lua"),
+        r#"
+            function wait(seconds)
+                return coroutine.yield("_WAIT_TIME", seconds);
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("directors/Quest/TickerLiveness.lua"),
+        r#"
+            require ("global")
+            function onEventStarted(player, director, eventType, eventName)
+                wait(0.2)
+                player:SendMessage(0x20, "", "continuation")
+            end
+        "#,
+    )
+    .unwrap();
+    let lua = Arc::new(LuaEngine::new(&root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(std::env::temp_dir().join(format!(
+                "garlemald-ticker-liveness-{}.db",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )))
+        .await
+        .expect("db"),
+    );
+
+    // Zone 166 with the tutorial cast.
+    let mut zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 1,
+            kind: ActorKind::Player,
+            position: common::Vector3::new(362.0, 4.0, -703.0),
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    for id in [
+        0x4534_0003u32,
+        0x4534_0004,
+        0x4534_0005,
+        0x4534_0006,
+        0x4534_0007,
+    ] {
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: id,
+                kind: ActorKind::BattleNpc,
+                position: common::Vector3::new(370.0, 4.0, -710.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone).await;
+
+    // Player: engaged on TARGET 0 (the ActivateCommand F-press shape).
+    let mut player = Character::new(1);
+    player.base.zone_id = 166;
+    player.base.current_main_state = 2;
+    let now0 = common::utils::millis_unix_timestamp();
+    player.ai_container.internal_engage(0, now0, 3000);
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 166, 1, player))
+        .await;
+
+    // Content NPCs: wolves with hate on the player, allies idle —
+    // mirrors the post-spawn state (controllers attach on spawn in
+    // production; hate drives the controller's combat branch).
+    for id in [0x4534_0003u32, 0x4534_0004, 0x4534_0005] {
+        let mut wolf = Character::new(id);
+        wolf.base.zone_id = 166;
+        wolf.base.current_main_state = 2;
+        wolf.hate.update_hate(1, 10);
+        wolf.ai_container.internal_engage(1, now0, 3000);
+        registry
+            .insert(ActorHandle::new(id, ActorKindTag::BattleNpc, 166, 0, wolf))
+            .await;
+    }
+    for id in [0x4534_0006u32, 0x4534_0007] {
+        let mut ally = Character::new(id);
+        ally.base.zone_id = 166;
+        registry
+            .insert(ActorHandle::new(id, ActorKindTag::BattleNpc, 166, 0, ally))
+            .await;
+    }
+
+    // Session with an active content script (drives the B6 content path).
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    world
+        .upsert_session(MapSession {
+            id: 1,
+            current_zone_id: 166,
+            active_content_script: Some(crate::data::ActiveContentScript {
+                parent_zone_id: 166,
+                area_name: "man0g01".to_string(),
+                area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+                director_name: "Quest/QuestDirectorMan0g001".to_string(),
+                director_actor_id: 0x6530_0003,
+                content_area_actor_id: 0x6534_0002,
+                content_script: "SimpleContent30010".to_string(),
+                warp_complete: true,
+                spawned_actor_ids: Vec::new(),
+            }),
+            ..MapSession::default()
+        })
+        .await;
+
+    // Park the director coroutine on wait(0.2) via the real dispatch.
+    let script_path = root.join("directors/Quest/TickerLiveness.lua");
+    let snapshot = crate::lua::userdata::PlayerSnapshot {
+        actor_id: 1,
+        ..Default::default()
+    };
+    let director = crate::lua::userdata::LuaDirectorHandle {
+        name: "Quest/TickerLiveness".to_string(),
+        actor_id: 0x6530_0003,
+        class_path: "/Director/Quest/TickerLiveness".to_string(),
+        queue: CommandQueue::new(),
+    };
+    let result = lua.call_director_on_event_started(
+        &script_path,
+        snapshot,
+        director,
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(lua.scheduler().lock().unwrap().pending_time_count(), 1);
+
+    // Drive the REAL ticker for ~1.5s of frames. If tick_once hangs,
+    // the tokio test timeout (via the watchdog below) fails the test.
+    let ticker = GameTicker::with_lua(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+        Some(lua.clone()),
+    );
+    let start = std::time::Instant::now();
+    let mut frame: u64 = 0;
+    while start.elapsed() < std::time::Duration::from_millis(1500) {
+        frame += 100;
+        // Watchdog each frame: a single tick_once must not take >5s.
+        tokio::time::timeout(std::time::Duration::from_secs(5), ticker.tick_once(frame))
+            .await
+            .expect("tick_once hung — ticker liveness bug reproduced");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_time_count(),
+        0,
+        "the wait(0.2) park must have been drained by the ticker",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #28 Phase 1 — runtime/event-bridge command routing (S1.1–S1.4)
+// ---------------------------------------------------------------------------
+
+/// S1.1 — a `KickEvent` drained through the EVENT bridge for a
+/// registered player must produce exactly one 0x012F on the wire:
+/// event_type 5 ("noticeEvent" tag — the client's kick receiver[+0x80]
+/// gate), trigger = player at body+0x00, owner = director at body+0x04,
+/// target-stamped with the session id. The translator keeps its
+/// deliberate KickEvent exclusion (`kick_event_is_suppressed_from_outbox`),
+/// so the runtime arm is the single emission point on this path.
+#[tokio::test]
+async fn runtime_drain_kick_event_sends_kick_packet_with_event_type_5() {
+    use crate::data::Session as MapSession;
+    use crate::lua::command::LuaCommand;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0002u32;
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(8);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: session_id,
+            current_zone_id: 166,
+            ..MapSession::default()
+        })
+        .await;
+
+    let handle = registry.get(player_id).await.expect("player handle");
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        vec![LuaCommand::KickEvent {
+            player_id,
+            actor_id: director_id,
+            trigger: "noticeEvent".to_string(),
+            args: vec![],
+        }],
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+
+    let bytes = rx.try_recv().expect("kick packet must reach the client");
+    let mut offset = 0;
+    let sub = common::subpacket::SubPacket::parse(&bytes, &mut offset).expect("parse kick");
+    assert_eq!(
+        sub.game_message.opcode,
+        crate::packets::opcodes::OP_KICK_EVENT,
+        "runtime KickEvent must emit 0x012F",
+    );
+    assert_eq!(sub.header.source_id, player_id, "trigger actor = player");
+    assert_eq!(
+        sub.header.target_id, session_id,
+        "kick must be target-stamped with the session id (proxy rule)",
+    );
+    assert_eq!(
+        u32::from_le_bytes(sub.data[0..4].try_into().unwrap()),
+        player_id,
+        "body+0x00 trigger actor id",
+    );
+    assert_eq!(
+        u32::from_le_bytes(sub.data[4..8].try_into().unwrap()),
+        director_id,
+        "body+0x04 owner actor id",
+    );
+    assert_eq!(sub.data[8], 5, "event_type byte must be 5 (noticeEvent)");
+    assert!(
+        rx.try_recv().is_err(),
+        "exactly one packet — no duplicate emission",
+    );
+}
+
+/// S1.2 (documentation test) — the seed installs a
+/// `PrivateAreaMasterPast` level-1 replica on zone 155
+/// (`034_server_zones_privateareas.sql` row 5; `privateAreaType` is
+/// what `install_private_area` keys the level map by). Report E flagged
+/// this as unverified: the director's final
+/// `DoZoneChange(155, "PrivateAreaMasterPast", 1, …)` therefore
+/// resolves the named instance on a seeded server rather than taking
+/// the parent-zone fallback at `do_zone_change_with_private_area`.
+#[tokio::test]
+async fn zone_155_seed_installs_private_area_master_past_level_1() {
+    let db = crate::database::Database::open(tempdb()).await.expect("db");
+    let rows = db.load_private_areas().await.expect("load_private_areas");
+    assert!(
+        rows.iter().any(|r| r.parent_zone_id == 155
+            && r.private_area_name == "PrivateAreaMasterPast"
+            && r.private_area_type == 1),
+        "zone 155 must seed PrivateAreaMasterPast level 1 (SEQ_005 return warp target); got {:?}",
+        rows.iter()
+            .filter(|r| r.parent_zone_id == 155)
+            .collect::<Vec<_>>(),
+    );
+}
+
+/// S1.2 — `DoZoneChange` drained through the EVENT bridge (the SEQ_005
+/// director's final warp-out runs from a non-processor context) must
+/// migrate the player's session into the named private area and emit a
+/// non-empty warp burst whose every subpacket is target-stamped
+/// (untargeted subpackets are dropped by the world-server proxy).
+#[tokio::test]
+async fn runtime_drain_do_zone_change_warps_session_with_targeted_burst() {
+    use crate::data::Session as MapSession;
+    use crate::lua::command::LuaCommand;
+    use crate::zone::PrivateArea;
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    // Source zone 166 + destination zone 155 carrying the
+    // PrivateAreaMasterPast level-1 replica (mirrors the seed row that
+    // `zone_155_seed_installs_private_area_master_past_level_1` pins).
+    let zone166 = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    world.register_zone(zone166).await;
+    let mut zone155 = Zone::new(
+        155,
+        "fst0Town01a",
+        102,
+        "/Area/Zone/ZoneMasterGridania",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    zone155.add_private_area(PrivateArea::new(
+        155,
+        "fst0Town01a",
+        102,
+        5,
+        "/Area/PrivateArea/PrivateAreaMasterPast",
+        "PrivateAreaMasterPast",
+        1,
+        51,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+    ));
+    world.register_zone(zone155).await;
+
+    let player_id = 0x0040_0001u32;
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player.base.position_x = 360.0;
+    player.base.position_z = -700.0;
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: session_id,
+            current_zone_id: 166,
+            ..MapSession::default()
+        })
+        .await;
+
+    let handle = registry.get(player_id).await.expect("player handle");
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        vec![LuaCommand::DoZoneChange {
+            player_id,
+            zone_id: 155,
+            private_area: Some("PrivateAreaMasterPast".to_string()),
+            private_area_type: 1,
+            spawn_type: 15,
+            x: 175.38,
+            y: -1.21,
+            z: -1156.51,
+            rotation: -2.1,
+        }],
+        &registry,
+        &db,
+        &world,
+        None,
+    )
+    .await;
+
+    let session = world.session(session_id).await.expect("session");
+    assert_eq!(session.current_zone_id, 155, "session migrated to zone 155");
+    assert_eq!(
+        session.current_private_area_name.as_deref(),
+        Some("PrivateAreaMasterPast"),
+        "named private area resolved (no parent-zone fallback)",
+    );
+    assert_eq!(session.current_private_area_level, 1);
+    {
+        let c = handle.character.read().await;
+        assert_eq!(c.base.zone_id, 155, "character row follows the warp");
+    }
+
+    let mut total_subpackets = 0usize;
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let Ok(sub) = common::subpacket::SubPacket::parse(&bytes, &mut offset) else {
+                break;
+            };
+            total_subpackets += 1;
+            assert_ne!(
+                sub.header.target_id, 0,
+                "every warp-burst subpacket must be target-stamped (opcode 0x{:04X})",
+                sub.game_message.opcode,
+            );
+        }
+    }
+    assert!(
+        total_subpackets > 0,
+        "warp burst must be non-empty (DeleteAllActors + 0x00E2 + zone-in bundle)",
+    );
+}
+
+/// S1.3 — `apply_content_finished` is the full eager teardown: content
+/// NPCs (director roster + `spawned_actor_ids` extras) leave the
+/// registry AND the zone grid, the rosters + `active_content_script`
+/// clear, the player's tutorial `MinimumHpLock` lifts, and the player's
+/// parked coroutines purge from the scheduler.
+#[tokio::test]
+async fn apply_content_finished_tears_down_content_state() {
+    use crate::data::Session as MapSession;
+
+    // Script root: a director parked on waitForSignal so the scheduler
+    // holds a signal park owned by the player.
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-content-finished-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+    std::fs::write(
+        root.join("global.lua"),
+        r#"
+            function waitForSignal(signal)
+                return coroutine.yield("_WAIT_SIGNAL", signal);
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("directors/Quest/Teardown.lua"),
+        r#"
+            require ("global")
+            function onEventStarted(player, director, eventType, eventName)
+                waitForSignal("battleComplete")
+            end
+        "#,
+    )
+    .unwrap();
+    let lua = Arc::new(crate::lua::LuaEngine::new(&root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+
+    let mut zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0003u32;
+    let yda_id = 0x4534_0006u32;
+    let wolf_id = 0x4534_0003u32;
+    let stoper_id = 0x4534_0010u32; // SpawnActor'd, never AddMember'd
+    let mut ob = AreaOutbox::new();
+    for (id, kind) in [
+        (player_id, ActorKind::Player),
+        (yda_id, ActorKind::BattleNpc),
+        (wolf_id, ActorKind::BattleNpc),
+        (stoper_id, ActorKind::Npc),
+    ] {
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: id,
+                kind,
+                position: Vector3::new(360.0, 4.0, -700.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone).await;
+    let zone_arc = world.zone(166).await.unwrap();
+
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player
+        .chara
+        .mods
+        .set(crate::actor::Modifier::MinimumHpLock, 1.0);
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    for (id, kind) in [
+        (yda_id, ActorKindTag::Ally),
+        (wolf_id, ActorKindTag::BattleNpc),
+        (stoper_id, ActorKindTag::Npc),
+    ] {
+        let mut c = Character::new(id);
+        c.base.zone_id = 166;
+        registry.insert(ActorHandle::new(id, kind, 166, 0, c)).await;
+    }
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    let mut session = MapSession {
+        id: session_id,
+        current_zone_id: 166,
+        active_content_script: Some(crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+            director_name: "Quest/Teardown".to_string(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0x6534_0002,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+            spawned_actor_ids: vec![stoper_id],
+        }),
+        ..MapSession::default()
+    };
+    session
+        .transient_director_members
+        .insert(director_id, vec![player_id, director_id, yda_id, wolf_id]);
+    session.transient_party_members.push(yda_id);
+    world.upsert_session(session).await;
+
+    // Park the director coroutine on a signal, owned by the player.
+    let result = lua.call_director_on_event_started(
+        &root.join("directors/Quest/Teardown.lua"),
+        crate::lua::userdata::PlayerSnapshot {
+            actor_id: player_id,
+            ..Default::default()
+        },
+        crate::lua::userdata::LuaDirectorHandle {
+            name: "Quest/Teardown".to_string(),
+            actor_id: director_id,
+            class_path: "/Director/Quest/Teardown".to_string(),
+            queue: crate::lua::command::CommandQueue::new(),
+        },
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(lua.scheduler().lock().unwrap().pending_signal_count(), 1);
+
+    crate::runtime::quest_apply::apply_content_finished(166, "", &registry, &world, Some(&lua))
+        .await;
+
+    // Content NPCs gone from the registry; the player survives.
+    for id in [yda_id, wolf_id, stoper_id] {
+        assert!(
+            registry.get(id).await.is_none(),
+            "0x{id:08X} must be despawned from the registry",
+        );
+    }
+    assert!(registry.get(player_id).await.is_some(), "player stays");
+    // ...and gone from the zone grid (the apply_despawn_actor leak fix).
+    {
+        let z = zone_arc.read().await;
+        let around = z.core.actors_around_point(360.0, -700.0, 50.0);
+        let ids: Vec<u32> = around.iter().map(|a| a.actor_id).collect();
+        for id in [yda_id, wolf_id, stoper_id] {
+            assert!(
+                !ids.contains(&id),
+                "0x{id:08X} must be removed from the spatial grid; grid = {ids:?}",
+            );
+        }
+        assert!(ids.contains(&player_id), "player keeps their grid entry");
+    }
+    // Session state cleared.
+    let snap = world.session(session_id).await.expect("session");
+    assert!(snap.active_content_script.is_none(), "content script off");
+    assert!(snap.transient_director_members.is_empty(), "roster cleared");
+    assert!(snap.transient_party_members.is_empty(), "party cleared");
+    // MinimumHpLock lifted — player killable again.
+    {
+        let handle = registry.get(player_id).await.unwrap();
+        let c = handle.character.read().await;
+        assert_eq!(
+            c.chara.mods.get(crate::actor::Modifier::MinimumHpLock),
+            0.0,
+            "tutorial MinimumHpLock must be cleared at teardown",
+        );
+    }
+    // Scheduler empty for the owner — no stale park can resume into the
+    // torn-down instance.
+    {
+        let s = lua.scheduler().lock().unwrap();
+        assert_eq!(s.pending_signal_count(), 0, "signal park purged");
+        assert_eq!(s.pending_time_count(), 0);
+        assert_eq!(s.pending_event_count(), 0);
+    }
+}
+
+/// S1.4 — the ticker's content `onUpdate` drain rides the EVENT bridge:
+/// a content script calling `sendSignal("x")` must resume a coroutine
+/// parked on `waitForSignal("x")`. On the old plain runtime drain the
+/// `SendSignal` command fell through the catch-all and was silently
+/// dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_on_update_send_signal_resumes_parked_coroutine() {
+    use crate::data::Session as MapSession;
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-onupdate-signal-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("content")).unwrap();
+    std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+    std::fs::write(
+        root.join("global.lua"),
+        r#"
+            function waitForSignal(signal)
+                return coroutine.yield("_WAIT_SIGNAL", signal);
+            end
+            function sendSignal(signal)
+                GetLuaInstance():OnSignal(signal);
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("content/SignalContent.lua"),
+        r#"
+            require ("global")
+            function onUpdate(tick, area)
+                sendSignal("x")
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("directors/Quest/SignalWaiter.lua"),
+        r#"
+            require ("global")
+            function onEventStarted(player, director, eventType, eventName)
+                waitForSignal("x")
+            end
+        "#,
+    )
+    .unwrap();
+    let lua = Arc::new(crate::lua::LuaEngine::new(&root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    world.register_zone(zone).await;
+
+    let player_id = 0x0040_0001u32;
+    let session_id = 7u32;
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(64);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    world
+        .upsert_session(MapSession {
+            id: session_id,
+            current_zone_id: 166,
+            active_content_script: Some(crate::data::ActiveContentScript {
+                parent_zone_id: 166,
+                area_name: "man0g01".to_string(),
+                area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+                director_name: "Quest/SignalWaiter".to_string(),
+                director_actor_id: 0x6608_0003,
+                content_area_actor_id: 0x6534_0002,
+                content_script: "SignalContent".to_string(),
+                warp_complete: true,
+                spawned_actor_ids: Vec::new(),
+            }),
+            ..MapSession::default()
+        })
+        .await;
+
+    // Park a coroutine on "x".
+    let result = lua.call_director_on_event_started(
+        &root.join("directors/Quest/SignalWaiter.lua"),
+        crate::lua::userdata::PlayerSnapshot {
+            actor_id: player_id,
+            ..Default::default()
+        },
+        crate::lua::userdata::LuaDirectorHandle {
+            name: "Quest/SignalWaiter".to_string(),
+            actor_id: 0x6608_0003,
+            class_path: "/Director/Quest/SignalWaiter".to_string(),
+            queue: crate::lua::command::CommandQueue::new(),
+        },
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(lua.scheduler().lock().unwrap().pending_signal_count(), 1);
+
+    // One ticker frame past the 500 ms content cadence: onUpdate fires,
+    // its SendSignal rides the event bridge, and the park resumes.
+    let ticker = GameTicker::with_lua(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+        Some(lua.clone()),
+    );
+    ticker.tick_once(600).await;
+
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_signal_count(),
+        0,
+        "the coroutine parked on \"x\" must have been resumed by the onUpdate sendSignal",
+    );
+}
+
+/// #28 S2.1 — seed cross-check: the joined spawn DTO marks Papalymo
+/// (bnpc 7) a caster (pool currentJob 22) and Yda (bnpc 6) melee
+/// (currentJob 2), both with combatDelay 4200, and the level-1 ally HP
+/// fallback (`min_level * 100`) keeps the roster HP bars non-zero (the
+/// seed groups carry hp = 0).
+#[tokio::test]
+async fn s2_1_seed_pool_jobs_mark_papalymo_caster_and_yda_melee() {
+    let db = crate::database::Database::open(tempdb()).await.expect("db");
+
+    let papalymo = db
+        .load_battle_npc_spawn(7)
+        .await
+        .expect("query")
+        .expect("bnpc 7 seeded");
+    assert_eq!(papalymo.current_job, 22, "Papalymo pool job = THM");
+    assert_eq!(papalymo.combat_delay, 4200);
+
+    let yda = db
+        .load_battle_npc_spawn(6)
+        .await
+        .expect("query")
+        .expect("bnpc 6 seeded");
+    assert!(
+        !matches!(yda.current_job, 22 | 23),
+        "Yda must stay melee, got job {}",
+        yda.current_job,
+    );
+    assert_eq!(yda.combat_delay, 4200);
+
+    let wolf = db
+        .load_battle_npc_spawn(3)
+        .await
+        .expect("query")
+        .expect("bnpc 3 seeded");
+    assert!(!matches!(wolf.current_job, 22 | 23));
+
+    // Ally HP fallback (B's roster-HP dependency): the spawn path's
+    // level-scaled default replaces the seed's hp=0 so the zone-in
+    // `build_npc_property_init` emits real hp/hpMax.
+    assert_eq!(yda.hp, 0, "seed group ships hp 0 — fallback must cover it");
+    let fallback = yda.min_level.max(1).saturating_mul(100).max(100);
+    assert!(
+        fallback >= 100,
+        "fallback HP must be non-zero, got {fallback}"
+    );
+}
+
+/// #28 S2.5 — the real `SimpleContent30010.lua` onUpdate against the
+/// real script tree: once the player engages, allies spread across the
+/// live wolves, the wolves turn proactive, and a dead wolf's attacker
+/// re-engages a live one on the next period (S0.5 roster dead-filter +
+/// the corpse-disengage sweep's state clear).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s2_5_content_onupdate_engages_roster_and_reengages_on_death() {
+    use crate::data::Session as MapSession;
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    let lua = Arc::new(crate::lua::LuaEngine::new(&script_root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let mut zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0003u32;
+    let yda_id = 0x4534_0006u32;
+    let papalymo_id = 0x4534_0007u32;
+    let wolves = [0x4534_0003u32, 0x4534_0004, 0x4534_0005];
+    let session_id = 7u32;
+
+    // Seed-shaped arena coords (021_server_battlenpc_spawn_locations).
+    let coords: Vec<(u32, ActorKind, f32, f32, f32)> = vec![
+        (player_id, ActorKind::Player, 369.54, 4.21, -706.11),
+        (yda_id, ActorKind::Ally, 365.27, 4.12, -700.73),
+        (papalymo_id, ActorKind::Ally, 365.89, 4.09, -706.72),
+        (wolves[0], ActorKind::BattleNpc, 374.43, 4.4, -698.71),
+        (wolves[1], ActorKind::BattleNpc, 375.38, 4.4, -700.25),
+        (wolves[2], ActorKind::BattleNpc, 375.13, 4.4, -703.59),
+    ];
+    let mut ob = AreaOutbox::new();
+    for (id, kind, x, y, z) in &coords {
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: *id,
+                kind: *kind,
+                position: common::Vector3::new(*x, *y, *z),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone).await;
+
+    // Player: engaged on wolf 1 with a live target (the S2.5 latch
+    // reads `player:IsEngaged() and player.target`).
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player.base.position_x = 369.54;
+    player.base.position_y = 4.21;
+    player.base.position_z = -706.11;
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    player.chara.current_target = wolves[0];
+    player
+        .ai_container
+        .internal_engage(wolves[0], crate::runtime::clock::server_now_ms(), 2500);
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+
+    // Allies + wolves with spawn-shaped controllers (S2.1 defaults:
+    // Yda melee, Papalymo caster, wolves hostile melee).
+    for (id, kind, x, y, z) in coords.iter().skip(1) {
+        let mut c = Character::new(*id);
+        c.base.zone_id = 166;
+        c.base.position_x = *x;
+        c.base.position_y = *y;
+        c.base.position_z = *z;
+        c.chara.hp = 1000;
+        c.chara.max_hp = 1000;
+        let controller_kind = if *kind == ActorKind::Ally {
+            crate::battle::controller::ControllerKind::Ally
+        } else {
+            crate::battle::controller::ControllerKind::BattleNpc
+        };
+        let mut ctrl = crate::battle::controller::Controller::new(controller_kind, *id);
+        ctrl.battle.neutral = *kind == ActorKind::Ally;
+        if *id == papalymo_id {
+            ctrl.battle.is_caster = true;
+            ctrl.auto_attack_enabled = false;
+            let mut spell = crate::battle::BattleCommand::new(27313, "thunder");
+            spell.range = 20.0;
+            spell.cast_time_ms = 2000;
+            spell.recast_time_ms = 6000;
+            spell.cast_type = 2;
+            ctrl.battle.spell = Some(spell);
+        }
+        c.ai_container.controller = Some(ctrl);
+        let tag = if *kind == ActorKind::Ally {
+            ActorKindTag::Ally
+        } else {
+            ActorKindTag::BattleNpc
+        };
+        registry.insert(ActorHandle::new(*id, tag, 166, 0, c)).await;
+    }
+
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(512);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    let mut session = MapSession {
+        id: session_id,
+        current_zone_id: 166,
+        active_content_script: Some(crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+            director_name: "Quest/QuestDirectorMan0g001".to_string(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0x6534_0002,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+            spawned_actor_ids: Vec::new(),
+        }),
+        ..MapSession::default()
+    };
+    session.transient_director_members.insert(
+        director_id,
+        vec![
+            player_id,
+            director_id,
+            yda_id,
+            papalymo_id,
+            wolves[0],
+            wolves[1],
+            wolves[2],
+        ],
+    );
+    world.upsert_session(session).await;
+
+    let ticker = GameTicker::with_lua(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+        Some(lua.clone()),
+    );
+
+    // First content period: the latch opens (player engaged) and the
+    // whole roster engages within two periods.
+    ticker.tick_once(600).await;
+    ticker.tick_once(1_200).await;
+
+    let engaged = |id: u32| {
+        let registry = registry.clone();
+        async move {
+            let handle = registry.get(id).await.unwrap();
+            let c = handle.character.read().await;
+            (
+                c.ai_container.is_engaged(),
+                c.ai_container
+                    .current_state()
+                    .map(|s| s.target_actor_id)
+                    .unwrap_or(0),
+            )
+        }
+    };
+    let (yda_engaged, yda_target) = engaged(yda_id).await;
+    assert!(yda_engaged, "Yda must engage once the player commits");
+    assert!(
+        wolves.contains(&yda_target),
+        "Yda's target must be a wolf, got 0x{yda_target:08X}",
+    );
+    let (papa_engaged, _) = engaged(papalymo_id).await;
+    assert!(papa_engaged, "Papalymo must engage (cast pending)");
+    for w in wolves {
+        let (w_engaged, w_target) = engaged(w).await;
+        assert!(w_engaged, "wolf 0x{w:08X} must turn proactive");
+        assert!(
+            w_target == player_id || w_target == yda_id,
+            "wolf foe must be the engaged player or the first ally, got 0x{w_target:08X}",
+        );
+    }
+
+    // Kill Yda's wolf + replay the corpse-disengage sweep's effect on
+    // Yda (state + hate cleared). Next period: S0.5 drops the corpse
+    // from `GetMonsters()` and Yda re-engages a live wolf.
+    let dead_wolf = yda_target;
+    {
+        let handle = registry.get(dead_wolf).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+        c.chara.hp = 0;
+    }
+    {
+        let handle = registry.get(yda_id).await.unwrap();
+        let mut c = handle.character.write().await;
+        c.ai_container.clear_states();
+        c.hate.clear_hate(None);
+    }
+    ticker.tick_once(1_800).await;
+
+    let (yda_engaged, yda_target) = engaged(yda_id).await;
+    assert!(yda_engaged, "Yda must re-engage after her wolf died");
+    assert_ne!(yda_target, dead_wolf, "the corpse must not be re-targeted");
+    assert!(
+        wolves.contains(&yda_target),
+        "Yda's new target must be a live wolf, got 0x{yda_target:08X}",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #28 Phase 3 — hotbar press dispatch + execution + costs/recast/TP
+// ---------------------------------------------------------------------------
+
+/// Synthetic retail-shaped 0x012D EventStart body (D §1.1): trigger u32,
+/// owner u32 (`0xA0F00000 | command id`), serverCodes, unknown, eventType
+/// u8, NUL-terminated eventName, LuaParam tail with the real target in
+/// the type-6 Actor param.
+fn event_start_body(
+    trigger: u32,
+    owner: u32,
+    event_name: &str,
+    params: &[common::luaparam::LuaParam],
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&trigger.to_le_bytes());
+    v.extend_from_slice(&owner.to_le_bytes());
+    v.extend_from_slice(&0x2680_0000u32.to_le_bytes()); // serverCodes
+    v.extend_from_slice(&0u32.to_le_bytes()); // unknown
+    v.push(0); // event_type
+    v.extend_from_slice(event_name.as_bytes());
+    v.push(0);
+    common::luaparam::write_lua_params(&mut v, params).expect("lua params encode");
+    v
+}
+
+fn parse_all_subpackets(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<common::subpacket::SubPacket> {
+    let mut out = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match common::subpacket::SubPacket::parse(&bytes, &mut offset) {
+                Ok(sub) => out.push(sub),
+                Err(_) => break,
+            }
+        }
+    }
+    out
+}
+
+/// X01 rows decoded per the retail layout (#28 S0.6): `(anim, cmd,
+/// target, amount, textId)`.
+fn decode_x01_rows(subs: &[common::subpacket::SubPacket]) -> Vec<(u32, u16, u32, u16, u16)> {
+    subs.iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_COMMAND_RESULT_X01)
+        .map(|s| {
+            (
+                u32::from_le_bytes(s.data[0x04..0x08].try_into().unwrap()),
+                u16::from_le_bytes(s.data[0x24..0x26].try_into().unwrap()),
+                u32::from_le_bytes(s.data[0x28..0x2C].try_into().unwrap()),
+                u16::from_le_bytes(s.data[0x2C..0x2E].try_into().unwrap()),
+                u16::from_le_bytes(s.data[0x2E..0x30].try_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
+fn count_end_events(subs: &[common::subpacket::SubPacket]) -> usize {
+    subs.iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_END_EVENT)
+        .count()
+}
+
+fn contains_target_path(subs: &[common::subpacket::SubPacket], path: &[u8]) -> bool {
+    subs.iter()
+        .any(|s| s.data.windows(path.len()).any(|w| w == path))
+}
+
+/// #28 S3.2 + S3.3 — a Fast Blade hotbar press drives the full pipeline:
+/// the retail-shaped 0x012D dispatches inline (active-mode gate, target
+/// from the type-6 param, CanUse order), pushes the WeaponSkill state +
+/// engages, answers with exactly one EndEvent per press, completes via
+/// the ticker into an X01 carrying cmd 27150 + battleAnimation
+/// 301995007, drains the 1000 TP cost, starts + emits the 10 s recast
+/// (commandDetailForSelf pair), re-presses fail 32535 inside the recast
+/// and 32539 out of range, and subsequent auto-attack swings accrue TP
+/// with the stateAtQuicklyForAll wire sync.
+#[tokio::test]
+async fn hotbar_press_executes_fast_blade_with_costs_and_recast() {
+    use crate::actor::Character;
+    use crate::battle::BattleStateKind;
+    use crate::data::Session as MapSession;
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+    use common::luaparam::LuaParam;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let lua = Arc::new(crate::lua::LuaEngine::new("/nonexistent"));
+    // Real seed catalog — fast_blade 27150 (GLA lvl 1, WS, tp 1000,
+    // range 5, recast 10 s, battleAnimation 301995007).
+    let (catalog, by_level) = db
+        .load_global_battle_command_list()
+        .await
+        .expect("battle command catalog");
+    assert!(catalog.contains_key(&27150), "fast_blade seeded");
+    lua.catalogs()
+        .install_battle_commands_with_level_index(catalog, by_level);
+
+    let mut zone = Zone::new(
+        100,
+        "test",
+        1,
+        "/Area/Zone/Test",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 1,
+            kind: ActorKind::Player,
+            position: Vector3::ZERO,
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 2,
+            kind: ActorKind::BattleNpc,
+            position: Vector3::new(3.0, 0.0, 0.0),
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    world.register_zone(zone).await;
+
+    // GLA player in PASSIVE state first (the active-mode gate phase),
+    // hotbar slot 0 = raw 27150 (lobby-creation shape), tp 1000.
+    let mut player = Character::new(1);
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    player.chara.level = 1;
+    player.chara.class = 3;
+    player.chara.tp = 1000;
+    player.chara.hotbar.push(crate::gamedata::HotbarEntry {
+        hotbar_slot: 0,
+        command_id: 27150,
+        recast_time: 0,
+    });
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, player))
+        .await;
+    let mut wolf = Character::new(2);
+    wolf.chara.hp = 5000;
+    wolf.chara.max_hp = 5000;
+    wolf.chara.level = 1;
+    wolf.base.position_x = 3.0;
+    registry
+        .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, wolf))
+        .await;
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+    world
+        .upsert_session(MapSession {
+            id: 42,
+            current_zone_id: 100,
+            ..MapSession::default()
+        })
+        .await;
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: Some(lua.clone()),
+        cmd: None,
+    };
+    let handle = registry.get(1).await.expect("player handle");
+    let press = event_start_body(1, 0xA0F0_6A0E, "commandDefault", &[LuaParam::Actor(2)]);
+
+    // Phase 0 — passive mode: gated with the 32503 line, one EndEvent,
+    // no state pushed.
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "exactly one EndEvent per press");
+    {
+        let c = handle.character.read().await;
+        assert!(
+            !c.ai_container.is_engaged(),
+            "passive-mode press must not engage",
+        );
+    }
+
+    // Phase 1 — active mode: the press engages + pushes WeaponSkill.
+    {
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+    }
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "exactly one EndEvent per press");
+    {
+        let c = handle.character.read().await;
+        assert!(c.ai_container.is_engaged(), "press must engage-if-not");
+        assert!(
+            c.ai_container.is_current(BattleStateKind::WeaponSkill),
+            "WeaponSkill state must top the stack",
+        );
+    }
+
+    // Phase 2 — completion via the ticker: damage X01 with the real
+    // command id + battleAnimation, TP drained, recast set + emitted.
+    let ticker = GameTicker::new(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+    );
+    ticker
+        .tick_once(crate::runtime::clock::server_now_ms() + 1)
+        .await;
+    let subs = parse_all_subpackets(&mut rx);
+    let rows = decode_x01_rows(&subs);
+    assert!(
+        rows.iter()
+            .any(|(anim, cmd, target, ..)| *anim == 301_995_007 && *cmd == 27150 && *target == 2),
+        "completion X01 must carry battleAnimation 301995007 + cmd 27150; got {rows:?}",
+    );
+    assert!(
+        contains_target_path(&subs, b"charaWork/commandDetailForSelf"),
+        "recast pair must reach the client on completion",
+    );
+    assert!(
+        contains_target_path(&subs, b"charaWork/stateAtQuicklyForAll"),
+        "HP/TP state sync must reach the client",
+    );
+    let now_unix = common::utils::unix_timestamp() as u32;
+    {
+        let c = handle.character.read().await;
+        assert_eq!(c.chara.tp, 0, "Fast Blade drains the full 1000 TP");
+        let recast = c.chara.hotbar[0].recast_time;
+        assert!(
+            (now_unix + 8..=now_unix + 11).contains(&recast),
+            "slot recast must be ~now+10s, got {recast} (now {now_unix})",
+        );
+    }
+
+    // Phase 3 — re-press inside the recast window: 32535 error row +
+    // EndEvent, no second WeaponSkill push.
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "error path still EndEvents");
+    let rows = decode_x01_rows(&subs);
+    assert!(
+        rows.iter()
+            .any(|(anim, cmd, _, _, text)| *anim == 0 && *cmd == 27150 && *text == 32535),
+        "recast re-press must carry error text 32535; got {rows:?}",
+    );
+
+    // Phase 4 — range gate: recast cleared, target moved to 10 y
+    // (fast_blade range 5) → 32539.
+    {
+        let mut c = handle.character.write().await;
+        c.chara.hotbar[0].recast_time = 0;
+    }
+    {
+        let wolf_handle = registry.get(2).await.unwrap();
+        let mut c = wolf_handle.character.write().await;
+        c.base.position_x = 10.0;
+    }
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "error path still EndEvents");
+    let rows = decode_x01_rows(&subs);
+    assert!(
+        rows.iter()
+            .any(|(_, cmd, _, _, text)| *cmd == 27150 && *text == 32539),
+        "out-of-range press must carry error text 32539; got {rows:?}",
+    );
+
+    // Phase 5 — TP accrual: the engage from Phase 1 keeps swinging
+    // (wolf back in range). Default delay 2500 ms → 250 TP per landed
+    // swing (pmeteor delay-seconds × 100); run several swings so the
+    // miss/zero-roll chance can't flake the assertion.
+    {
+        let wolf_handle = registry.get(2).await.unwrap();
+        let mut c = wolf_handle.character.write().await;
+        c.base.position_x = 2.0;
+    }
+    let base = crate::runtime::clock::server_now_ms();
+    for i in 1..=10u64 {
+        ticker.tick_once(base + i * 2_600).await;
+    }
+    let subs = parse_all_subpackets(&mut rx);
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.chara.tp > 0 && c.chara.tp.is_multiple_of(250),
+            "swings must bank 250 TP each (delay 2500 ms), got {}",
+            c.chara.tp,
+        );
+    }
+    assert!(
+        contains_target_path(&subs, b"charaWork/stateAtQuicklyForAll"),
+        "TP changes must ride the stateAtQuicklyForAll sync",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #28 Phase 4 — kill gate + director rewrite + teardown (S4.1–S4.3)
+// ---------------------------------------------------------------------------
+
+/// Scaffold for the S4.1 kill-gate tests: zone 166 with the tutorial
+/// cast (player + 2 Ally-kind allies + 3 BattleNpc wolves), a session
+/// carrying the active content script + the 7-member director roster,
+/// and a Lua engine with a director coroutine parked on
+/// `waitForSignal("battleComplete")` that queues `player:ChangeMusic(7)`
+/// on resume — so "the gate fired exactly once" is observable as
+/// exactly one 0x000C SetMusic on the wire.
+struct KillGateScene {
+    world: Arc<WorldManager>,
+    registry: Arc<ActorRegistry>,
+    db: Arc<crate::database::Database>,
+    lua: Arc<crate::lua::LuaEngine>,
+    zone: Arc<RwLock<Zone>>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    player_id: u32,
+    yda_id: u32,
+    wolves: [u32; 3],
+}
+
+async fn kill_gate_scene() -> KillGateScene {
+    use crate::data::Session as MapSession;
+
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-killgate-{}-{:?}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::thread::current().id(),
+    ));
+    std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+    std::fs::write(
+        root.join("global.lua"),
+        r#"
+            function waitForSignal(signal)
+                return coroutine.yield("_WAIT_SIGNAL", signal);
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("directors/Quest/BattleCompleteWaiter.lua"),
+        r#"
+            require ("global")
+            function onEventStarted(player, director, eventType, eventName)
+                waitForSignal("battleComplete")
+                player:ChangeMusic(7)
+            end
+        "#,
+    )
+    .unwrap();
+    let lua = Arc::new(crate::lua::LuaEngine::new(&root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0003u32;
+    let yda_id = 0x4534_0006u32;
+    let papalymo_id = 0x4534_0007u32;
+    let wolves = [0x4534_0003u32, 0x4534_0004, 0x4534_0005];
+    let session_id = 7u32;
+
+    let mut zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    let cast: [(u32, ActorKind); 6] = [
+        (player_id, ActorKind::Player),
+        (yda_id, ActorKind::Ally),
+        (papalymo_id, ActorKind::Ally),
+        (wolves[0], ActorKind::BattleNpc),
+        (wolves[1], ActorKind::BattleNpc),
+        (wolves[2], ActorKind::BattleNpc),
+    ];
+    for (id, kind) in cast {
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: id,
+                kind,
+                position: Vector3::new(370.0, 4.0, -705.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone).await;
+    let zone = world.zone(166).await.expect("zone 166 registered");
+
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    for (id, tag) in [
+        (yda_id, ActorKindTag::Ally),
+        (papalymo_id, ActorKindTag::Ally),
+        (wolves[0], ActorKindTag::BattleNpc),
+        (wolves[1], ActorKindTag::BattleNpc),
+        (wolves[2], ActorKindTag::BattleNpc),
+    ] {
+        let mut c = Character::new(id);
+        c.base.zone_id = 166;
+        c.chara.hp = 100;
+        c.chara.max_hp = 100;
+        registry.insert(ActorHandle::new(id, tag, 166, 0, c)).await;
+    }
+
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    let mut session = MapSession {
+        id: session_id,
+        current_zone_id: 166,
+        active_content_script: Some(crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+            director_name: "Quest/BattleCompleteWaiter".to_string(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0x6534_0002,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+            spawned_actor_ids: Vec::new(),
+        }),
+        ..MapSession::default()
+    };
+    session.transient_director_members.insert(
+        director_id,
+        vec![
+            player_id,
+            director_id,
+            yda_id,
+            papalymo_id,
+            wolves[0],
+            wolves[1],
+            wolves[2],
+        ],
+    );
+    world.upsert_session(session).await;
+
+    // Park the director coroutine on "battleComplete".
+    let result = lua.call_director_on_event_started(
+        &root.join("directors/Quest/BattleCompleteWaiter.lua"),
+        crate::lua::userdata::PlayerSnapshot {
+            actor_id: player_id,
+            ..Default::default()
+        },
+        crate::lua::userdata::LuaDirectorHandle {
+            name: "Quest/BattleCompleteWaiter".to_string(),
+            actor_id: director_id,
+            class_path: "/Director/Quest/BattleCompleteWaiter".to_string(),
+            queue: crate::lua::command::CommandQueue::new(),
+        },
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(lua.scheduler().lock().unwrap().pending_signal_count(), 1);
+
+    KillGateScene {
+        world,
+        registry,
+        db,
+        lua,
+        zone,
+        rx,
+        player_id,
+        yda_id,
+        wolves,
+    }
+}
+
+impl KillGateScene {
+    /// Drop a wolf to 0 HP and run the production death path
+    /// (`die_if_defender_fell` — the resolve_auto_attack/resolve_action
+    /// tail) with lua + db in scope, as the ticker drain does.
+    async fn kill(&self, wolf: u32, attacker: Option<u32>) {
+        {
+            let h = self.registry.get(wolf).await.expect("wolf in registry");
+            let mut c = h.character.write().await;
+            c.chara.hp = 0;
+        }
+        crate::runtime::dispatcher::die_if_defender_fell(
+            wolf,
+            attacker,
+            &self.registry,
+            &self.world,
+            &self.zone,
+            Some(&self.lua),
+            Some(&self.db),
+        )
+        .await;
+    }
+
+    fn parked_on_battle_complete(&self) -> usize {
+        self.lua.scheduler().lock().unwrap().pending_signal_count()
+    }
+
+    fn drain_set_music_count(&mut self) -> usize {
+        parse_all_subpackets(&mut self.rx)
+            .iter()
+            .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_SET_MUSIC)
+            .count()
+    }
+}
+
+/// S4.1 (a) — two wolves dead → no signal; the third death fires
+/// exactly one effective `battleComplete` (one director resume, one
+/// queued ChangeMusic on the wire).
+#[tokio::test]
+async fn s4_1_kill_gate_fires_once_when_last_wolf_dies() {
+    let mut scene = kill_gate_scene().await;
+    let player = scene.player_id;
+    let [w1, w2, w3] = scene.wolves;
+
+    scene.kill(w1, Some(player)).await;
+    assert_eq!(scene.parked_on_battle_complete(), 1, "1 dead: still parked");
+    scene.kill(w2, Some(player)).await;
+    assert_eq!(scene.parked_on_battle_complete(), 1, "2 dead: still parked");
+    assert_eq!(
+        scene.drain_set_music_count(),
+        0,
+        "no resume before 3rd kill"
+    );
+
+    scene.kill(w3, Some(player)).await;
+    assert_eq!(scene.parked_on_battle_complete(), 0, "3 dead: resumed");
+    assert_eq!(
+        scene.drain_set_music_count(),
+        1,
+        "exactly one battleComplete resume",
+    );
+}
+
+/// S4.1 (b) — an Ally landing the killing blow on the last wolf (the
+/// attacker gate in `die_if_defender_fell` rejects non-Player
+/// attackers) must still fire the gate.
+#[tokio::test]
+async fn s4_1_kill_gate_fires_on_ally_killing_blow() {
+    let mut scene = kill_gate_scene().await;
+    let player = scene.player_id;
+    let yda = scene.yda_id;
+    let [w1, w2, w3] = scene.wolves;
+
+    scene.kill(w1, Some(player)).await;
+    scene.kill(w2, Some(player)).await;
+    scene.kill(w3, Some(yda)).await;
+
+    assert_eq!(scene.parked_on_battle_complete(), 0, "resumed by ally kill");
+    assert_eq!(scene.drain_set_music_count(), 1);
+}
+
+/// S4.1 (c) — a scripted/GM death (`apply_die` without
+/// `die_if_defender_fell` — the `BattleEvent::Die` / `!die` paths)
+/// fires the gate via the `apply_die` tail call site.
+#[tokio::test]
+async fn s4_1_kill_gate_fires_on_gm_kill_via_apply_die_tail() {
+    let mut scene = kill_gate_scene().await;
+    let player = scene.player_id;
+    let [w1, w2, w3] = scene.wolves;
+
+    scene.kill(w1, Some(player)).await;
+    scene.kill(w2, Some(player)).await;
+    crate::runtime::dispatcher::apply_die(
+        w3,
+        &scene.registry,
+        &scene.world,
+        &scene.zone,
+        Some(&scene.lua),
+        Some(&scene.db),
+    )
+    .await;
+
+    assert_eq!(scene.parked_on_battle_complete(), 0, "resumed by GM kill");
+    assert_eq!(scene.drain_set_music_count(), 1);
+}
+
+/// S4.1 (d) — the last two wolves dying in the same tick drain
+/// sequentially: the first death still counts one live hostile (state
+/// flips on each wolf's own `apply_die`), the second fires the gate —
+/// one effective signal, no double resume.
+#[tokio::test]
+async fn s4_1_kill_gate_single_fire_on_same_tick_double_death() {
+    let mut scene = kill_gate_scene().await;
+    let player = scene.player_id;
+    let [w1, w2, w3] = scene.wolves;
+
+    scene.kill(w1, Some(player)).await;
+    // Both remaining wolves hit 0 HP in the same tick; the battle-event
+    // drain settles them one after the other.
+    for w in [w2, w3] {
+        let h = scene.registry.get(w).await.expect("wolf in registry");
+        let mut c = h.character.write().await;
+        c.chara.hp = 0;
+    }
+    scene.kill(w2, Some(player)).await;
+    assert_eq!(
+        scene.parked_on_battle_complete(),
+        1,
+        "w3 not yet state-DEAD — gate must hold",
+    );
+    scene.kill(w3, Some(player)).await;
+
+    assert_eq!(scene.parked_on_battle_complete(), 0);
+    assert_eq!(
+        scene.drain_set_music_count(),
+        1,
+        "double-death must resume the director exactly once",
+    );
+}
+
+/// S4.2 + S4.3 — the REAL `QuestDirectorMan0g001.lua` driven end-to-end
+/// through production routing: EventStart → cinematic EventUpdate →
+/// `playerActive` (F press) → wait(1) tick → kick → kick-reply
+/// EventStart → Btl002-return EventUpdate → 3 × wolf death via
+/// `die_if_defender_fell` (the S4.1 gate fires `battleComplete` in the
+/// death-path call stack) → wait(2) tick → processEvent020_1
+/// EventUpdate. Asserts the ordered command/wire stream of the
+/// director's tail (widgets → ChangeMusic → ChangeState trio →
+/// processEvent020_1 → StartSequence(10) → EndEvent → ContentFinished
+/// teardown → DoZoneChange warp) and the post-warp state (journal
+/// sequence 10, zone-155 private area, no ghost actors in zone 166's
+/// grid, content driver off, player killable again).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
+    use crate::data::Session as MapSession;
+    use crate::lua::command::LuaCommand;
+    use crate::zone::PrivateArea;
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    let lua = Arc::new(crate::lua::LuaEngine::new(&script_root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(crate::database::Database::open(tempdb()).await.expect("db"));
+
+    let player_id = 0x0040_0001u32;
+    let director_id = 0x6608_0003u32;
+    let yda_id = 0x4534_0006u32;
+    let papalymo_id = 0x4534_0007u32;
+    let wolves = [0x4534_0003u32, 0x4534_0004, 0x4534_0005];
+    let session_id = 7u32;
+    let quest_id = 110_005u32; // Man0g0
+
+    // Zone 166 (tutorial arena) + zone 155 carrying the
+    // PrivateAreaMasterPast level-1 replica (the warp-out target).
+    let mut zone166 = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    let cast: [(u32, ActorKind); 6] = [
+        (player_id, ActorKind::Player),
+        (yda_id, ActorKind::Ally),
+        (papalymo_id, ActorKind::Ally),
+        (wolves[0], ActorKind::BattleNpc),
+        (wolves[1], ActorKind::BattleNpc),
+        (wolves[2], ActorKind::BattleNpc),
+    ];
+    for (id, kind) in cast {
+        zone166.core.add_actor(
+            StoredActor {
+                actor_id: id,
+                kind,
+                position: Vector3::new(370.0, 4.0, -705.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone166).await;
+    let zone166_arc = world.zone(166).await.expect("zone 166");
+    let mut zone155 = Zone::new(
+        155,
+        "fst0Town01a",
+        102,
+        "/Area/Zone/ZoneMasterGridania",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    zone155.add_private_area(PrivateArea::new(
+        155,
+        "fst0Town01a",
+        102,
+        5,
+        "/Area/PrivateArea/PrivateAreaMasterPast",
+        "PrivateAreaMasterPast",
+        1,
+        51,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+    ));
+    world.register_zone(zone155).await;
+
+    // Player: GLA (DoW branch), Man0g0 at SEQ_005 in the journal, the
+    // tutorial MinimumHpLock armed (teardown must lift it), and an
+    // event session opened on the director (the kick's EventStart shape).
+    let mut player = Character::new(player_id);
+    player.base.zone_id = 166;
+    player.base.position_x = 370.0;
+    player.base.position_z = -705.0;
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    player.chara.class = 2;
+    player
+        .chara
+        .mods
+        .set(crate::actor::Modifier::MinimumHpLock, 1.0);
+    {
+        let mut quest = crate::actor::quest::Quest::new(
+            crate::actor::quest::quest_actor_id(quest_id),
+            "Man0g0",
+        );
+        quest.start_sequence(5);
+        quest.clear_dirty();
+        player.quest_journal.add(quest).expect("journal slot");
+    }
+    {
+        let mut eob = crate::event::outbox::EventOutbox::new();
+        player.event_session.start_event(
+            player_id,
+            director_id,
+            "noticeEvent",
+            5,
+            vec![],
+            &mut eob,
+        );
+    }
+    registry
+        .insert(ActorHandle::new(
+            player_id,
+            ActorKindTag::Player,
+            166,
+            session_id,
+            player,
+        ))
+        .await;
+    for (id, tag) in [
+        (yda_id, ActorKindTag::Ally),
+        (papalymo_id, ActorKindTag::Ally),
+        (wolves[0], ActorKindTag::BattleNpc),
+        (wolves[1], ActorKindTag::BattleNpc),
+        (wolves[2], ActorKindTag::BattleNpc),
+    ] {
+        let mut c = Character::new(id);
+        c.base.zone_id = 166;
+        c.chara.hp = 100;
+        c.chara.max_hp = 100;
+        registry.insert(ActorHandle::new(id, tag, 166, 0, c)).await;
+    }
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4096);
+    world
+        .register_client(session_id, ClientHandle::new(session_id, tx))
+        .await;
+    let mut session = MapSession {
+        id: session_id,
+        current_zone_id: 166,
+        active_content_script: Some(crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+            director_name: "Quest/QuestDirectorMan0g001".to_string(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0x6534_0002,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+            spawned_actor_ids: Vec::new(),
+        }),
+        ..MapSession::default()
+    };
+    session.transient_director_members.insert(
+        director_id,
+        vec![
+            player_id,
+            director_id,
+            yda_id,
+            papalymo_id,
+            wolves[0],
+            wolves[1],
+            wolves[2],
+        ],
+    );
+    world.upsert_session(session).await;
+
+    let handle = registry.get(player_id).await.expect("player handle");
+    let snapshot = crate::lua::userdata::PlayerSnapshot {
+        actor_id: player_id,
+        zone_id: 166,
+        current_class: 2, // gladiator → IsDiscipleOfWar
+        active_quests: vec![quest_id],
+        active_quest_states: vec![crate::lua::userdata::QuestStateSnapshot {
+            quest_id,
+            sequence: 5,
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }],
+        ..Default::default()
+    };
+
+    // Stage A — director EventStart: startTutorialMode +
+    // processTtrBtl001, parked on the cinematic.
+    let result = lua.call_director_on_event_started(
+        &script_root.join("directors/Quest/QuestDirectorMan0g001.lua"),
+        snapshot,
+        crate::lua::userdata::LuaDirectorHandle {
+            name: "Quest/QuestDirectorMan0g001".to_string(),
+            actor_id: director_id,
+            class_path: "/Director/Quest/QuestDirectorMan0g001".to_string(),
+            queue: crate::lua::command::CommandQueue::new(),
+        },
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        result.commands,
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(lua.scheduler().lock().unwrap().pending_event_count(), 1);
+    let subs = parse_all_subpackets(&mut rx);
+    assert!(
+        subs.iter()
+            .any(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA),
+        "startTutorialMode's SendDataPacket(9) must reach the wire",
+    );
+    assert!(
+        subs.iter()
+            .any(|s| s.game_message.opcode == crate::packets::opcodes::OP_RUN_EVENT_FUNCTION),
+        "processTtrBtl001 must reach the wire",
+    );
+
+    // Stage B — cinematic done (EventUpdate): EndEvent, parked on the
+    // F-press signal.
+    let cmds = lua
+        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .expect("parked on the cinematic");
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        cmds,
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(lua.scheduler().lock().unwrap().pending_signal_count(), 1);
+
+    // Stage C — F press: the `playerActive` signal rides the bridge and
+    // the director re-parks on the real wait(1).
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        vec![LuaCommand::SendSignal {
+            name: "playerActive".to_string(),
+        }],
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(lua.scheduler().lock().unwrap().pending_time_count(), 1);
+
+    // Stage D — wait(1) elapses; the tick drains kickEventContinue's
+    // KickEvent through the event bridge (the S1.1 runtime arm).
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let batches = lua.tick();
+    assert_eq!(batches.len(), 1, "post-wait(1) drain; got {batches:?}");
+    for (owner, cmds) in batches {
+        assert_eq!(owner, player_id);
+        crate::runtime::quest_apply::apply_event_script_commands(
+            &handle,
+            cmds,
+            &registry,
+            &db,
+            &world,
+            Some(&lua),
+        )
+        .await;
+    }
+    let subs = parse_all_subpackets(&mut rx);
+    let kick = subs
+        .iter()
+        .find(|s| s.game_message.opcode == crate::packets::opcodes::OP_KICK_EVENT)
+        .expect("mid-flow kick must reach the wire");
+    assert_eq!(kick.data[8], 5, "kick event_type must be 5 (noticeEvent)");
+    assert_eq!(lua.scheduler().lock().unwrap().pending_event_count(), 1);
+
+    // Stage E — client answers the kick (EventStart): processTtrBtl002.
+    let cmds = lua
+        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .expect("parked on the kick reply");
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, LuaCommand::RunEventFunction { .. })),
+        "processTtrBtl002 must drain; got {cmds:?}",
+    );
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        cmds,
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+
+    // Stage F — Btl002 returns (EventUpdate): EndEvent, then the
+    // director parks on the kill gate's signal. The fight is
+    // free-running from here.
+    let cmds = lua
+        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .expect("parked on Btl002");
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        cmds,
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_signal_count(),
+        1,
+        "director parked on battleComplete during the fight",
+    );
+    let _ = parse_all_subpackets(&mut rx);
+
+    // Stage G — the fight: three wolves die on the production death
+    // path. The third death fires battleComplete in the death-path call
+    // stack; the director drains the widget tail and parks on wait(2).
+    for (i, w) in wolves.into_iter().enumerate() {
+        {
+            let h = registry.get(w).await.expect("wolf in registry");
+            let mut c = h.character.write().await;
+            c.chara.hp = 0;
+        }
+        crate::runtime::dispatcher::die_if_defender_fell(
+            w,
+            Some(player_id),
+            &registry,
+            &world,
+            &zone166_arc,
+            Some(&lua),
+            Some(&db),
+        )
+        .await;
+        if i < 2 {
+            assert_eq!(
+                lua.scheduler().lock().unwrap().pending_signal_count(),
+                1,
+                "gate must hold with live wolves remaining",
+            );
+        }
+    }
+    {
+        let sched = lua.scheduler().lock().unwrap();
+        assert_eq!(sched.pending_signal_count(), 0, "battleComplete consumed");
+        assert_eq!(sched.pending_time_count(), 1, "parked on wait(2)");
+    }
+    let subs = parse_all_subpackets(&mut rx);
+    let widget_count = subs
+        .iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA)
+        .count();
+    assert_eq!(
+        widget_count, 4,
+        "closeTutorialWidget + 9055 + 9065 successes + attention toast",
+    );
+
+    // Stage H — wait(2) elapses: ChangeMusic, ChangeState(0) trio, and
+    // processEvent020_1 drain in order; parked on the cutscene.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let batches = lua.tick();
+    assert_eq!(batches.len(), 1, "post-wait(2) drain; got {batches:?}");
+    for (owner, cmds) in batches {
+        assert_eq!(owner, player_id);
+        crate::runtime::quest_apply::apply_event_script_commands(
+            &handle,
+            cmds,
+            &registry,
+            &db,
+            &world,
+            Some(&lua),
+        )
+        .await;
+    }
+    assert_eq!(lua.scheduler().lock().unwrap().pending_event_count(), 1);
+    let subs = parse_all_subpackets(&mut rx);
+    let first_idx = |op: u16| subs.iter().position(|s| s.game_message.opcode == op);
+    let music = first_idx(crate::packets::opcodes::OP_SET_MUSIC).expect("ChangeMusic(7)");
+    let state = first_idx(crate::packets::opcodes::OP_SET_ACTOR_STATE).expect("0x0134");
+    let x00 = first_idx(crate::packets::opcodes::OP_COMMAND_RESULT_X00).expect("0x013C");
+    let x01 = first_idx(crate::packets::opcodes::OP_COMMAND_RESULT_X01).expect("0x0139");
+    let run_fn = first_idx(crate::packets::opcodes::OP_RUN_EVENT_FUNCTION).expect("020_1");
+    assert!(
+        music < state && state < x00 && x00 < x01 && x01 < run_fn,
+        "order must be ChangeMusic → ChangeState trio → processEvent020_1; \
+         got music={music} state={state} x00={x00} x01={x01} run_fn={run_fn}",
+    );
+
+    // Stage I — processEvent020_1 returns (EventUpdate): the director's
+    // final batch in command order, then the teardown + warp effects.
+    let cmds = lua
+        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .expect("parked on processEvent020_1");
+    let kind_order: Vec<&'static str> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            LuaCommand::QuestStartSequence { sequence: 10, .. } => Some("start_sequence_10"),
+            LuaCommand::EndEvent { .. } => Some("end_event"),
+            LuaCommand::ContentFinished { .. } => Some("content_finished"),
+            LuaCommand::DoZoneChange { zone_id: 155, .. } => Some("do_zone_change_155"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kind_order,
+        vec![
+            "start_sequence_10",
+            "end_event",
+            "content_finished",
+            "do_zone_change_155",
+            "end_event",
+        ],
+        "the director tail must drain in plan order; got {cmds:?}",
+    );
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        cmds,
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+
+    // Wire order: EndEvent → teardown RemoveActors → warp wipe.
+    let subs = parse_all_subpackets(&mut rx);
+    let first_idx = |op: u16| subs.iter().position(|s| s.game_message.opcode == op);
+    let end_event = first_idx(crate::packets::opcodes::OP_END_EVENT).expect("EndEvent");
+    let remove = first_idx(crate::packets::opcodes::OP_REMOVE_ACTOR).expect("teardown despawn");
+    let wipe = first_idx(crate::packets::opcodes::OP_DELETE_ALL_ACTORS).expect("warp wipe");
+    let e2 = first_idx(crate::packets::opcodes::OP_0XE2_PACKET).expect("0x00E2");
+    assert!(
+        end_event < remove && remove < wipe && wipe < e2,
+        "order must be EndEvent → ContentFinished despawns → DoZoneChange wipe; \
+         got end={end_event} remove={remove} wipe={wipe} e2={e2}",
+    );
+    for s in &subs {
+        assert_ne!(
+            s.header.target_id, 0,
+            "every subpacket must be target-stamped (opcode 0x{:04X})",
+            s.game_message.opcode,
+        );
+    }
+    // S4.3 — the post-warp zone-in bundle re-sends the SOLO party trio
+    // (capture line 40887 parity): with the content roster torn down the
+    // 0x017D after the wipe carries member_count 1 again.
+    let solo_begin = subs
+        .iter()
+        .skip(wipe)
+        .find(|s| s.game_message.opcode == crate::packets::opcodes::OP_GROUP_MEMBERS_BEGIN)
+        .expect("post-warp bundle must re-send the party trio");
+    assert_eq!(
+        u32::from_le_bytes(solo_begin.data[0x18..0x1C].try_into().unwrap()),
+        1,
+        "post-warp party group must be solo (member_count 1)",
+    );
+    assert!(
+        subs.iter()
+            .skip(wipe)
+            .any(|s| s.game_message.opcode == crate::packets::opcodes::OP_GROUP_HEADER),
+        "post-warp bundle must carry the 0x017C group header",
+    );
+
+    // S4.3 — post-warp state. Journal at SEQ_010.
+    {
+        let c = handle.character.read().await;
+        let q = c.quest_journal.get(quest_id).expect("Man0g0 in journal");
+        assert_eq!(q.get_sequence(), 10, "StartSequence(10) applied");
+        assert_eq!(c.base.zone_id, 155, "character followed the warp");
+        assert_eq!(
+            c.chara.mods.get(crate::actor::Modifier::MinimumHpLock),
+            0.0,
+            "player killable again (tutorial lock lifted)",
+        );
+    }
+    // Session: content driver off, rosters cleared, warped into the
+    // named private area.
+    let snap = world.session(session_id).await.expect("session");
+    assert!(snap.active_content_script.is_none(), "onUpdate driver off");
+    assert!(snap.transient_director_members.is_empty(), "roster cleared");
+    assert_eq!(snap.current_zone_id, 155);
+    assert_eq!(
+        snap.current_private_area_name.as_deref(),
+        Some("PrivateAreaMasterPast"),
+    );
+    // Registry + zone-166 grid: no ghosts.
+    for id in [yda_id, papalymo_id, wolves[0], wolves[1], wolves[2]] {
+        assert!(
+            registry.get(id).await.is_none(),
+            "0x{id:08X} must be despawned",
+        );
+    }
+    {
+        let z = zone166_arc.read().await;
+        let ids: Vec<u32> = z
+            .core
+            .actors_around_point(370.0, -705.0, 100.0)
+            .iter()
+            .map(|a| a.actor_id)
+            .collect();
+        assert!(
+            ids.is_empty(),
+            "zone 166 grid must hold no tutorial ghosts; got {ids:?}",
+        );
+    }
+    // Scheduler: nothing parked — no stale director can resume.
+    {
+        let sched = lua.scheduler().lock().unwrap();
+        assert_eq!(sched.pending_signal_count(), 0);
+        assert_eq!(sched.pending_time_count(), 0);
+        assert_eq!(sched.pending_event_count(), 0);
+    }
 }

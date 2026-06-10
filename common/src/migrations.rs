@@ -76,12 +76,15 @@ mod tests {
             // (or wholly-commented-out) migration. `ALTER TABLE`
             // migrations are a legitimate column-add path (see
             // `050_characters_quest_scenario_npc_ls.sql` for the first
-            // landed example), so the check is the union of all three.
+            // landed example) and `UPDATE` a legitimate data-fix path
+            // (`052_fix_tutorial_ally_pools.sql`), so the check is the
+            // union of all four.
             assert!(
                 mig.sql.contains("CREATE TABLE")
                     || mig.sql.contains("INSERT")
-                    || mig.sql.contains("ALTER TABLE"),
-                "{} has none of CREATE TABLE / INSERT / ALTER TABLE",
+                    || mig.sql.contains("ALTER TABLE")
+                    || mig.sql.contains("UPDATE"),
+                "{} has none of CREATE TABLE / INSERT / ALTER TABLE / UPDATE",
                 mig.name,
             );
         }

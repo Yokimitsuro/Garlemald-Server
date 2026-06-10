@@ -33,6 +33,7 @@
 
 use common::Vector3;
 
+use super::command::BattleCommand;
 use super::target_find::{ActorArena, ActorView};
 
 /// Who's driving this controller.
@@ -119,6 +120,24 @@ pub struct BattleNpcControllerState {
     /// Content-group member ids, populated by AllyController before each
     /// `tick`. Empty for plain BattleNpcs.
     pub content_group_ids: Vec<u32>,
+    /// Caster archetype (#28 S2.1) — pool `currentJob` ∈ {22 THM, 23 CNJ}.
+    /// Casters stand back at `standback_range` instead of closing to
+    /// melee, and the spawner disables their auto-attack.
+    pub is_caster: bool,
+    /// Stand-off ring for casters. 15.0 keeps Papalymo inside thunder's
+    /// 20 y range with margin (LSB default standback is 20; tuned down
+    /// for the SEQ_005 arena). LSB: mob_controller.cpp::CanMoveForward
+    /// (STANDBACK shape re-derived, GPL-3 — no verbatim copy).
+    pub standback_range: f32,
+    /// Earliest `now_ms` the next `Cast` decision may fire. Re-armed by
+    /// `AIContainer::apply_decision` to `now + cast_time + recast_time`
+    /// after a successful `internal_cast`.
+    pub next_cast_ms: u64,
+    /// Pre-resolved spell for the caster loop (#28 S2.4). Resolved from
+    /// `catalogs.battle_commands` at spawn time (the sync decision path
+    /// has no catalog access) — same gamedata→battle conversion the
+    /// plan routes through `apply_decision`.
+    pub spell: Option<BattleCommand>,
 }
 
 impl Controller {
@@ -137,6 +156,7 @@ impl Controller {
                 sight_range: 20.0,
                 sound_range: 10.0,
                 roam_delay_seconds: 5,
+                standback_range: 15.0,
                 ..Default::default()
             },
             pet_master_actor_id: 0,
@@ -189,6 +209,10 @@ pub struct ControllerOwnerView {
     /// `Character::get_attack_delay_ms`; defaults to 2500 ms when no weapon
     /// delay is set.
     pub attack_delay_ms: u32,
+    /// Auto-attack reach in yalms. Read from `Character::get_attack_range`
+    /// (default 3.0). Drives both the melee stop ring (#28 S2.2) and the
+    /// swing range gate (#28 S2.3).
+    pub attack_range: f32,
 }
 
 /// What the controller wants the AIContainer to do this tick. Emitted by
@@ -202,11 +226,18 @@ pub enum ControllerDecision {
     /// Drop aggro + path back to spawn.
     Disengage,
     /// Walk toward this position (used for both combat pursuit + roaming).
+    /// In combat the position is the stop-ring point on the owner→target
+    /// line, never the target itself — the ticker's step integrator can
+    /// walk all the way to it without overshooting.
     MoveTo { position: Vector3 },
-    /// Stop pathing and face the current target.
-    FaceTarget,
+    /// Stop pathing and face this position (the current target).
+    FaceTarget { position: Vector3 },
     /// Start roaming — path to a random point near spawn.
     Roam,
+    /// Caster loop (#28 S2.4) — begin casting the pre-resolved
+    /// `battle.spell` at the target. The AIContainer's Cast arm runs
+    /// `internal_cast` + re-arms `battle.next_cast_ms`.
+    Cast { target_actor_id: u32 },
     /// Change the locked target, no engage.
     ChangeTarget { target_actor_id: Option<u32> },
     /// Fire a Lua combat-tick hook. The container dispatches by name.
@@ -266,7 +297,7 @@ impl Controller {
 
         // Engaged → combat tick. Not engaged → retaliate, try aggro, else roam.
         if owner.is_engaged {
-            self.do_combat_tick(now_ms, owner)
+            self.do_combat_tick(now_ms, owner, arena)
         } else if let Some(hated) = owner.most_hated_actor_id {
             // Retaliate. A mob that has accumulated hate (because it took
             // damage — `resolve_auto_attack` calls `update_hate` on the
@@ -415,7 +446,12 @@ impl Controller {
         gap <= (std::f32::consts::PI / 2.0)
     }
 
-    fn do_combat_tick(&mut self, now_ms: u64, owner: ControllerOwnerView) -> ControllerDecision {
+    fn do_combat_tick(
+        &mut self,
+        now_ms: u64,
+        owner: ControllerOwnerView,
+        arena: &dyn ActorArena,
+    ) -> ControllerDecision {
         // Deaggro when the target is gone or we've roamed too far from spawn.
         if self.should_deaggro(owner) {
             return ControllerDecision::Disengage;
@@ -428,10 +464,69 @@ impl Controller {
             };
         }
 
-        // Move toward target every combat tick until we're in attack range.
-        // The AIContainer turns `MoveTo` into pathfinding.
+        // Pursuit / cast / facing — decided EVERY tick, not 3 s-gated
+        // (#28 S2.2; pmeteor gates Move inside its 3 s combat tick which
+        // is why its mobs visibly stutter — copy the geometry, not the
+        // cadence). Geometry from pmeteor `BattleNpcController.cs:245-301`
+        // + `PathFind.StepTo`; LSB: mob_controller.cpp::Move (shape
+        // re-derived, GPL-3 — no verbatim copy).
         if let Some(target_id) = owner.current_target_actor_id
-            && !owner.has_prevent_movement
+            && let Some(target) = arena.get(target_id)
+        {
+            let dx = target.position.x - owner.actor.position.x;
+            let dz = target.position.z - owner.actor.position.z;
+            let dist = (dx * dx + dz * dz).sqrt();
+
+            // Caster spell decision rides ahead of movement so an
+            // in-range caster never takes a step the tick it casts.
+            // LSB: mob_controller.cpp::DoCombatTick (cast before Move).
+            if self.battle.is_caster
+                && self.casting_enabled
+                && now_ms >= self.battle.next_cast_ms
+                && self.battle.spell.as_ref().is_some_and(|s| dist <= s.range)
+            {
+                return ControllerDecision::Cast {
+                    target_actor_id: target_id,
+                };
+            }
+
+            // Stop ring: melee closes to attack_range - 0.2 (pmeteor
+            // constant); casters park at their standback ring.
+            let stop = if self.battle.is_caster {
+                self.battle.standback_range
+            } else {
+                owner.attack_range - 0.2
+            };
+            if dist > stop && !owner.has_prevent_movement {
+                // Destination = the stop-ring point on the owner→target
+                // line, so the step integrator can never overshoot.
+                let t = (dist - stop) / dist;
+                return ControllerDecision::MoveTo {
+                    position: Vector3::new(
+                        owner.actor.position.x + dx * t,
+                        owner.actor.position.y + (target.position.y - owner.actor.position.y) * t,
+                        owner.actor.position.z + dz * t,
+                    ),
+                };
+            }
+
+            // In range. Fire the 3 s Lua combat-tick hook when due,
+            // otherwise just keep facing the target (rotation only —
+            // folded into the ticker's step application).
+            if now_ms.saturating_sub(self.last_combat_tick_ms) >= COMBAT_TICK_INTERVAL_MS {
+                self.last_combat_tick_ms = now_ms;
+                return ControllerDecision::LuaCombatTick {
+                    target_actor_id: Some(target_id),
+                };
+            }
+            return ControllerDecision::FaceTarget {
+                position: target.position,
+            };
+        }
+
+        // Target not resolvable in the arena — keep the legacy 3 s Lua
+        // hook cadence so scripted AI still ticks.
+        if let Some(target_id) = owner.current_target_actor_id
             && now_ms.saturating_sub(self.last_combat_tick_ms) >= COMBAT_TICK_INTERVAL_MS
         {
             self.last_combat_tick_ms = now_ms;
@@ -554,6 +649,7 @@ mod tests {
             is_close_to_spawn: true,
             target_is_locked: false,
             attack_delay_ms: 2500,
+            attack_range: 3.0,
         }
     }
 
@@ -645,6 +741,90 @@ mod tests {
         let arena = arena_with(&[view(1, 0.0, 0.0, 2, true)]);
         let out = c.tick(1_000, owner_view(true, false, None, None), &arena);
         assert_eq!(out, ControllerDecision::Idle);
+    }
+
+    /// #28 S2.2 — engaged melee pursues to the stop ring: the MoveTo
+    /// destination is the `attack_range - 0.2` point on the owner→target
+    /// line, decided every tick (not 3 s-gated).
+    #[test]
+    fn s2_2_engaged_melee_pursues_to_stop_ring() {
+        let mut c = BattleNpcController::new_for(1);
+        let arena = arena_with(&[view(1, 0.0, 0.0, 2, true), view(10, 9.0, 0.0, 1, true)]);
+        let v = owner_view(true, true, Some(10), Some(10));
+        // First tick (well inside the 3 s window) must already move.
+        let out = c.tick(100, v, &arena);
+        match out {
+            ControllerDecision::MoveTo { position } => {
+                // Ring at attack_range 3.0 - 0.2 = 2.8 from the target →
+                // destination 9.0 - 2.8 = 6.2 along the line.
+                assert!((position.x - 6.2).abs() < 1e-3, "got x={}", position.x);
+                assert!(position.z.abs() < 1e-3);
+            }
+            other => panic!("expected MoveTo, got {other:?}"),
+        }
+        // Second tick 100 ms later: still moving (per-tick decision).
+        assert!(matches!(
+            c.tick(200, v, &arena),
+            ControllerDecision::MoveTo { .. }
+        ));
+    }
+
+    /// #28 S2.2 — in range: rotation-only FaceTarget between the 3 s Lua
+    /// combat ticks.
+    #[test]
+    fn s2_2_engaged_melee_in_range_faces_target() {
+        let mut c = BattleNpcController::new_for(1);
+        let arena = arena_with(&[view(1, 0.0, 0.0, 2, true), view(10, 2.0, 0.0, 1, true)]);
+        let v = owner_view(true, true, Some(10), Some(10));
+        let out = c.tick(100, v, &arena);
+        match out {
+            ControllerDecision::FaceTarget { position } => {
+                assert_eq!(position.x, 2.0);
+            }
+            other => panic!("expected FaceTarget, got {other:?}"),
+        }
+        // The 3 s Lua hook still fires when due.
+        assert!(matches!(
+            c.tick(3_100, v, &arena),
+            ControllerDecision::LuaCombatTick { .. }
+        ));
+    }
+
+    /// #28 S2.4 — caster decision order: cast is checked before movement
+    /// (LSB DoCombatTick order), so an in-spell-range caster casts
+    /// instead of stepping; once the recast clock is armed it stands
+    /// back to the 15 y ring / faces the target.
+    #[test]
+    fn s2_4_caster_casts_before_moving_then_stands_back() {
+        let mut c = BattleNpcController::new_for(1);
+        c.battle.is_caster = true;
+        let mut spell = BattleCommand::new(27313, "thunder");
+        spell.range = 20.0;
+        c.battle.spell = Some(spell);
+        // 18 y out: beyond the 15 y standback ring but inside spell range
+        // → Cast wins over MoveTo.
+        let arena = arena_with(&[view(1, 0.0, 0.0, 3, true), view(10, 18.0, 0.0, 2, true)]);
+        let v = owner_view(true, true, Some(10), Some(10));
+        assert_eq!(
+            c.tick(100, v, &arena),
+            ControllerDecision::Cast {
+                target_actor_id: 10
+            }
+        );
+        // Recast armed → movement decision resumes: close to the 15 y ring.
+        c.battle.next_cast_ms = u64::MAX;
+        match c.tick(200, v, &arena) {
+            ControllerDecision::MoveTo { position } => {
+                assert!((position.x - 3.0).abs() < 1e-3, "got x={}", position.x);
+            }
+            other => panic!("expected MoveTo, got {other:?}"),
+        }
+        // Inside the ring with recast pending → face only.
+        let arena_close = arena_with(&[view(1, 0.0, 0.0, 3, true), view(10, 10.0, 0.0, 2, true)]);
+        assert!(matches!(
+            c.tick(300, v, &arena_close),
+            ControllerDecision::FaceTarget { .. }
+        ));
     }
 
     #[test]

@@ -152,6 +152,22 @@ pub struct ActiveContentScript {
     /// Script name (e.g. `"SimpleContent30010"`); resolves to
     /// `scripts/lua/content/<name>.lua`.
     pub content_script: String,
+    /// `false` between `CreateContentArea` and the completion of the
+    /// `DoZoneChangeContent` warp bundle. During this pre-warp window the
+    /// content NPCs spawned by the script's `onCreate` exist server-side
+    /// but have deliberately NOT been `AddActor`'d to the client (the
+    /// pre-kick packet window must stay byte-clean — pmeteor's reference
+    /// capture shows zero actor packets there), so per-actor broadcasts
+    /// for roster members (e.g. the `ChangeState(2)` poses) are
+    /// suppressed until the warp bundle has spawned them client-side.
+    pub warp_complete: bool,
+    /// Every actor id materialised by this content's spawn appliers
+    /// (`SpawnBattleNpcById` + `SpawnActor`) while the script was
+    /// active. The `ContentFinished` teardown despawns these — the
+    /// director roster alone misses actors the script spawned but
+    /// never `AddMember`'d (SEQ_005's `openingstoper` event trigger).
+    /// (#28 S1.3.)
+    pub spawned_actor_ids: Vec<u32>,
 }
 
 /// Runtime-only snapshot of an in-world retainer. Holds the minimal

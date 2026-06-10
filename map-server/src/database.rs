@@ -4436,7 +4436,10 @@ mod battle_npc_spawn_tests {
     /// `load_battle_npc_spawn` joins the four `server_battlenpc_*`
     /// tables and returns the row for the requested `bnpc_id`. Seed
     /// data for `bnpcId=6` is yda (groupId=3, poolId=3,
-    /// actorClassId=2290005, scriptName='yda', allegiance=1, zoneId=166).
+    /// scriptName='yda', allegiance=1, zoneId=166). Migration 052
+    /// corrects pool 3's actorClassId to 2290006 —
+    /// FighterAllyOpeningAttacker, the class whose displayNameId
+    /// renders "Yda" (#28 S0.4; the seed shipped pools 3/4 crossed).
     #[tokio::test]
     async fn load_battle_npc_spawn_yda() {
         let path = tempdb("yda");
@@ -4449,7 +4452,7 @@ mod battle_npc_spawn_tests {
         assert_eq!(row.bnpc_id, 6);
         assert_eq!(row.group_id, 3);
         assert_eq!(row.pool_id, 3);
-        assert_eq!(row.actor_class_id, 2_290_005);
+        assert_eq!(row.actor_class_id, 2_290_006);
         assert_eq!(row.script_name, "yda");
         assert_eq!(row.allegiance, 1, "yda is an ally (Player allegiance)");
         assert_eq!(row.zone_id, 166, "yda spawns in Black Shroud Forest");
@@ -4471,6 +4474,29 @@ mod battle_npc_spawn_tests {
             !row.kindred_name.is_empty(),
             "kindred_name should land from the genus join"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `bnpcId=7` is papalymo (groupId=4, poolId=4). Migration 052
+    /// corrects pool 4's actorClassId to 2290005 —
+    /// FighterAllyOpeningHealer, displayNameId "Papalymo" — while the
+    /// pool's `currentJob` stays 22 (THM): caster classification must
+    /// key on the job, never the actorClassId (#28 S0.4 risk note).
+    #[tokio::test]
+    async fn load_battle_npc_spawn_papalymo() {
+        let path = tempdb("papalymo");
+        let db = Database::open(&path).await.expect("open db");
+        let row = db
+            .load_battle_npc_spawn(7)
+            .await
+            .expect("query")
+            .expect("papalymo row");
+        assert_eq!(row.bnpc_id, 7);
+        assert_eq!(row.group_id, 4);
+        assert_eq!(row.pool_id, 4);
+        assert_eq!(row.actor_class_id, 2_290_005);
+        assert_eq!(row.script_name, "papalymo");
+        assert_eq!(row.current_job, 22, "papalymo stays the THM caster");
         let _ = std::fs::remove_file(&path);
     }
 

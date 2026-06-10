@@ -1181,6 +1181,10 @@ impl WorldManager {
         &self,
         registry: &ActorRegistry,
         db: &crate::database::Database,
+        // Battle-command catalog for hotbar `maxCommandRecastTime`
+        // resolution (#28 S3.1). `None` (Lua-less test harnesses) emits
+        // the hotbar with 0-second recast caps — slots still render.
+        catalogs: Option<&Arc<crate::lua::Catalogs>>,
         session_id: u32,
         spawn_type: u16,
     ) {
@@ -1229,6 +1233,7 @@ impl WorldManager {
             current_job,
             login_director_actor_id,
             active_quests,
+            hotbar,
         ) = {
             let c = actor_handle.character.read().await;
             // (slot, quest_actor_id) pairs for `playerWork.questScenario[N]`
@@ -1264,7 +1269,36 @@ impl WorldManager {
                 c.chara.current_job,
                 c.chara.login_director_actor_id,
                 aq,
+                c.chara.hotbar.clone(),
             )
+        };
+        // #28 S3.1 — resolve the equipped hotbar into the pre-masked
+        // `(slot0, command, maxRecast, recastEnd)` tuples the `/_init`
+        // dump emits. Lobby creation stores RAW command ids, the equip
+        // appliers store masked — `| 0xA0F00000` normalises both
+        // (pmeteor `Database.LoadHotbar`). The recast cap comes from the
+        // battle-command catalog; an unresolvable id ships cap 0 (no
+        // spinner) rather than dropping the slot.
+        let hotbar_props: Vec<(u16, u32, u16, u32)> = {
+            let commands = catalogs.and_then(|c| c.battle_commands.read().ok());
+            hotbar
+                .iter()
+                .filter(|e| e.command_id & 0xFFFF != 0)
+                .map(|e| {
+                    let raw = (e.command_id & 0xFFFF) as u16;
+                    let max_recast_s = commands
+                        .as_ref()
+                        .and_then(|m| m.get(&raw))
+                        .map(|c| c.max_recast_time_seconds as u16)
+                        .unwrap_or(0);
+                    (
+                        e.hotbar_slot,
+                        e.command_id | 0xA0F0_0000,
+                        max_recast_s,
+                        e.recast_time,
+                    )
+                })
+                .collect()
         };
         let has_login_director = login_director_actor_id != 0;
         let login_director_spec = session.login_director.clone();
@@ -1281,7 +1315,7 @@ impl WorldManager {
                 c.chara.gc_rank_uldah,
             )
         };
-        let (zone_actor_id, mut region_id, bgm_day, zone_name, zone_class_path, zone_class_name) = {
+        let (zone_actor_id, region_id, bgm_day, zone_name, zone_class_path, zone_class_name) = {
             let z = zone_arc.read().await;
             (
                 z.core.actor_id,
@@ -1293,49 +1327,25 @@ impl WorldManager {
             )
         };
 
-        // SEQ-005 content-warp — instance-region encoding (THE FIX).
+        // SEQ-005 content-warp — ship the UNMODIFIED parent region.
         //
-        // A `DoZoneChangeContent` keeps the player in the parent zone's
-        // geometry (here fst0Battle03 / region 106), but the 1.x client only
-        // COMPLETES a zone-in (echoes 0x0007, clears "Now Loading", then runs
-        // the director event) when the SetMap region differs from the
-        // currently-loaded region. Same-region = early-return in the SetMap
-        // handler (ZoneClient_handleMapOpcode_SetMap0x05_reloadDecision @
-        // 0x59ced0) = no reload = infinite "Now Loading".
-        //
-        // Key insight from the reload executor (FUN_0059e3c0, confirmed at
-        // runtime): the reload DECISION compares the full 32-bit region
-        // against [+0x94], but the geometry/scene key uses only the LOW 16
-        // BITS of the region:
-        //     scene_key = (uint16)region | (layout << 16)
-        // So setting the high 16 bits of the region makes it differ from the
-        // parent (106) — triggering the reload + full completion — while the
-        // low 16 bits (106) still select the correct fst0Battle geometry.
-        // This is exactly how a content INSTANCE differs from its public
-        // parent: same low-16 region (geometry), distinct high-16 (instance).
-        //
-        // The diagnostic with region=105 proved (a) a region change makes the
-        // warp complete (cinematic played, quest advanced) and (b) geometry
-        // is keyed by the region's low 16 bits (105 -> Mor Dhona). Encoding
-        // 106 | 0x10000 keeps the geometry (low-16 = 106) and forces the
-        // reload (full = 0x1006A != 106). `zone_actor_id`/name/class are left
-        // at the parent's (the d4a1fd1 override to the content master
-        // 0x65340002 fed a non-zone id and is intentionally dropped).
-        const CONTENT_INSTANCE_REGION_TAG: u32 = 0x0001_0000;
-        if let Some(active) = session.active_content_script.as_ref()
-            && session.current_zone_id == active.parent_zone_id
-        {
-            let parent_region = region_id;
-            region_id = (parent_region & 0xFFFF) | CONTENT_INSTANCE_REGION_TAG;
-            tracing::info!(
-                session = session_id,
-                area = %active.area_name,
-                parent_region,
-                instance_region = format!("0x{:X}", region_id),
-                zone_actor_id = format!("0x{:08X}", zone_actor_id),
-                "send_zone_in_bundle: content warp — instance-region encoding (low16=geometry, high16=instance)",
-            );
-        }
+        // History: a same-zone `DoZoneChangeContent` (man0g01 stays in
+        // fst0Battle03 / region 106) used to hang at "Now Loading", and a
+        // high-16 "instance region" tag (106 | 0x10000) was added here to
+        // force the client's scene reload via the SetMap handler's
+        // region-mismatch arm (FUN_0059ced0: reload iff force-latch [+0xbc]
+        // != 0 OR region != resident [+0x94]). The tag worked around the real
+        // defect — the DeleteAllActors + 0x00E2 pair preceding this bundle
+        // was sent untagged (`target_id == 0`) and silently dropped by the
+        // world-server proxy fan-out, so the 0x00E2 that sets the client's
+        // force-reload latch never arrived. With the pair now delivered
+        // (see `apply_do_zone_change_content`), the latch arm fires and the
+        // plain same-value region reloads exactly like pmeteor's reference
+        // capture (whose u16 RegionId could never carry a tag in the first
+        // place). The tag itself was harmful: the reload executor
+        // (FUN_0059e3c0) commits the FULL u32 into the client's resident
+        // region [+0x94], so 0x1006A left the client registered in a region
+        // that doesn't exist. (Garlemald-Server #28.)
 
         // The "script-bind" for the player — mirrors
         // `Map Server/Actors/Chara/Player/Player.cs` `CreateScriptBindPacket`
@@ -1587,6 +1597,7 @@ impl WorldManager {
             initial_town,
             rest_bonus_exp_rate,
             &active_quests,
+            &hotbar_props,
         ));
         // Post-init property emission — C# `PostUpdate` drives these on
         // the first tick after spawn, but the client's

@@ -107,6 +107,7 @@ mod integration_tests {
             is_close_to_spawn: true,
             target_is_locked: false,
             attack_delay_ms: 2500,
+            attack_range: 3.0,
         }
     }
 

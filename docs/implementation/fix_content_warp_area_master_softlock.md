@@ -1,5 +1,18 @@
 # Content warp "Now Loading" hang — present the private-area master so the client re-bootstraps the zone-in
 
+> **SUPERSEDED (2026-06-09, issue #28 RCA).** The root-cause theory below
+> (client keys the re-bootstrap off the SetMap `zone_actor_id`) was
+> refuted by the decompiled client: `[MapElem+0x98]` (where the zone
+> actor id lands) is written unconditionally and never compared — it
+> cannot trigger a reload. The actual root cause of the same-zone hang:
+> the `DeleteAllActors` + `0x00E2` pair was sent with `target_id == 0`
+> and silently dropped by the world-server proxy, so the client's
+> force-reload latch (`[MapElem+0xbc]`, set by the 0x00E2 receiver) never
+> armed and a same-region SetMap took the no-op arm. See
+> `captures/issue28-rca/06-synthesis.md` (workspace root) and the
+> comments in `apply_do_zone_change_content` (processor.rs) +
+> `send_zone_in_bundle` (world_manager.rs). Kept for history.
+
 ## Symptom
 
 After the `GetQuest` quest-id fix, the Gridania tutorial advances until
