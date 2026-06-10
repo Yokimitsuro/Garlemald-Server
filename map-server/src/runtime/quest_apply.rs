@@ -203,6 +203,28 @@ pub async fn apply_runtime_lua_command(
             apply_set_quest_complete(player_id, quest_id, flag, registry, db).await;
             true
         }
+        // `GetWorldManager():DoPlayerMoveInZone(...)` / `WarpToPosition`
+        // from a quest/NPC hook. The login pipeline handles this command
+        // in `PacketProcessor::apply_login_lua_command`, but the quest
+        // drain (chat-resume `apply_event_script_commands` → here) had
+        // NO arm — so man0u0's `onPush(EXIT_TRIGGER)` bounce and the
+        // OpeningStoper "exit" bounce played their dialogue and then
+        // silently dropped the move, letting the player walk out of the
+        // Ul'dah opening zone (issue #26 retest).
+        LC::WarpToPosition {
+            actor_id,
+            x,
+            y,
+            z,
+            rotation,
+            spawn_type,
+        } => {
+            apply_warp_to_position_runtime(
+                actor_id, x, y, z, rotation, spawn_type, registry, world,
+            )
+            .await;
+            true
+        }
         LC::AddExp {
             actor_id,
             class_id,
@@ -3784,6 +3806,74 @@ pub(crate) async fn broadcast_quest_enpc_update(
         crate::packets::send::build_set_actor_quest_graphic(npc_actor_id, enpc.quest_flag_type);
     graphic.set_target_id(player_id);
     client.send_bytes(graphic.to_bytes()).await;
+}
+
+/// Same-zone teleport for the quest-drain pipeline. Mirrors
+/// `PacketProcessor::apply_warp_to_position` (the login-pipeline arm,
+/// live-verified by the SEQ_005 content warp): mutate the pose, refresh
+/// the session destination, emit a target-stamped `SetActorPosition`.
+/// Used by the `LC::WarpToPosition` arm above — quest `onPush` bounce
+/// paths (`DoPlayerMoveInZone`) ride this.
+pub(crate) async fn apply_warp_to_position_runtime(
+    actor_id: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+    rotation: f32,
+    spawn_type: u8,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(actor = actor_id, "WarpToPosition: actor not in registry");
+        return;
+    };
+    let session_id = handle.session_id;
+    {
+        let mut c = handle.character.write().await;
+        c.base.position_x = x;
+        c.base.position_y = y;
+        c.base.position_z = z;
+        c.base.rotation = rotation;
+    }
+    if let Some(mut session) = world.session(session_id).await {
+        session.destination_x = x;
+        session.destination_y = y;
+        session.destination_z = z;
+        session.destination_rot = rotation;
+        session.destination_spawn_type = spawn_type;
+        world.upsert_session(session).await;
+    }
+    if let Some(client) = world.client(session_id).await {
+        let mut pkt = crate::packets::send::build_set_actor_position(
+            actor_id,
+            actor_id as i32,
+            x,
+            y,
+            z,
+            rotation,
+            spawn_type.into(),
+            false,
+        );
+        // Untargeted subpackets are dropped by the world-server proxy
+        // fan-out (Garlemald-Server #28).
+        pkt.set_target_id(session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+        tracing::info!(
+            actor = actor_id,
+            x,
+            y,
+            z,
+            rotation,
+            spawn_type,
+            "WarpToPosition (quest drain) applied + SetActorPosition emitted"
+        );
+    } else {
+        tracing::debug!(
+            actor = actor_id,
+            "WarpToPosition (quest drain): no client handle — pose updated, no packet"
+        );
+    }
 }
 
 /// Graphic-only variant of [`broadcast_quest_enpc_update`] — re-emits the
