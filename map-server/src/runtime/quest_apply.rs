@@ -225,6 +225,16 @@ pub async fn apply_runtime_lua_command(
             .await;
             true
         }
+        // `player:SendGameMessage(...)` from a quest/NPC hook — e.g. the
+        // opening stoppers' "caution" circle (text 34109 "off limits").
+        LC::SendGameMessage {
+            actor_id,
+            text_id,
+            log_type,
+        } => {
+            apply_send_game_message(actor_id, text_id, log_type, registry, world).await;
+            true
+        }
         LC::AddExp {
             actor_id,
             class_id,
@@ -3812,6 +3822,42 @@ pub(crate) async fn broadcast_quest_enpc_update(
 /// `PacketProcessor::apply_warp_to_position` (the login-pipeline arm,
 /// live-verified by the SEQ_005 content warp): mutate the pose, refresh
 /// the session destination, emit a target-stamped `SetActorPosition`.
+/// `player:SendGameMessage(...)` — emit the localized text-sheet line
+/// (Meteor `GameMessagePacket` 0x157 "with actor ×1", WorldMaster as
+/// the text owner) to the player's client, target-stamped for the
+/// world relay. Mirrors `Player.SendGameMessage(sourceActor,
+/// textIdOwner, textId, log)`.
+pub(crate) async fn apply_send_game_message(
+    actor_id: u32,
+    text_id: u32,
+    log_type: u8,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let mut sub = crate::packets::send::build_game_message_actor1(
+        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        actor_id,
+        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        text_id.min(u16::MAX as u32) as u16,
+        log_type,
+    );
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        actor = actor_id,
+        text_id,
+        log = format!("0x{log_type:02X}"),
+        "SendGameMessage emitted",
+    );
+}
+
 /// Used by the `LC::WarpToPosition` arm above — quest `onPush` bounce
 /// paths (`DoPlayerMoveInZone`) ride this.
 pub(crate) async fn apply_warp_to_position_runtime(
