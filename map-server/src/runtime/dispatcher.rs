@@ -218,26 +218,17 @@ pub async fn dispatch_battle_event(
                 0,
             );
             broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
-            // State trio back to passive — unless the actor is dead (the
-            // death path owns its own DEAD-state trio; overwriting it
-            // here would stand the corpse back up client-side).
-            let is_dead = match registry.get(*owner_actor_id).await {
-                Some(h) => {
-                    h.character.read().await.base.current_main_state
-                        == crate::actor::MAIN_STATE_DEAD
-                }
-                None => true,
-            };
-            if !is_dead {
-                emit_change_state_trio(
-                    *owner_actor_id,
-                    crate::actor::MAIN_STATE_PASSIVE,
-                    registry,
-                    world,
-                    zone,
-                )
-                .await;
-            }
+            // State trio back to passive. The helper's corpse guard
+            // keeps a dead actor dead (the death path owns the DEAD
+            // trio; overwriting it would stand the corpse back up).
+            emit_change_state_trio(
+                *owner_actor_id,
+                crate::actor::MAIN_STATE_PASSIVE,
+                registry,
+                world,
+                zone,
+            )
+            .await;
             // 0x00DE ResetHead — stop the mob's head from continuing
             // to track the player's last position. Captured retail
             // pairs this with the gem clear at disengage. Project
@@ -1724,8 +1715,40 @@ pub(crate) async fn emit_change_state_trio(
     };
     {
         let mut c = handle.character.write().await;
+        // A corpse must stay a corpse: a stale Engage/Disengage event
+        // racing a death would otherwise stand the actor back up
+        // client-side. Revival transitions out of DEAD via
+        // `apply_revive`, which doesn't route through this helper.
+        if c.base.current_main_state == crate::actor::MAIN_STATE_DEAD
+            && main_state != crate::actor::MAIN_STATE_DEAD
+        {
+            return;
+        }
         c.base.current_main_state = main_state;
         c.chara.new_main_state = main_state;
+    }
+    // Pre-warp content NPCs: keep the stored-state mutation, suppress
+    // the wire broadcast — the client hasn't been sent those actors yet
+    // (their spawn fan-out is deferred to the zone-in bundle, which
+    // replays the stored state). Engages can't normally fire pre-warp
+    // (the content script's battleStarted latch needs an engaged
+    // player), so on those paths this is belt-and-braces parity with
+    // the Lua ChangeState path that has always enforced it.
+    for snap in world.all_sessions().await {
+        if let Some(active) = snap.active_content_script.as_ref()
+            && !active.warp_complete
+            && snap
+                .transient_director_members
+                .get(&active.director_actor_id)
+                .is_some_and(|roster| roster.contains(&actor_id))
+        {
+            tracing::debug!(
+                actor = format!("0x{actor_id:08X}"),
+                main_state,
+                "state trio stored; broadcast suppressed (pre-warp content roster)",
+            );
+            return;
+        }
     }
     let state_sub = tx::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
     let x00 = tx::actor_battle::build_command_result_x00(actor_id, 0x7200_0062, 0);
@@ -1744,7 +1767,13 @@ pub(crate) async fn emit_change_state_trio(
     bytes.extend(x00.to_bytes());
     bytes.extend(x01.to_bytes());
     send_to_self_if_player(registry, world, actor_id, bytes.clone()).await;
-    broadcast_around_actor(world, registry, zone, actor_id, bytes).await;
+    let recipients = broadcast_around_actor(world, registry, zone, actor_id, bytes).await;
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        main_state,
+        recipients,
+        "state trio applied (0x134 + X00/X01)",
+    );
 }
 
 pub(crate) async fn die_if_defender_fell(

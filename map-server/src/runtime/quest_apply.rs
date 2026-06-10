@@ -678,38 +678,6 @@ async fn apply_change_state(
         );
         return;
     };
-    // 1. Update the actor's stored main_state so subsequent reads see it.
-    {
-        let mut c = handle.character.write().await;
-        c.base.current_main_state = main_state;
-    }
-    // 1b. Pre-warp content NPCs: suppress the wire broadcast (keep the
-    //     stored-state mutation above). `SimpleContent30010.lua::onCreate`
-    //     fires `ChangeState(2)` on the tutorial roster BEFORE the
-    //     `DoZoneChangeContent` warp, while the client has not been sent
-    //     those actors (their AddActor fan-out is deliberately skipped to
-    //     keep the pre-kick window byte-clean — pmeteor's reference
-    //     capture shows ZERO actor packets there). The post-warp zone-in
-    //     bundle re-emits SetActorState from the stored value, so nothing
-    //     is lost; mid-fight state changes happen post-warp and broadcast
-    //     normally. (Garlemald-Server #28.)
-    for snap in world.all_sessions().await {
-        if let Some(active) = snap.active_content_script.as_ref()
-            && !active.warp_complete
-            && snap
-                .transient_director_members
-                .get(&active.director_actor_id)
-                .is_some_and(|roster| roster.contains(&actor_id))
-        {
-            tracing::debug!(
-                actor = format!("0x{actor_id:08X}"),
-                main_state,
-                "ChangeState stored; broadcast suppressed (pre-warp content roster)",
-            );
-            return;
-        }
-    }
-    // 2. Broadcast 0x0134 SetActorState (main_state | sub_state<<8).
     let Some(zone_arc) = world.zone(handle.zone_id).await else {
         tracing::debug!(
             actor = format!("0x{actor_id:08X}"),
@@ -721,49 +689,15 @@ async fn apply_change_state(
     // pmeteor's State-flag flush (Character.cs PostUpdate:411-419) ships a
     // TRIO, not just the 0x0134: SetActorState + CommandResultX00 (anim
     // 0x72000062) + CommandResultX01 (anim 0x7C000062, command 21001
-    // Activate, one self-hit `CommandResult(Id, 0, 1)`). The 1.x client
-    // plays the draw-/sheathe-weapon animation off the X00/X01 battle
-    // actions — a bare 0x0134 changes the logical state but the model
-    // never draws (the SEQ_005 live test: state toggled 2->0->2 with no
-    // visible weapon). Byte-verified against pmeteor's capture at its
-    // tutorial F-press (map-packets.log:38247ff: 0x134 + 0x13C + 0x139).
-    // (Garlemald-Server #28.)
-    let state_sub =
-        crate::packets::send::actor::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
-    let x00 =
-        crate::packets::send::actor_battle::build_command_result_x00(actor_id, 0x7200_0062, 0);
-    let x01 = crate::packets::send::actor_battle::build_command_result_x01(
-        actor_id,
-        0x7C00_0062,
-        21001,
-        &crate::packets::send::actor_battle::CommandResult {
-            target_id: actor_id,
-            hit_num: 1,
-            hit_effect: 1,
-            ..Default::default()
-        },
-    );
-    let mut bytes = state_sub.to_bytes();
-    bytes.extend(x00.to_bytes());
-    bytes.extend(x01.to_bytes());
-    // Send to the actor's OWN client first when it's a player —
-    // `broadcast_around_actor`'s `actors_around` excludes the source, so
-    // a player's own state change (the F-press Engage drawing the
-    // weapon) otherwise never reaches their client (`recipients=0` in
-    // the SEQ_005 live test). Mirrors `apply_die` / `apply_revive`.
-    // (Garlemald-Server #28.)
-    crate::runtime::dispatcher::send_to_self_if_player(registry, world, actor_id, bytes.clone())
-        .await;
-    let recipients = crate::runtime::broadcast::broadcast_around_actor(
-        world, registry, &zone_arc, actor_id, bytes,
+    // Activate, one self-hit). The 1.x client plays the draw-/sheathe-
+    // weapon animation (and arms per-actor combat presentation) off the
+    // X00/X01 battle actions — a bare 0x0134 changes the logical state
+    // invisibly. The shared helper owns the byte shape, the pre-warp
+    // content-roster suppression, and the corpse guard. (Garlemald #28.)
+    crate::runtime::dispatcher::emit_change_state_trio(
+        actor_id, main_state, registry, world, &zone_arc,
     )
     .await;
-    tracing::debug!(
-        actor = format!("0x{actor_id:08X}"),
-        main_state,
-        recipients,
-        "ChangeState applied (0x134 + draw-anim X00/X01 trio)",
-    );
 }
 
 /// `director:AddMember(actor)` — populates the director's transient
@@ -3783,19 +3717,28 @@ pub(crate) async fn broadcast_quest_enpc_update(
     let Some(client) = world.client(session_id).await else {
         return;
     };
-    // Resolve the player's CURRENT zone from the session — the
-    // ActorHandle's zone_id is frozen at registration (`reassign_zone`
-    // has no production callers), so after the man0g0 zone-166 → 155
-    // warp the handle still says 166 and the SEQ_010 quest NPCs spawned
-    // into 155 would never resolve. Pre-warp call sites read the same
-    // zone either way. (Garlemald-Server #28, req 4.)
-    let zone_id = world
-        .session(session_id)
-        .await
-        .map(|s| s.current_zone_id)
-        .filter(|z| *z != 0)
-        .unwrap_or(player_handle.zone_id);
-    let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
+    // Resolve the player's CURRENT zone + private-area routing from the
+    // session — the ActorHandle's zone_id is frozen at registration
+    // (`reassign_zone` has no production callers), so after the man0g0
+    // zone-166 → 155 warp the handle still says 166 and the SEQ_010
+    // quest NPCs spawned into 155 would never resolve. Pre-warp call
+    // sites read the same zone either way. (Garlemald-Server #28, req 4.)
+    let (zone_id, requester_area) = match world.session(session_id).await {
+        Some(s) if s.current_zone_id != 0 => (
+            s.current_zone_id,
+            s.current_private_area_name
+                .clone()
+                .map(|n| (n, s.current_private_area_level)),
+        ),
+        _ => (player_handle.zone_id, None),
+    };
+    let Some(npc_handle) = find_npc_by_class_id(
+        registry,
+        zone_id,
+        enpc.actor_class_id,
+        requester_area.as_ref(),
+    )
+    .await
     else {
         tracing::debug!(
             player = player_id,
@@ -3850,14 +3793,23 @@ async fn broadcast_quest_enpc_clear(
     let Some(client) = world.client(session_id).await else {
         return;
     };
-    // Session-resolved zone (see broadcast_quest_enpc_update above).
-    let zone_id = world
-        .session(session_id)
-        .await
-        .map(|s| s.current_zone_id)
-        .filter(|z| *z != 0)
-        .unwrap_or(player_handle.zone_id);
-    let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
+    // Session-resolved zone + area (see broadcast_quest_enpc_update).
+    let (zone_id, requester_area) = match world.session(session_id).await {
+        Some(s) if s.current_zone_id != 0 => (
+            s.current_zone_id,
+            s.current_private_area_name
+                .clone()
+                .map(|n| (n, s.current_private_area_level)),
+        ),
+        _ => (player_handle.zone_id, None),
+    };
+    let Some(npc_handle) = find_npc_by_class_id(
+        registry,
+        zone_id,
+        enpc.actor_class_id,
+        requester_area.as_ref(),
+    )
+    .await
     else {
         return;
     };
@@ -3884,22 +3836,40 @@ async fn broadcast_quest_enpc_clear(
     client.send_bytes(graphic.to_bytes()).await;
 }
 
+/// Resolve a quest ENPC by actor class id within a zone, preferring the
+/// copy whose private-area pool matches the requesting player's routing.
+/// Several city NPCs are seeded both at the zone root and inside a
+/// `PrivateAreaMasterPast` phase under the same class id (Baderon,
+/// Momodi, Miounne, …) — without the area preference this pick was
+/// HashMap-iteration-order nondeterministic, and a broadcast bound to
+/// the copy the client never spawned is silently dropped. Falls back to
+/// a zone-root copy when the player's area has none (private-area player
+/// whose quest NPC only exists at the root). (Garlemald-Server #28.)
 async fn find_npc_by_class_id(
     registry: &ActorRegistry,
     zone_id: u32,
     class_id: u32,
+    requester_area: Option<&(String, u32)>,
 ) -> Option<ActorHandle> {
     let actors = registry.actors_in_zone(zone_id).await;
+    let mut root_match: Option<ActorHandle> = None;
     for h in actors {
         let matches = {
             let c = h.character.read().await;
             c.chara.actor_class_id == class_id
         };
-        if matches {
-            return Some(h);
+        if !matches {
+            continue;
+        }
+        match (&h.private_area, requester_area) {
+            (Some(npc_area), Some(req)) if npc_area.as_ref() == req => return Some(h),
+            (None, None) => return Some(h),
+            // Root copy — keep as fallback for a private-area player.
+            (None, Some(_)) if root_match.is_none() => root_match = Some(h),
+            _ => {}
         }
     }
-    None
+    root_match
 }
 
 // ---------------------------------------------------------------------------
