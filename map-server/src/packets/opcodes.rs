@@ -357,7 +357,12 @@ pub const OP_BATTLE_ACTION_X18: u16 = 0x013B;
 // ---------------------------------------------------------------------------
 // Chat / system messages
 // ---------------------------------------------------------------------------
-pub const OP_SEND_MESSAGE: u16 = 0x00CA;
+/// Meteor `SendMessagePacket.cs` — opcode 0x0003 in BOTH directions
+/// (the client's outgoing chat arrives as `OP_RX_CHAT_MESSAGE`, same
+/// value, distinguished by direction). The earlier port used 0x00CA
+/// here; the live 1.23b client receives that frame and silently drops
+/// it — chat lines never rendered (verified via packet logs, issue #10).
+pub const OP_SEND_MESSAGE: u16 = 0x0003;
 pub const OP_GAME_MESSAGE: u16 = 0x01FD;
 
 // ---------------------------------------------------------------------------

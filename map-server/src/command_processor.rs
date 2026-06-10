@@ -639,23 +639,27 @@ impl CommandProcessor {
             session.destination_spawn_type = 2; // retail "warp by gm" code
             self.world.upsert_session(session).await;
         }
-        // Same-zone warp: emit a SetActorPosition packet so the client
-        // actually moves. Cross-zone warp needs a full DoZoneChange
-        // flow the caller can drive by logging out + logging back in.
-        // `spawn_type=2` matches the retail "warp-by-GM" spawn code;
-        // `is_zoning_player=false` because we're not going through the
-        // loading screen. (Cross-zone variant left as a follow-up.)
+        // Same-zone warp — Meteor `WorldManager.DoPlayerMoveInZone`:
+        // a 0xE2 signal (0x10) followed by `CreateSpawnTeleportPacket`,
+        // which is SetActorPosition with the embedded actor id set to
+        // 0xFFFFFFFF ("self") — NOT the player's id; the client ignores
+        // the move otherwise. `warp.lua` passes spawn type 0x00
+        // (SPAWNTYPE_FADEIN) on this path. Cross-zone warp needs a full
+        // DoZoneChange flow the caller can drive by logging out +
+        // logging back in (left as a follow-up).
         if current_zone_id == zone_id
             && let Some(client) = self.world.client(session_id).await
         {
+            let e2 = crate::packets::send::build_0xe2(actor_id, 0x10);
+            client.send_bytes(e2.to_bytes()).await;
             let pkt = crate::packets::send::build_set_actor_position(
                 actor_id,
-                actor_id as i32,
+                -1,
                 x,
                 y,
                 z,
                 rotation,
-                2,
+                0,
                 false,
             );
             client.send_bytes(pkt.to_bytes()).await;

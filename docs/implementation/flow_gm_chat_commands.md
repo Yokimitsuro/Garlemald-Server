@@ -66,6 +66,35 @@ What was still missing vs the issue's acceptance criteria:
 - `map-server/src/processor.rs` — chat `!` branch: invoker threading +
   ChatSystemToPlayer feedback.
 
+## Round 2 — live-client test found two wire-format bugs
+
+First in-game test (2026-06-10, live 1.23b client): commands executed
+server-side (`command result response=gave 1000 gil to Prueba Test`)
+but nothing rendered in the client and `!warp x y z` didn't move the
+actor. Packet logs proved both frames reached the client (world-server
+forwarded them verbatim), so the client was *dropping* them:
+
+1. **SendMessage used a wrong opcode + ad-hoc layout.** The port sent
+   opcode 0x00CA with `{u64 0, u32 0, u8 type, pad, sender[0x20],
+   text, nul}`. Meteor's `SendMessagePacket.cs` is opcode **0x0003**
+   (same value both directions — client chat already arrives at
+   0x0003), fixed 0x228 body: `sender[0x20]` + `u32 type` + `text[0x200]`.
+   Fixed `build_send_message` + `OP_SEND_MESSAGE` accordingly; added a
+   layout test (`send_message_matches_meteor_layout`).
+2. **Same-zone warp sent the wrong move sequence.** Meteor
+   `WorldManager.DoPlayerMoveInZone` = `_0xE2Packet(actor, 0x10)` +
+   `CreateSpawnTeleportPacket(spawnType)` where the SetActorPosition
+   embeds actor id **0xFFFFFFFF** ("self"), not the player's id, and
+   `warp.lua` uses spawn type 0x00. The port sent a single
+   SetActorPosition with the player's id + spawn type 2. Fixed
+   `handle_warp` to emit the 0xE2(0x10) + SetActorPosition(-1, …, 0)
+   pair.
+
+`build_send_message_public` (0x0003, "login greeting") still writes
+`u32 type` *before* the sender — opposite of Meteor's layout — and is
+likely invisible client-side for the same reason. Not touched here
+(separate work unit).
+
 ## Unknowns left
 
 - `is_gm` gating: the login snapshot hardcodes `is_gm: false`
@@ -75,8 +104,6 @@ What was still missing vs the issue's acceptance criteria:
   acceptance criteria that the testing account is not rejected), but a
   real deployment needs a `characters`/account GM flag checked in the
   chat branch before dispatch.
-- Same-zone move spawn code (2 vs Meteor's 0x00) — verify against the
-  client whether the camera/fade behavior differs.
 
 ## Validation performed
 

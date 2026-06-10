@@ -551,7 +551,15 @@ fn build_text_sheet_dispid_n(
     SubPacket::new(opcode, receiver_actor_id, data)
 }
 
-/// 0x00CA SendMessagePacket — the general chat relay.
+/// 0x0003 SendMessagePacket — one chat-log line in the receiving
+/// client. Wire layout from Meteor `SendMessagePacket.cs`
+/// (PACKET_SIZE 0x248 → 0x228 body):
+///   +0x00  sender name, ASCII, fixed 0x20 slot
+///   +0x20  u32 message type (1 say … 0x20 system, 0x21 system error)
+///   +0x24  message text, ASCII, max 0x200, zero-padded
+///
+/// The earlier port sent opcode 0x00CA with an ad-hoc layout; the
+/// 1.23b client drops that frame without rendering (issue #10).
 pub fn build_send_message(
     source_session: u32,
     target_session: u32,
@@ -559,16 +567,15 @@ pub fn build_send_message(
     sender_name: &str,
     message: &str,
 ) -> SubPacket {
-    let mut body = Vec::<u8>::with_capacity(0x40 + message.len());
-    body.write_u64::<LittleEndian>(0).unwrap();
-    body.write_u32::<LittleEndian>(0).unwrap();
-    body.write_u8(message_type).unwrap();
-    body.write_u8(0).unwrap();
-    body.write_u16::<LittleEndian>(0).unwrap();
-    write_padded_ascii(&mut body, sender_name, 0x20);
-    body.write_all(message.as_bytes()).unwrap();
-    body.write_u8(0).unwrap();
-    let mut sub = SubPacket::new(OP_SEND_MESSAGE, source_session, body);
+    let mut data = body(0x248);
+    let sender = sender_name.as_bytes();
+    let n = sender.len().min(0x20);
+    data[..n].copy_from_slice(&sender[..n]);
+    data[0x20..0x24].copy_from_slice(&u32::from(message_type).to_le_bytes());
+    let msg = message.as_bytes();
+    let m = msg.len().min(0x200);
+    data[0x24..0x24 + m].copy_from_slice(&msg[..m]);
+    let mut sub = SubPacket::new(OP_SEND_MESSAGE, source_session, data);
     sub.set_target_id(target_session);
     sub
 }
@@ -590,6 +597,21 @@ pub fn build_send_message_public(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Meteor `SendMessagePacket.cs` layout: sender in a 0x20 ASCII
+    /// slot, u32 message type at 0x20, text from 0x24, fixed 0x228
+    /// body, opcode 0x0003.
+    #[test]
+    fn send_message_matches_meteor_layout() {
+        let pkt = build_send_message(2, 2, 0x20, "Sender", "hello");
+        assert_eq!(pkt.data.len(), 0x228);
+        assert_eq!(&pkt.data[..6], b"Sender");
+        assert!(pkt.data[6..0x20].iter().all(|b| *b == 0));
+        assert_eq!(&pkt.data[0x20..0x24], &[0x20, 0, 0, 0]);
+        assert_eq!(&pkt.data[0x24..0x29], b"hello");
+        assert!(pkt.data[0x29..].iter().all(|b| *b == 0));
+        assert_eq!(pkt.game_message.opcode, OP_SEND_MESSAGE);
+    }
 
     /// Reproduce the body bytes of `gather_wood.pcapng` 0x0166 record #1
     /// — sender = 0xA0F4E204 (gamedata static actor), text_id = 0x0024
