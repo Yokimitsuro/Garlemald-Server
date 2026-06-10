@@ -2273,22 +2273,31 @@ pub async fn apply_quest_update_enpcs(
         broadcast_quest_enpc_clear(player_id, enpc, registry, world).await;
     }
 
-    // Force-rebroadcast every ENPC currently active for this quest.
+    // Re-broadcast the quest GRAPHIC (head marker) of every ENPC
+    // currently active for this quest — but NOT the SetEventStatus
+    // overrides.
     //
-    // Why: `apply_quest_set_enpc` only emits a broadcast when `add_enpc`
-    // returns `New` or `Updated` — i.e. when the new flags differ from the
-    // previous sequence's. After a cinematic noticeEvent ack, re-running
-    // `onStateChange` typically computes the *same* flags as zone-in
-    // (e.g. man0g0 SEQ_000 with MINITUT0/MINITUT1 still false), so every
-    // SetEnpc returns `Unchanged` and no packets go out. The 1.x client
-    // appears to drop quest-graphic state across cinematic playback,
-    // though, so without a fresh broadcast Yda's `!` icon never reappears
-    // and the player thinks no NPC is interactable.
+    // Why the graphic: `apply_quest_set_enpc` only emits a broadcast
+    // when `add_enpc` returns `New` or `Updated`. After a cinematic
+    // noticeEvent ack, re-running `onStateChange` typically computes
+    // the *same* flags as zone-in (e.g. man0g0 SEQ_000 with
+    // MINITUT0/MINITUT1 still false), so every SetEnpc returns
+    // `Unchanged` and no packets go out — yet the 1.x client drops
+    // quest-graphic state across cinematic playback, so without a
+    // fresh graphic Yda's `!` icon never reappears.
     //
-    // Pmeteor's `QuestState.UpdateState()` re-emits unconditionally, so
-    // matching that here produces the same wire-level behaviour. The
-    // duplicate packet at zone-in (when no cinematic has played yet) is
-    // a tiny cost.
+    // Why NOT the statuses: pmeteor's `QuestState.AddENpc` is silent
+    // for unchanged entries — quest SetEventStatus overrides only go
+    // out for new/changed registrations, and entries dropped from the
+    // sequence get RESET to the actor's own per-condition defaults
+    // (`UpdateQuestNpcInInstance(enpc, clearInstance=true)` →
+    // `GetSetEventStatusPackets()` with `pushEnabled = null`).
+    // Re-emitting the overrides here permanently re-disabled the
+    // Ul'dah opening stopper's own "exit"/"caution" push circles —
+    // man0u0 registers it with `isPushEnabled=false` every sequence,
+    // so each UpdateENPCs run re-killed the conditions the spawn
+    // bundle's defaults had armed, and the player could walk straight
+    // out of the Merchant Strip (issue #26 retest).
     let active: Vec<QuestEnpc> = {
         let c = handle.character.read().await;
         c.quest_journal
@@ -2297,7 +2306,7 @@ pub async fn apply_quest_update_enpcs(
             .unwrap_or_default()
     };
     for enpc in active {
-        broadcast_quest_enpc_update(player_id, enpc, registry, world).await;
+        broadcast_quest_enpc_graphic(player_id, enpc, registry, world).await;
     }
 }
 
@@ -3771,6 +3780,47 @@ pub(crate) async fn broadcast_quest_enpc_update(
         sub.set_target_id(player_id);
         client.send_bytes(sub.to_bytes()).await;
     }
+    let mut graphic =
+        crate::packets::send::build_set_actor_quest_graphic(npc_actor_id, enpc.quest_flag_type);
+    graphic.set_target_id(player_id);
+    client.send_bytes(graphic.to_bytes()).await;
+}
+
+/// Graphic-only variant of [`broadcast_quest_enpc_update`] — re-emits the
+/// head-marker (`SetActorQuestGraphic`) WITHOUT the SetEventStatus
+/// overrides. Used by `apply_quest_update_enpcs`'s unchanged-entry
+/// refresh: pmeteor's `QuestState.AddENpc` sends nothing for unchanged
+/// registrations, so repeating the status overrides there diverges from
+/// the reference — concretely it kept re-disabling the Ul'dah opening
+/// stopper's own "exit"/"caution" push circles (registered with
+/// `isPushEnabled=false` every sequence), undoing the spawn bundle's
+/// per-condition defaults and letting the player walk out of the
+/// Merchant Strip.
+async fn broadcast_quest_enpc_graphic(
+    player_id: u32,
+    enpc: QuestEnpc,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(player_handle) = registry.get(player_id).await else {
+        return;
+    };
+    let session_id = player_handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let zone_id = player_handle.zone_id;
+    let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
+    else {
+        return;
+    };
+    let npc_actor_id = {
+        let c = npc_handle.character.read().await;
+        c.base.actor_id
+    };
     let mut graphic =
         crate::packets::send::build_set_actor_quest_graphic(npc_actor_id, enpc.quest_flag_type);
     graphic.set_target_id(player_id);

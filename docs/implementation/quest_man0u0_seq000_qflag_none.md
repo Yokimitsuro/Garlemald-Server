@@ -68,6 +68,36 @@ anywhere else.
   - flags == 0xF arms the exit (QFLAG_PUSH), push → SEQ_005.
   Red before the fix (Ascilia stuck at QFLAG_TALK), green after.
 
+## Round 2 — player can walk out of the Merchant Strip (SEQ_000)
+
+Live retest: SEQ_000 progressed (QFLAG fix confirmed) but the player
+could walk out of the opening area. Packet-log forensics (parsing the
+position stream against the trigger coordinates): the player crossed
+the `OPENING_STOPER_ULDAH` (1090373) "exit"/"caution" push circles at
+0.48 yalms **after** the intro cinematic's EndEvent, and the client
+fired no push EventStart at all. Two real gaps vs quest_system:
+
+1. **Missing base script** — quest_system ships
+   `base/chara/npc/object/OpeningStoperW0B1.lua` (the handler that
+   bounces the player via `DoPlayerMoveInZone` on "exit" and prints
+   message 34109 on "caution"); only the Gridania F0B1 had been
+   ported. Ported it (dispatcher-convention signature, like F0B1).
+2. **ENPC status semantics diverged from pmeteor.**
+   `QuestState.AddENpc` sends quest SetEventStatus overrides only for
+   NEW/CHANGED registrations and is silent for unchanged ones;
+   dropped entries are reset to the actor's own per-condition
+   defaults. Our `apply_quest_update_enpcs` force-rebroadcast was
+   re-sending the overrides for every active ENPC on every run —
+   man0u0 registers the stopper with `isPushEnabled=false`, so each
+   UpdateENPCs re-disabled the stopper's own "exit"/"caution" circles
+   that the spawn bundle's defaults had armed. The rebroadcast now
+   re-emits only the head-marker graphic (which is what the man0g0
+   cinematic marker-loss fix actually needed).
+
+Note: the "exit" bounce flows through `DoPlayerMoveInZone` →
+`WarpToPosition`, whose delivery is fixed by upstream PR #35
+(proxy-dropped warp packets). Testing needs a build with #35 merged.
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).
