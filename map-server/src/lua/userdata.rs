@@ -2535,23 +2535,64 @@ impl UserData for LuaPlayer {
             );
             Ok(())
         });
-        methods.add_method("ReplaceQuest", |_, this, (old_id, new_id): (u32, u32)| {
-            push(
-                &this.queue,
-                LuaCommand::AbandonQuest {
-                    player_id: this.snapshot.actor_id,
-                    quest_id: old_id,
-                },
-            );
-            push(
-                &this.queue,
-                LuaCommand::AddQuest {
-                    player_id: this.snapshot.actor_id,
-                    quest_id: new_id,
-                },
-            );
-            Ok(())
-        });
+        methods.add_method(
+            "ReplaceQuest",
+            |_, this, (old_q, new_q): (mlua::Value, mlua::Value)| {
+                // pmeteor scripts call `player:ReplaceQuest(quest, "Man0g1")`
+                // — a LuaQuestHandle for the outgoing quest plus the class
+                // NAME of the incoming one (man0g0.lua's PUSH_ADV_GUILD arm,
+                // the SEQ_010 → Man0g1 handoff). The previous `(u32, u32)`
+                // signature threw a conversion error at exactly that call,
+                // so the opener could never hand off to Souls Gone Wild.
+                // Accept handle/id/name on both sides. (Garlemald #28.)
+                fn resolve(v: &mlua::Value) -> u32 {
+                    match v {
+                        mlua::Value::Integer(i) => *i as u32,
+                        mlua::Value::Number(n) => *n as u32,
+                        mlua::Value::String(s) => {
+                            // Same class-name table as `GetQuest` above,
+                            // extended with the follow-up quests the openers
+                            // hand off to (gamedata_quests.id rows).
+                            match s.to_str().as_deref().unwrap_or("") {
+                                "Man0l0" => 110001,
+                                "Man0l1" => 110002,
+                                "Man0g0" => 110005,
+                                "Man0g1" => 110006,
+                                "Man0u0" => 110009,
+                                "Man0u1" => 110010,
+                                other => common::utils::murmur_hash2(other, 0),
+                            }
+                        }
+                        mlua::Value::UserData(ud) => ud
+                            .borrow::<LuaQuestHandle>()
+                            .map(|q| q.quest_id)
+                            .unwrap_or(0),
+                        _ => 0,
+                    }
+                }
+                let old_id = resolve(&old_q);
+                let new_id = resolve(&new_q);
+                if old_id != 0 {
+                    push(
+                        &this.queue,
+                        LuaCommand::AbandonQuest {
+                            player_id: this.snapshot.actor_id,
+                            quest_id: old_id,
+                        },
+                    );
+                }
+                if new_id != 0 {
+                    push(
+                        &this.queue,
+                        LuaCommand::AddQuest {
+                            player_id: this.snapshot.actor_id,
+                            quest_id: new_id,
+                        },
+                    );
+                }
+                Ok(())
+            },
+        );
 
         // --- Director hooks (scripts call these from guildleve flows) -------
         methods.add_method("AddDirector", |_, _this, _director: Value| {

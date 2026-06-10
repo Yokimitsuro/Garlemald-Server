@@ -7961,8 +7961,16 @@ impl PacketProcessor {
                 // `apply_actor_engage` / pmeteor `if (IsEngaged) return`).
                 if cur != Some(selected_target) {
                     c.ai_container.clear_states();
-                    c.ai_container
+                    let started = c
+                        .ai_container
                         .internal_engage(selected_target, now_ms, delay);
+                    tracing::debug!(
+                        player = format!("0x{actor_id:08X}"),
+                        target = format!("0x{selected_target:08X}"),
+                        delay,
+                        started,
+                        "player auto-attack engage (0x00CD)",
+                    );
                 }
             } else if !auto_attack {
                 // Auto-attack toggled off (attackTarget == 0xE0000000) — stop

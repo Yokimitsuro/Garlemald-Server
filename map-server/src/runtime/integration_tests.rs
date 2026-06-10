@@ -2793,8 +2793,11 @@ async fn equipped_mainhand_weapon_populates_modifiers_and_damage() {
 
     let handle = registry.get(1).await.unwrap();
     let c = handle.character.read().await;
-    // Weapon-scoped modifiers set by apply_player_weapon_stats.
-    assert_eq!(c.chara.mods.get(Modifier::Delay), 2500.0);
+    // Weapon-scoped modifiers set by apply_player_weapon_stats. Delay
+    // lands in SECONDS (2500 ms → 2.5) — the raw-ms store armed every
+    // player swing clock ×1000 too far out (Garlemald #28).
+    assert_eq!(c.chara.mods.get(Modifier::Delay), 2.5);
+    assert_eq!(c.get_attack_delay_ms(), 2500);
     assert_eq!(c.chara.mods.get(Modifier::AttackType), 1.0);
     assert_eq!(c.chara.mods.get(Modifier::HitCount), 1.0);
     assert_eq!(c.chara.mods.get(Modifier::WeaponDamagePower), 20.0);
@@ -12340,15 +12343,14 @@ async fn s2_1_seed_pool_jobs_mark_papalymo_caster_and_yda_melee() {
         .expect("bnpc 3 seeded");
     assert!(!matches!(wolf.current_job, 22 | 23));
 
-    // Ally HP fallback (B's roster-HP dependency): the spawn path's
-    // level-scaled default replaces the seed's hp=0 so the zone-in
-    // `build_npc_property_init` emits real hp/hpMax.
-    assert_eq!(yda.hp, 0, "seed group ships hp 0 — fallback must cover it");
-    let fallback = yda.min_level.max(1).saturating_mul(100).max(100);
-    assert!(
-        fallback >= 100,
-        "fallback HP must be non-zero, got {fallback}"
-    );
+    // Tutorial pacing seeds (053 migration): wolves 250 / Yda 600 /
+    // Papalymo 500 HP so the fight outlasts the 18-second live failure
+    // (100-HP wolves each one-shot by a flat-100 placeholder cast). The
+    // level-scaled spawn fallback still backstops any group whose seed
+    // hp stays 0.
+    assert_eq!(yda.hp, 600, "053 migration seeds Yda's tutorial HP");
+    assert_eq!(wolf.hp, 250, "053 migration seeds wolf tutorial HP");
+    assert_eq!(papalymo.hp, 500, "053 migration seeds Papalymo's HP");
 }
 
 /// #28 S2.5 — the real `SimpleContent30010.lua` onUpdate against the
@@ -13620,8 +13622,52 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     {
         let sched = lua.scheduler().lock().unwrap();
         assert_eq!(sched.pending_signal_count(), 0, "battleComplete consumed");
-        assert_eq!(sched.pending_time_count(), 1, "parked on wait(2)");
+        assert_eq!(
+            sched.pending_time_count(),
+            1,
+            "parked on the wait(3) render-settle beat",
+        );
     }
+    // The render-settle beat: NO widgets yet — the third wolf's death
+    // packets must reach the client with a beat to draw the collapse
+    // before the success overlay (the live failure was widgets landing
+    // in the same drain/second as the death). (Garlemald #28.)
+    let subs = parse_all_subpackets(&mut rx);
+    let widget_count = subs
+        .iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA)
+        .count();
+    assert_eq!(
+        widget_count, 0,
+        "success widgets must NOT ship in the same drain as the death",
+    );
+
+    // Stage G2 — wait(3) elapses: the widget tail drains, then the
+    // director parks on the decorative wait(2).
+    tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
+    let batches = lua.tick();
+    assert_eq!(
+        batches.len(),
+        1,
+        "post-wait(3) widget drain; got {batches:?}"
+    );
+    for (owner, cmds) in batches {
+        assert_eq!(owner, player_id);
+        crate::runtime::quest_apply::apply_event_script_commands(
+            &handle,
+            cmds,
+            &registry,
+            &db,
+            &world,
+            Some(&lua),
+        )
+        .await;
+    }
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_time_count(),
+        1,
+        "parked on wait(2)",
+    );
     let subs = parse_all_subpackets(&mut rx);
     let widget_count = subs
         .iter()

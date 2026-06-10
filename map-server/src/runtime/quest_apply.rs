@@ -457,7 +457,7 @@ pub async fn apply_runtime_lua_command(
             actor_id,
             target_actor_id,
         } => {
-            apply_actor_engage(actor_id, target_actor_id, registry).await;
+            apply_actor_engage(actor_id, target_actor_id, registry, world).await;
             true
         }
         LC::ChangeState {
@@ -590,7 +590,12 @@ pub async fn apply_runtime_lua_command(
 /// engaged — re-engaging the same target would clobber the existing
 /// state's swing clock, restarting the swing window. The C# engage
 /// path has the same gate (`if (IsEngaged) return false`).
-async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &ActorRegistry) {
+async fn apply_actor_engage(
+    actor_id: u32,
+    target_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
     if target_actor_id == 0 {
         tracing::debug!(
             actor = format!("0x{actor_id:08X}"),
@@ -611,26 +616,45 @@ async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &Acto
     // epoch ms (the pre-#28 bug) parked `is_attack_ready` ~56 years out:
     // script-engaged allies entered the engaged state but never swung.
     let now_ms = crate::runtime::clock::server_now_ms();
-    let mut c = handle.character.write().await;
-    let delay = c.get_attack_delay_ms();
-    let started = c
-        .ai_container
-        .internal_engage(target_actor_id, now_ms, delay);
-    // Seed hate toward the target. AI-controlled actors (allies driven by
-    // `allyGlobal.EngageTarget`, scripted BattleNpcs) run `do_combat_tick`,
-    // which `should_deaggro`s the instant `most_hated()` is None. Attacking
-    // only seeds hate on the *defender* (`resolve_auto_attack`), so without
-    // this the engager would emit a Disengage on its very next tick and spin
-    // an engage/disengage loop while its AttackState keeps swinging. Mirrors
-    // the `BattleEvent::Engage` hate-seed in `dispatcher.rs`. (Garlemald #28.)
-    c.hate.update_hate(target_actor_id, 1);
-    tracing::debug!(
-        actor = format!("0x{actor_id:08X}"),
-        target = format!("0x{target_actor_id:08X}"),
-        delay,
-        started,
-        "ActorEngage applied",
-    );
+    let started = {
+        let mut c = handle.character.write().await;
+        let delay = c.get_attack_delay_ms();
+        let started = c
+            .ai_container
+            .internal_engage(target_actor_id, now_ms, delay);
+        // Seed hate toward the target. AI-controlled actors (allies driven by
+        // `allyGlobal.EngageTarget`, scripted BattleNpcs) run `do_combat_tick`,
+        // which `should_deaggro`s the instant `most_hated()` is None. Attacking
+        // only seeds hate on the *defender* (`resolve_auto_attack`), so without
+        // this the engager would emit a Disengage on its very next tick and spin
+        // an engage/disengage loop while its AttackState keeps swinging. Mirrors
+        // the `BattleEvent::Engage` hate-seed in `dispatcher.rs`. (Garlemald #28.)
+        c.hate.update_hate(target_actor_id, 1);
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            target = format!("0x{target_actor_id:08X}"),
+            delay,
+            started,
+            "ActorEngage applied",
+        );
+        started
+    };
+    // Script-driven engages (allyGlobal.EngageTarget) bypass the
+    // BattleEvent::Engage dispatch arm, so emit the State trio here —
+    // the per-NPC mode-change action pmeteor broadcasts at engage time
+    // that arms the client's combat presentation for this actor (see
+    // `dispatcher::emit_change_state_trio`). Fresh engages only — a
+    // re-engage no-op shouldn't re-spam the trio.
+    if started && let Some(zone_arc) = world.zone(handle.zone_id).await {
+        crate::runtime::dispatcher::emit_change_state_trio(
+            actor_id,
+            crate::actor::MAIN_STATE_ACTIVE,
+            registry,
+            world,
+            &zone_arc,
+        )
+        .await;
+    }
 }
 
 /// `actor:ChangeState(main_state)` — port of pmeteor `Actor.cs::ChangeState`.
@@ -3743,7 +3767,7 @@ pub async fn apply_add_gil(actor_id: u32, amount: i32, db: &Database) {
 // ENPC broadcast
 // ---------------------------------------------------------------------------
 
-async fn broadcast_quest_enpc_update(
+pub(crate) async fn broadcast_quest_enpc_update(
     player_id: u32,
     enpc: QuestEnpc,
     registry: &ActorRegistry,
@@ -5257,7 +5281,7 @@ mod tests {
             assert!(!c.ai_container.is_engaged());
         }
 
-        apply_actor_engage(actor_id, target_id, &registry).await;
+        apply_actor_engage(actor_id, target_id, &registry, &WorldManager::new()).await;
 
         // Post-condition: engaged, current state targets `target_id`.
         let handle = registry.get(actor_id).await.expect("registered");
@@ -5291,11 +5315,11 @@ mod tests {
             ))
             .await;
 
-        apply_actor_engage(actor_id, target_id, &registry).await;
+        apply_actor_engage(actor_id, target_id, &registry, &WorldManager::new()).await;
         // Second call with a different target should NOT change state
         // — re-engage is gated on `IsEngaged` (use ChangeTarget for
         // retargets).
-        apply_actor_engage(actor_id, 0x4000_00AAu32, &registry).await;
+        apply_actor_engage(actor_id, 0x4000_00AAu32, &registry, &WorldManager::new()).await;
 
         let handle = registry.get(actor_id).await.expect("registered");
         let c = handle.character.read().await;
@@ -5340,8 +5364,8 @@ mod tests {
     async fn c3_apply_actor_engage_skips_zero_target_and_missing_actor() {
         let registry = ActorRegistry::new();
         // No registered actors — both calls should log+return.
-        apply_actor_engage(0xDEAD_BEEF, 0x4000_0099, &registry).await;
-        apply_actor_engage(0xDEAD_BEEF, 0, &registry).await;
+        apply_actor_engage(0xDEAD_BEEF, 0x4000_0099, &registry, &WorldManager::new()).await;
+        apply_actor_engage(0xDEAD_BEEF, 0, &registry, &WorldManager::new()).await;
         apply_hate_container_add_base_hate(0xDEAD_BEEF, 0x4000_0099, &registry).await;
         apply_hate_container_add_base_hate(0xDEAD_BEEF, 0, &registry).await;
     }
@@ -5568,7 +5592,7 @@ mod actor_engage_clock_tests {
         }
 
         // Script-driven engage (the `allyGlobal.EngageTarget` path).
-        apply_actor_engage(1, 2, &registry).await;
+        apply_actor_engage(1, 2, &registry, &world).await;
 
         let handle = registry.get(1).await.unwrap();
         let delay = { handle.character.read().await.get_attack_delay_ms() };

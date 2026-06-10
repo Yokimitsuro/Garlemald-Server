@@ -1840,8 +1840,30 @@ impl WorldManager {
         const CONTENT_ACTOR_BAND_BIT: u32 = 0x0004_0000;
         let neighbours: Vec<(u32, crate::zone::area::ActorKind)> = {
             let z = zone_arc.read().await;
-            z.core
-                .actors_around(actor_id, 50.0)
+            // Private-area routing — sessions flagged into a named
+            // PrivateArea scan that area's own actor pool (where the
+            // private-area spawn seeds now materialise, e.g. the zone-155
+            // 'PrivateAreaMasterPast' level-1 SEQ_010 quest NPCs).
+            // Content-instance names (the SEQ_005 'man0g01' tutorial) and
+            // unknown names miss `private_areas` and fall back to the
+            // zone root — same resolution rule as
+            // `runtime::broadcast::broadcast_around_actor`. The private
+            // pool sees the player too: `do_zone_change_with_private_area`
+            // re-inserts the arriving player's StoredActor there before
+            // this bundle runs. (Garlemald-Server #28.)
+            let core = match (
+                &session.current_private_area_name,
+                session.current_private_area_level,
+            ) {
+                (Some(name), level) => z
+                    .private_areas
+                    .get(name)
+                    .and_then(|m| m.get(&level))
+                    .map(|pa| &pa.core)
+                    .unwrap_or(&z.core),
+                _ => &z.core,
+            };
+            core.actors_around(actor_id, 50.0)
                 .into_iter()
                 .filter(|a| a.actor_id != actor_id)
                 .filter(|a| {
@@ -2110,6 +2132,33 @@ impl WorldManager {
             client.send_bytes(sub.to_bytes()).await;
         }
 
+        // Quest-ENPC re-emission. SetEventStatus + quest-graphic
+        // broadcasts fire when a quest mutates (StartSequence /
+        // UpdateENPCs) — but a sequence bump immediately before a warp
+        // (man0g0's StartSequence(10) → DoZoneChange) runs while the
+        // player's zone holds no matching NPC, so every broadcast is
+        // skipped ("no live NPC" ×7 in the live log) and the new zone's
+        // quest NPCs render without their talk icons / event statuses.
+        // The QuestState mutations themselves landed fine; re-emit the
+        // CURRENT registrations now that this zone's populace is in the
+        // bundle. NPCs not in this zone skip harmlessly (same lookup the
+        // original broadcast uses). (Garlemald-Server #28, req 4.)
+        let active_enpcs: Vec<crate::actor::quest::QuestEnpc> = {
+            let c = actor_handle.character.read().await;
+            c.quest_journal
+                .slots
+                .iter()
+                .flatten()
+                .flat_map(|q| q.state.current.values().copied())
+                .collect()
+        };
+        for enpc in active_enpcs {
+            crate::runtime::quest_apply::broadcast_quest_enpc_update(
+                actor_id, enpc, registry, self,
+            )
+            .await;
+        }
+
         // KickEvent emission — DEFERRED to the very end of the bundle.
         // Per meteor-decomp `event_kick_receiver_decomp.md` slot 2, the
         // client silently drops `KickEvent (0x012F)` if the owner
@@ -2318,8 +2367,13 @@ impl WorldManager {
         session_id: u32,
         new_position: Vector3,
     ) {
-        let zone_id = match self.session(session_id).await {
-            Some(s) => s.current_zone_id,
+        let (zone_id, private_area) = match self.session(session_id).await {
+            Some(s) => (
+                s.current_zone_id,
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level)),
+            ),
             None => return,
         };
         let Some(zone_arc) = self.zone(zone_id).await else {
@@ -2327,6 +2381,22 @@ impl WorldManager {
         };
         let mut zone = zone_arc.write().await;
         let mut ob = crate::zone::outbox::AreaOutbox::new();
+        // Sessions routed into a named PrivateArea keep their StoredActor
+        // in that area's core (`do_zone_change_with_private_area` attach)
+        // — updating `zone.core` would silently no-op and the player's
+        // grid position would freeze at the warp-in point. Content-
+        // instance names (not in `private_areas`) fall back to the zone
+        // root, same rule as `broadcast_around_actor`. (Garlemald #28.)
+        if let Some((name, level)) = private_area
+            && let Some(pa) = zone
+                .private_areas
+                .get_mut(&name)
+                .and_then(|m| m.get_mut(&level))
+        {
+            pa.core
+                .update_actor_position(actor_id, new_position, &mut ob);
+            return;
+        }
         zone.core
             .update_actor_position(actor_id, new_position, &mut ob);
     }

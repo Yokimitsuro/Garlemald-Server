@@ -44,6 +44,12 @@ function onEventStarted(player, actor, triggerName)
 
 		-- ==== THE FIGHT ====  (free-running: S2 AI + S3 skills)
 		waitForSignal("battleComplete");            -- S4.1 fires when all 3 wolves are dead
+		-- Render-settle beat: the gate fires in the same call stack as the
+		-- third wolf's death broadcast, so without this the success widgets
+		-- land in the SAME drain/second as the death packets (live log
+		-- 12:18:19Z — widgets over still-standing wolves). Retail shows the
+		-- death animation plus a beat before the overlay. (#28.)
+		wait(3);
 		closeTutorialWidget(player);
 		showTutorialSuccessWidget(player, 9055);
 		showTutorialSuccessWidget(player, 9065);
@@ -55,6 +61,7 @@ function onEventStarted(player, actor, triggerName)
 		closeTutorialWidget(player);
 		openTutorialWidget(player, CONTROLLER_KEYBOARD, TUTORIAL_DEFEATENEMY);
 		waitForSignal("battleComplete");
+		wait(3);                                    -- render-settle beat (see DoW branch)
 		closeTutorialWidget(player);
 		showTutorialSuccessWidget(player, 9050);
 	end

@@ -436,7 +436,16 @@ impl Character {
 
         if let Some(w) = main {
             // Main-hand scoped: replace the previous weapon's values.
-            self.chara.mods.set(Modifier::Delay, w.delay_ms as f64);
+            // `Modifier::Delay` is stored in SECONDS — `get_attack_delay_ms`
+            // multiplies by 1000, and the BNpc pool path stores seconds
+            // (battle_npc.rs `apply_spawn_metadata`). Storing the item's
+            // raw `delay_ms` here armed every player swing clock ~2.8
+            // MILLION ms out, so an engaged player never swung, never
+            // dealt damage, and never accrued TP — the SEQ_005 tutorial's
+            // "weaponskill stays grey" live failure. (Garlemald #28.)
+            self.chara
+                .mods
+                .set(Modifier::Delay, f64::from(w.delay_ms) / 1000.0);
             self.chara
                 .mods
                 .set(Modifier::AttackType, w.attack_type as f64);
@@ -1021,8 +1030,10 @@ mod recalc_tests {
         let mut c = Character::new(1);
         c.apply_player_weapon_stats(&items, &equipped);
 
-        // Mainhand-scoped sets come from item 100.
-        assert_eq!(c.chara.mods.get(Modifier::Delay), 2800.0);
+        // Mainhand-scoped sets come from item 100. Delay lands in
+        // seconds (2800 ms → 2.8) so `get_attack_delay_ms` round-trips.
+        assert_eq!(c.chara.mods.get(Modifier::Delay), 2.8);
+        assert_eq!(c.get_attack_delay_ms(), 2800);
         assert_eq!(c.chara.mods.get(Modifier::AttackType), 2.0);
         assert_eq!(c.chara.mods.get(Modifier::HitCount), 1.0);
         // Flat Attack/Parry stack across both hands: 5+2=7 and 3+1=4.

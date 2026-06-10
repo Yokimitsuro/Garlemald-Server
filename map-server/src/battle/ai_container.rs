@@ -416,16 +416,34 @@ impl AIContainer {
                 StateTickResult::Continue => {
                     if kind == BattleStateKind::Attack && top.is_attack_ready(now_ms) {
                         top.schedule_next_swing(now_ms, swing_delay_ms);
-                        let in_range = arena.get(target_actor_id).is_some_and(|t| {
+                        let target_view = arena.get(target_actor_id);
+                        let distance_sq = target_view.as_ref().map(|t| {
                             let dx = t.position.x - owner_pos.x;
                             let dz = t.position.z - owner_pos.z;
-                            (dx * dx + dz * dz) <= attack_range * attack_range
+                            dx * dx + dz * dz
                         });
+                        let in_range =
+                            distance_sq.is_some_and(|d2| d2 <= attack_range * attack_range);
                         if target_actor_id != 0 && auto_attack_enabled && in_range {
                             outbox.push(BattleEvent::ResolveAutoAttack {
                                 attacker_actor_id: owner_id,
                                 defender_actor_id: target_actor_id,
                             });
+                        } else {
+                            // Ready-but-skipped swings fire at most once per
+                            // delay window — cheap to log, and the ONLY
+                            // signal when an engaged actor silently never
+                            // attacks (the SEQ_005 player TP mystery was
+                            // exactly this branch, invisible in every log).
+                            tracing::debug!(
+                                owner = format!("0x{owner_id:08X}"),
+                                target = format!("0x{target_actor_id:08X}"),
+                                auto_attack_enabled,
+                                target_in_arena = target_view.is_some(),
+                                distance = distance_sq.map(f32::sqrt),
+                                attack_range,
+                                "battle: swing ready but skipped",
+                            );
                         }
                     }
                     break;
