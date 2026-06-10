@@ -7490,85 +7490,27 @@ impl PacketProcessor {
     /// recursively. Shared by the content-director dispatch and the
     /// command-static-actor dispatch. Mirrors `apply_quest_on_notice` +
     /// `fire_quest_event_hook`. (Garlemald-Server #28.)
+    /// Delegates to the shared `quest_apply::apply_event_script_commands`
+    /// (also used by the ticker's per-owner coroutine drains). Order is
+    /// load-bearing on the wire: pmeteor sends `SendDataPacket(9)`
+    /// (startTutorialMode — a runtime/0x0133 command) BEFORE the
+    /// `processTtrBtl001` cinematic (RunEventFunction/0x0130), while later
+    /// it sends the tutorial-widget SendDataPackets AFTER their cinematic —
+    /// the shared drain interleaves per-command to preserve that.
     async fn apply_event_script_commands(
         &self,
         handle: &ActorHandle,
         commands: Vec<crate::lua::command::LuaCommand>,
     ) {
-        use crate::lua::command::LuaCommand;
-        if commands.is_empty() {
-            return;
-        }
-        // Pull `SendSignal` out — it re-enters the engine (resumes parked
-        // coroutines) rather than being applied as a state mutation.
-        let mut signals: Vec<String> = Vec::new();
-        let mut rest: Vec<LuaCommand> = Vec::with_capacity(commands.len());
-        for c in commands {
-            match c {
-                LuaCommand::SendSignal { name } => signals.push(name),
-                other => rest.push(other),
-            }
-        }
-        if !rest.is_empty() {
-            let event_session_snapshot = {
-                let c = handle.character.read().await;
-                c.event_session.clone()
-            };
-            // Process commands in their ORIGINAL order, routing each to
-            // exactly one path. Order is load-bearing on the wire: pmeteor
-            // sends `SendDataPacket(9)` (startTutorialMode — a runtime/0x0133
-            // command) BEFORE the `processTtrBtl001` cinematic
-            // (RunEventFunction/0x0130), while later it sends the tutorial-
-            // widget SendDataPackets AFTER their cinematic. A two-pass split
-            // (all events then all runtime, or vice-versa) inverts one of
-            // those, so we interleave per-command instead. Event-flavoured
-            // commands (RunEventFunction/EndEvent) go through the event bridge;
-            // everything else (SendDataPacket, ChangeState, KickEvent capture,
-            // …) through the runtime drain. (Garlemald-Server #28.)
-            for c in rest {
-                let mut outbox = crate::event::outbox::EventOutbox::new();
-                crate::event::lua_bridge::translate_lua_commands_into_outbox(
-                    std::slice::from_ref(&c),
-                    &event_session_snapshot,
-                    &mut outbox,
-                );
-                let events = outbox.drain();
-                if events.is_empty() {
-                    crate::runtime::quest_apply::apply_runtime_lua_command(
-                        c,
-                        &self.registry,
-                        &self.db,
-                        &self.world,
-                        self.lua.as_ref(),
-                    )
-                    .await;
-                } else {
-                    for e in events {
-                        Box::pin(dispatch_event_event(
-                            &e,
-                            &self.registry,
-                            &self.world,
-                            &self.db,
-                            self.lua.as_ref(),
-                        ))
-                        .await;
-                    }
-                }
-            }
-        }
-        if let Some(lua) = self.lua.as_ref() {
-            for name in signals {
-                let resumed = lua.fire_signal_and_drain(&name);
-                if !resumed.is_empty() {
-                    tracing::debug!(
-                        signal = %name,
-                        commands = resumed.len(),
-                        "sendSignal resumed parked coroutine(s)",
-                    );
-                    Box::pin(self.apply_event_script_commands(handle, resumed)).await;
-                }
-            }
-        }
+        crate::runtime::quest_apply::apply_event_script_commands(
+            handle,
+            commands,
+            &self.registry,
+            &self.db,
+            &self.world,
+            self.lua.as_ref(),
+        )
+        .await;
     }
 
     /// Command static-actor ids that dispatch to a `commands/<Name>.lua`

@@ -191,15 +191,40 @@ impl GameTicker {
             let resumed = tokio::task::spawn_blocking(move || lua.tick())
                 .await
                 .unwrap_or_default();
-            if !resumed.is_empty() {
-                crate::runtime::quest_apply::apply_runtime_lua_commands(
-                    resumed,
-                    &self.registry,
-                    &self.db,
-                    &self.world,
-                    self.lua.as_ref(),
-                )
-                .await;
+            // Per-owner batches: a coroutine resumed off a `wait(n)` may
+            // queue EVENT-flavoured commands (the SEQ_005 director's
+            // post-`wait(1)` `kickEventContinue` + `processTtrBtl002`
+            // RunEventFunction) which the plain runtime drain DROPS at
+            // its catch-all. Route batches with a known owner player
+            // through the event bridge — same path the F-press command
+            // dispatch uses — and fall back to the runtime drain for
+            // ownerless coroutines. (Garlemald-Server #28.)
+            for (owner, cmds) in resumed {
+                let handle = if owner != 0 {
+                    self.registry.get(owner).await
+                } else {
+                    None
+                };
+                if let Some(handle) = handle {
+                    crate::runtime::quest_apply::apply_event_script_commands(
+                        &handle,
+                        cmds,
+                        &self.registry,
+                        &self.db,
+                        &self.world,
+                        self.lua.as_ref(),
+                    )
+                    .await;
+                } else {
+                    crate::runtime::quest_apply::apply_runtime_lua_commands(
+                        cmds,
+                        &self.registry,
+                        &self.db,
+                        &self.world,
+                        self.lua.as_ref(),
+                    )
+                    .await;
+                }
             }
         }
 

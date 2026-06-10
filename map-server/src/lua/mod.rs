@@ -424,6 +424,7 @@ impl LuaEngine {
             }
         };
 
+        let owner_player_id = player_snapshot.actor_id;
         let player = userdata::LuaPlayer {
             snapshot: player_snapshot,
             queue: queue.clone(),
@@ -479,18 +480,19 @@ impl LuaEngine {
                 };
             }
         };
-        let resume_result = thread.resume::<Value>(mv);
+        let resume_result = thread.resume::<MultiValue>(mv);
         let commands = CommandQueue::drain(&queue);
         let (value, error) = match resume_result {
             Ok(v) => (v, None),
-            Err(e) => (Value::Nil, Some(anyhow::anyhow!("{hook_name}: {e}"))),
+            Err(e) => (MultiValue::new(), Some(anyhow::anyhow!("{hook_name}: {e}"))),
         };
         if matches!(thread.status(), mlua::ThreadStatus::Resumable) {
-            let directive = scheduler::classify_yield(&value);
+            let directive = scheduler::classify_yield_mv(&value);
             let parked = ParkedCoroutine {
                 lua: lua.clone(),
                 thread,
                 queue,
+                owner_player_id,
             };
             self.repark(parked, directive);
         }
@@ -598,20 +600,25 @@ impl LuaEngine {
         };
 
         // First resume — runs until the first yield / return / error.
-        let resume_result = thread.resume::<Value>(director_ud);
+        let resume_result = thread.resume::<MultiValue>(director_ud);
         let commands = CommandQueue::drain(&queue);
         let (value, error) = match resume_result {
             Ok(v) => (v, None),
-            Err(e) => (Value::Nil, Some(anyhow::anyhow!("director main: {e}"))),
+            Err(e) => (
+                MultiValue::new(),
+                Some(anyhow::anyhow!("director main: {e}")),
+            ),
         };
 
         // Park if still alive + parked on a known wait directive.
         if matches!(thread.status(), mlua::ThreadStatus::Resumable) {
-            let directive = scheduler::classify_yield(&value);
+            let directive = scheduler::classify_yield_mv(&value);
             let parked = ParkedCoroutine {
                 lua: lua.clone(),
                 thread,
                 queue,
+                // No player in scope for a director `main`.
+                owner_player_id: 0,
             };
             self.repark(parked, directive);
         }
@@ -641,7 +648,8 @@ impl LuaEngine {
         event_type: u8,
         lua_params: Vec<common::luaparam::LuaParam>,
     ) -> PartialLuaCallResult {
-        self.spawn_director_on_event_started(script_path, |lua, queue| {
+        let owner_player_id = player_snapshot.actor_id;
+        self.spawn_director_on_event_started(script_path, owner_player_id, |lua, queue| {
             let player = userdata::LuaPlayer {
                 snapshot: player_snapshot,
                 queue: queue.clone(),
@@ -700,7 +708,8 @@ impl LuaEngine {
         event_type: u8,
         lua_params: Vec<common::luaparam::LuaParam>,
     ) -> PartialLuaCallResult {
-        self.spawn_director_on_event_started(script_path, |lua, queue| {
+        let owner_player_id = player_snapshot.actor_id;
+        self.spawn_director_on_event_started(script_path, owner_player_id, |lua, queue| {
             let player = userdata::LuaPlayer {
                 snapshot: player_snapshot,
                 queue: queue.clone(),
@@ -747,6 +756,7 @@ impl LuaEngine {
     pub fn spawn_director_on_event_started<F>(
         &self,
         script_path: &Path,
+        owner_player_id: u32,
         build_args: F,
     ) -> PartialLuaCallResult
     where
@@ -789,21 +799,22 @@ impl LuaEngine {
                 };
             }
         };
-        let resume_result = thread.resume::<Value>(args);
+        let resume_result = thread.resume::<MultiValue>(args);
         let commands = CommandQueue::drain(&queue);
         let (value, error) = match resume_result {
             Ok(v) => (v, None),
             Err(e) => (
-                Value::Nil,
+                MultiValue::new(),
                 Some(anyhow::anyhow!("director onEventStarted: {e}")),
             ),
         };
         if matches!(thread.status(), mlua::ThreadStatus::Resumable) {
-            let directive = scheduler::classify_yield(&value);
+            let directive = scheduler::classify_yield_mv(&value);
             let parked = ParkedCoroutine {
                 lua: lua.clone(),
                 thread,
                 queue,
+                owner_player_id,
             };
             self.repark(parked, directive);
         }
@@ -880,6 +891,7 @@ impl LuaEngine {
             }
         };
 
+        let owner_player_id = player.snapshot.actor_id;
         let player_ud = match lua.create_userdata(player) {
             Ok(ud) => ud,
             Err(e) => {
@@ -922,18 +934,19 @@ impl LuaEngine {
                 };
             }
         };
-        let resume_result = thread.resume::<Value>(mv);
+        let resume_result = thread.resume::<MultiValue>(mv);
         let commands = CommandQueue::drain(&queue);
         let (value, error) = match resume_result {
             Ok(v) => (v, None),
-            Err(e) => (Value::Nil, Some(anyhow::anyhow!("{hook_name}: {e}"))),
+            Err(e) => (MultiValue::new(), Some(anyhow::anyhow!("{hook_name}: {e}"))),
         };
         if matches!(thread.status(), mlua::ThreadStatus::Resumable) {
-            let directive = scheduler::classify_yield(&value);
+            let directive = scheduler::classify_yield_mv(&value);
             let parked = ParkedCoroutine {
                 lua: lua.clone(),
                 thread,
                 queue,
+                owner_player_id,
             };
             self.repark(parked, directive);
         }
@@ -1019,7 +1032,13 @@ impl LuaEngine {
     /// `director:EndGuildleve(true)` / `player:AddExp(...)` /
     /// `quest:SetQuestFlag(...)` calls from inside a parked `main`
     /// coroutine actually produce the right game-state mutations.
-    pub fn tick(&self) -> Vec<LuaCommand> {
+    /// Returns `(owner_player_id, commands)` batches — one per resumed
+    /// coroutine — so the ticker can route each batch through the EVENT
+    /// bridge for that player (event-flavoured commands like
+    /// `KickEvent`/`RunEventFunction`/`EndEvent` are dropped by the
+    /// plain runtime drain). `owner_player_id == 0` means no player
+    /// context (apply via the runtime drain as before).
+    pub fn tick(&self) -> Vec<(u32, Vec<LuaCommand>)> {
         let mut all_commands = Vec::new();
 
         let due = self
@@ -1029,13 +1048,17 @@ impl LuaEngine {
             .unwrap_or_default();
         for parked in due {
             let queue = parked.queue.clone();
-            let resume = parked.thread.resume::<Value>(());
+            let owner = parked.owner_player_id;
+            let resume = parked.thread.resume::<MultiValue>(());
             // Drain whatever the resumed slice pushed into the
             // script's command queue — the directive classification
             // below doesn't touch the queue, so drain before reparking.
-            all_commands.extend(CommandQueue::drain(&queue));
+            let cmds = CommandQueue::drain(&queue);
+            if !cmds.is_empty() {
+                all_commands.push((owner, cmds));
+            }
             if let Ok(value) = resume {
-                let directive = scheduler::classify_yield(&value);
+                let directive = scheduler::classify_yield_mv(&value);
                 self.repark(parked, directive);
             }
         }
@@ -1063,15 +1086,20 @@ impl LuaEngine {
             .lock()
             .map(|mut s| s.drain_signal(signal))
             .unwrap_or_default();
+        tracing::debug!(
+            signal,
+            resumed = due.len(),
+            "fire_signal: draining parked coroutines",
+        );
         let mut all_commands = Vec::new();
         for parked in due {
             let queue = parked.queue.clone();
-            let resume = parked.thread.resume::<Value>(());
+            let resume = parked.thread.resume::<MultiValue>(());
             all_commands.extend(CommandQueue::drain(&queue));
             if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable)
                 && let Ok(value) = resume
             {
-                let directive = scheduler::classify_yield(&value);
+                let directive = scheduler::classify_yield_mv(&value);
                 self.repark(parked, directive);
             }
         }
@@ -1109,14 +1137,14 @@ impl LuaEngine {
                 }
             })
         })?;
-        let resume_result = parked.thread.resume::<Value>(args);
+        let resume_result = parked.thread.resume::<MultiValue>(args);
         let commands = CommandQueue::drain(&parked.queue);
         if matches!(parked.thread.status(), mlua::ThreadStatus::Resumable) {
             // Coroutine yielded again — re-park on whatever directive
             // it returned. Without this, a multi-step script that
             // yields more than once would lose its handle.
             if let Ok(value) = resume_result {
-                let directive = scheduler::classify_yield(&value);
+                let directive = scheduler::classify_yield_mv(&value);
                 self.repark(parked, directive);
             }
         }

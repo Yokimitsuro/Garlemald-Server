@@ -6675,13 +6675,20 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
     let resumed = tokio::task::spawn_blocking(move || lua_clone.tick())
         .await
         .unwrap();
+    // tick() returns per-owner batches: one coroutine resumed here.
     assert_eq!(
         resumed.len(),
         1,
-        "resumed slice should push exactly one EndGuildleve command; got {resumed:?}",
+        "resumed slice should push exactly one batch; got {resumed:?}",
+    );
+    let (_owner, batch) = resumed.into_iter().next().unwrap();
+    assert_eq!(
+        batch.len(),
+        1,
+        "batch should hold exactly one EndGuildleve command; got {batch:?}",
     );
     assert!(matches!(
-        resumed[0],
+        batch[0],
         LuaCommand::EndGuildleve {
             director_actor_id: _,
             was_completed: true,
@@ -6689,9 +6696,9 @@ async fn director_main_coroutine_wait_then_end_guildleve_drains_through_ticker()
     ));
 
     // Drain the resumed commands through the runtime pipeline —
-    // this is what the ticker does on each frame.
+    // this is what the ticker does on each frame for ownerless batches.
     crate::runtime::quest_apply::apply_runtime_lua_commands(
-        resumed,
+        batch,
         &registry,
         &db,
         &world,

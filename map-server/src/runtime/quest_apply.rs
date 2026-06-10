@@ -645,6 +645,14 @@ async fn apply_change_state(
     };
     let sub =
         crate::packets::send::actor::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
+    // Send to the actor's OWN client first when it's a player —
+    // `broadcast_around_actor`'s `actors_around` excludes the source, so
+    // a player's own state change (the F-press Engage drawing the
+    // weapon) otherwise never reaches their client (`recipients=0` in
+    // the SEQ_005 live test). Mirrors `apply_die` / `apply_revive`.
+    // (Garlemald-Server #28.)
+    crate::runtime::dispatcher::send_to_self_if_player(registry, world, actor_id, sub.to_bytes())
+        .await;
     let recipients = crate::runtime::broadcast::broadcast_around_actor(
         world,
         registry,
@@ -1319,6 +1327,95 @@ async fn apply_director_outbox_op<F>(
         op = op_name,
         "runtime director-outbox op applied",
     );
+}
+
+/// Apply a script's drained `LuaCommand`s with EVENT-bridge routing —
+/// the shared engine behind `PacketProcessor::apply_event_script_commands`
+/// and the ticker's per-owner coroutine drains. Event-flavoured commands
+/// (`RunEventFunction` / `EndEvent` / `KickEvent` / ...) are translated
+/// through the `EventOutbox` + dispatcher so cinematic packets reach the
+/// wire (the plain runtime drain drops them at its catch-all); the rest
+/// go through the runtime; and any `SendSignal` resumes the coroutines
+/// parked on `waitForSignal(name)` (e.g. the combat tutorial director on
+/// "playerActive") and applies THEIR commands, recursively.
+/// (Garlemald-Server #28.)
+pub(crate) async fn apply_event_script_commands(
+    handle: &ActorHandle,
+    commands: Vec<crate::lua::command::LuaCommand>,
+    registry: &ActorRegistry,
+    db: &Database,
+    world: &WorldManager,
+    lua: Option<&Arc<LuaEngine>>,
+) {
+    use crate::lua::command::LuaCommand;
+    if commands.is_empty() {
+        return;
+    }
+    // Pull `SendSignal` out — it re-enters the engine (resumes parked
+    // coroutines) rather than being applied as a state mutation.
+    let mut signals: Vec<String> = Vec::new();
+    let mut rest: Vec<LuaCommand> = Vec::with_capacity(commands.len());
+    for c in commands {
+        match c {
+            LuaCommand::SendSignal { name } => signals.push(name),
+            other => rest.push(other),
+        }
+    }
+    if !rest.is_empty() {
+        let event_session_snapshot = {
+            let c = handle.character.read().await;
+            c.event_session.clone()
+        };
+        // Process commands in their ORIGINAL order, routing each to
+        // exactly one path — order is load-bearing on the wire (see the
+        // per-command interleave rationale in the PacketProcessor
+        // delegate's history).
+        for c in rest {
+            let mut outbox = crate::event::outbox::EventOutbox::new();
+            crate::event::lua_bridge::translate_lua_commands_into_outbox(
+                std::slice::from_ref(&c),
+                &event_session_snapshot,
+                &mut outbox,
+            );
+            let events = outbox.drain();
+            if events.is_empty() {
+                apply_runtime_lua_command(c, registry, db, world, lua).await;
+            } else {
+                for e in events {
+                    Box::pin(crate::event::dispatcher::dispatch_event_event(
+                        &e, registry, world, db, lua,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+    if let Some(lua_engine) = lua {
+        for name in signals {
+            let resumed = lua_engine.fire_signal_and_drain(&name);
+            if resumed.is_empty() {
+                // Either nothing was parked on this signal, or the
+                // resumed coroutine queued no commands before its next
+                // yield (e.g. straight into `wait(1)`) — the
+                // `fire_signal: draining parked coroutines` line above
+                // disambiguates.
+                tracing::debug!(
+                    signal = %name,
+                    "sendSignal resumed no commands",
+                );
+            } else {
+                tracing::debug!(
+                    signal = %name,
+                    commands = resumed.len(),
+                    "sendSignal resumed parked coroutine(s)",
+                );
+                Box::pin(apply_event_script_commands(
+                    handle, resumed, registry, db, world, lua,
+                ))
+                .await;
+            }
+        }
+    }
 }
 
 /// Bulk-drain helper — calls [`apply_runtime_lua_command`] for every
@@ -4815,5 +4912,88 @@ mod tests {
         assert_eq!(pairs[0].1, 4030010, "main-hand catalog id");
         assert_eq!(pairs[1].0, 10);
         assert_eq!(pairs[1].1, 8050245, "legs catalog id");
+    }
+}
+
+#[cfg(test)]
+mod change_state_self_send_tests {
+    use super::*;
+    use crate::actor::Character;
+    use crate::data::ClientHandle;
+    use crate::runtime::actor_registry::ActorKindTag;
+    use crate::zone::area::StoredActor;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::{ActorKind, Zone};
+    use common::Vector3;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+    use tokio::sync::mpsc;
+
+    /// A player toggling their own main state (the F-press Engage) must
+    /// receive their own 0x0134 SetActorState — `broadcast_around_actor`
+    /// excludes the source, so without the explicit self-send the weapon
+    /// never draws on the acting client (`recipients=0` in the SEQ_005
+    /// live test). (Garlemald-Server #28.)
+    #[tokio::test]
+    async fn change_state_reaches_the_acting_player() {
+        let world = WorldManager::new();
+        let registry = ActorRegistry::new();
+
+        let mut zone = Zone::new(
+            166,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = crate::zone::outbox::AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+
+        registry
+            .insert(crate::runtime::actor_registry::ActorHandle::new(
+                1,
+                ActorKindTag::Player,
+                166,
+                7,
+                Character::new(1),
+            ))
+            .await;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(4);
+        world.register_client(7, ClientHandle::new(7, tx)).await;
+
+        apply_change_state(1, 2, &registry, &world).await;
+
+        let got = rx.try_recv().expect("player should receive own 0x0134");
+        let mut off = 0usize;
+        let sub = common::subpacket::SubPacket::parse(&got, &mut off).unwrap();
+        assert_eq!(sub.game_message.opcode, 0x0134);
+        assert_eq!(
+            sub.header.target_id, 7,
+            "self-send must stamp the session id"
+        );
+        assert_eq!(sub.data[0], 2, "main_state byte");
+
+        // Stored state mutated too.
+        let handle = registry.get(1).await.unwrap();
+        let c = handle.character.read().await;
+        assert_eq!(c.base.current_main_state, 2);
     }
 }
