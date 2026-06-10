@@ -1662,6 +1662,16 @@ pub(crate) async fn die_if_defender_fell(
     if !is_bnpc {
         return;
     }
+    // #28 S4.1 — content-area kill gate, BEFORE the attacker gates below:
+    // a wolf killed by Yda/Papalymo (Ally kind, which the attacker gate
+    // rejects) must still count toward "all hostiles dead". `apply_die`'s
+    // tail has usually fired the gate already on this same transition —
+    // the repeat here is a cheap no-op (the resumed director re-parked on
+    // a different waiter, or the teardown cleared `active_content_script`)
+    // and keeps the gate live even if `apply_die`'s callers drop lua/db.
+    if let (Some(lua_ref), Some(db_ref)) = (lua, db) {
+        check_content_battle_complete(defender_actor_id, registry, world, db_ref, lua_ref).await;
+    }
     let Some(attacker_id) = attacker_actor_id else {
         return;
     };
@@ -1704,6 +1714,86 @@ pub(crate) async fn die_if_defender_fell(
         world,
     )
     .await;
+}
+
+/// #28 S4.1 — the all-hostiles-dead gate for scripted content (the
+/// SEQ_005 combat tutorial). Scans sessions for the one whose active
+/// content roster (`transient_director_members[director]`) contains the
+/// dead actor, counts roster members that are still-live hostiles
+/// (`kind == BattleNpc` — Yda/Papalymo register as `Ally`, so only wolf
+/// deaths move the count; `apply_die` flips the dying wolf to DEAD
+/// before this runs, so it counts itself out), and on zero live fires
+/// `SendSignal("battleComplete")` through
+/// `quest_apply::apply_event_script_commands` with the owning player's
+/// handle — byte-for-byte the same routing as the working F-press
+/// `playerActive` resume, so the director's continuation (success
+/// widgets → processEvent020_1 → StartSequence(10) → ContentFinished →
+/// DoZoneChange) runs in the death-path call stack with full wire
+/// access. Firing the signal with nothing parked is a logged no-op, and
+/// the caller-side death-transition guards keep this single-fire per
+/// death; signal scoping per player is deferred (single-player server —
+/// `"battleComplete:" .. actorId` is the trivial multi-session upgrade).
+pub(crate) async fn check_content_battle_complete(
+    dead_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Arc<crate::database::Database>,
+    lua: &Arc<crate::lua::LuaEngine>,
+) {
+    for session in world.all_sessions().await {
+        let Some(active) = session.active_content_script.as_ref() else {
+            continue;
+        };
+        let Some(roster) = session
+            .transient_director_members
+            .get(&active.director_actor_id)
+        else {
+            continue;
+        };
+        if !roster.contains(&dead_actor_id) {
+            continue;
+        }
+        let mut live = 0u32;
+        for &member_id in roster {
+            let Some(member) = registry.get(member_id).await else {
+                continue;
+            };
+            if !matches!(
+                member.kind,
+                crate::runtime::actor_registry::ActorKindTag::BattleNpc,
+            ) {
+                continue;
+            }
+            let c = member.character.read().await;
+            if c.base.current_main_state != crate::actor::MAIN_STATE_DEAD {
+                live += 1;
+            }
+        }
+        if live > 0 {
+            return;
+        }
+        let Some(player) = registry.by_session(session.id).await else {
+            return;
+        };
+        tracing::info!(
+            session = session.id,
+            dead = format!("0x{dead_actor_id:08X}"),
+            director = format!("0x{:08X}", active.director_actor_id),
+            "content battle complete — firing battleComplete through the event bridge",
+        );
+        crate::runtime::quest_apply::apply_event_script_commands(
+            &player,
+            vec![crate::lua::command::LuaCommand::SendSignal {
+                name: "battleComplete".into(),
+            }],
+            registry,
+            db,
+            world,
+            Some(lua),
+        )
+        .await;
+        return;
+    }
 }
 
 /// Award GC seals to `attacker_handle` for killing a mob of the given
@@ -1946,6 +2036,19 @@ pub(crate) async fn apply_die(
         for evt in status_outbox.drain() {
             dispatch_status_event(&evt, registry, world, db_ref, lua_ref.catalogs()).await;
         }
+    }
+
+    // #28 S4.1 — second gate call site: scripted deaths (`BattleEvent::
+    // Die`, GM `!die`) reach `apply_die` without transiting
+    // `die_if_defender_fell`, so the content kill gate fires here too —
+    // placement-independent. The already-DEAD guard above keeps this on
+    // the death transition only.
+    if matches!(
+        handle.kind,
+        crate::runtime::actor_registry::ActorKindTag::BattleNpc,
+    ) && let (Some(lua_ref), Some(db_ref)) = (lua, db)
+    {
+        check_content_battle_complete(owner_actor_id, registry, world, db_ref, lua_ref).await;
     }
 }
 

@@ -3118,6 +3118,41 @@ mod tests {
             1,
             "parked on the kick reply",
         );
+
+        // Client EventStart reply to the kick — resumes into
+        // processTtrBtl002's RunEventFunction, parked on the targeting
+        // tutorial's return.
+        let cmds = engine
+            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .expect("parked on the kick reply");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::RunEventFunction { .. })),
+            "processTtrBtl002 must drain off the kick reply; got {cmds:?}",
+        );
+        assert_eq!(engine.scheduler().lock().unwrap().pending_event_count(), 1);
+
+        // Btl002 returns (EventUpdate) — EndEvent drains and the
+        // director parks on the S4.1 kill gate's signal: the fight is
+        // free-running from here (full sequence covered end-to-end by
+        // `s4_2_real_director_full_sequence_kill_gate_to_warp`).
+        let cmds = engine
+            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .expect("parked on Btl002");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::EndEvent { .. })),
+            "EndEvent after Btl002; got {cmds:?}",
+        );
+        {
+            let sched = engine.scheduler().lock().unwrap();
+            assert_eq!(sched.pending_event_count(), 0);
+            assert_eq!(
+                sched.pending_signal_count(),
+                1,
+                "director must be parked on battleComplete during the fight",
+            );
+        }
     }
 
     /// Cross-thread repro of the LIVE ticker topology: the signal resume
