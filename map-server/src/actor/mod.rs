@@ -96,6 +96,13 @@ pub struct BaseActor {
     /// / `SetEmoteEventCondition` / push-variant packets so the client
     /// lights up each condition's trigger before the `ScriptBind`.
     pub event_conditions: event_conditions::EventConditionList,
+    /// MapObj background-geometry binding (`server_eventnpc_mapobj`,
+    /// Meteor `Npc.MapObjLayoutId`/`MapObjInstanceId`). When both are
+    /// non-zero the spawn bundle sends `SetActorBGProperties` INSTEAD
+    /// of an appearance packet, binding the actor to a layout object —
+    /// the mesh + collision baked into the zone (closed doors, gates).
+    pub mapobj_layout_id: u32,
+    pub mapobj_instance_id: u32,
 }
 
 impl BaseActor {

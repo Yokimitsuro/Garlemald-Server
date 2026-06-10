@@ -508,11 +508,26 @@ fn push_npc_spawn(
         0x0,
         false,
     ));
-    subpackets.push(tx::actor::build_set_actor_appearance(
-        actor_id,
-        model_id,
-        &appearance_ids,
-    ));
+    if character.base.mapobj_layout_id != 0 && character.base.mapobj_instance_id != 0 {
+        // MapObj actor (door/gate) — Meteor's `Npc.GetSpawnPackets` sends
+        // `SetActorBGProperties` INSTEAD of an appearance packet, binding
+        // the actor to a background layout object whose mesh + collision
+        // are baked into the zone (e.g. man0u0's closed doors that seal
+        // the Merchant Strip's north/south/east exits). Wire order per
+        // `SetActorBGPropertiesPacket.cs`: instanceId first, layoutId
+        // second.
+        subpackets.push(tx::actor::build_set_actor_bg_properties(
+            actor_id,
+            character.base.mapobj_instance_id,
+            character.base.mapobj_layout_id,
+        ));
+    } else {
+        subpackets.push(tx::actor::build_set_actor_appearance(
+            actor_id,
+            model_id,
+            &appearance_ids,
+        ));
+    }
     let _ = display_name_id;
     subpackets.push(tx::actor::build_set_actor_name(
         actor_id,

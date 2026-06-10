@@ -98,6 +98,40 @@ Note: the "exit" bounce flows through `DoPlayerMoveInZone` →
 `WarpToPosition`, whose delivery is fixed by upstream PR #35
 (proxy-dropped warp packets). Testing needs a build with #35 merged.
 
+## Round 3 — WarpToPosition drain arm + stopper SetENpc arg slip
+
+Fourth/fifth retests: the door push fired (dialogue) but the bounce
+never moved the player, and the stopper street exits stayed silent.
+One missing piece + one script slip:
+
+- `LC::WarpToPosition` was only handled by the login pipeline; the
+  quest/NPC drain dropped it silently → every `DoPlayerMoveInZone`
+  bounce evaporated after its dialogue. Added the arm +
+  `apply_warp_to_position_runtime` (mirror of the login applier).
+- man0u0 registered the stopper as `SetENpc(QFLAG_NONE, false, false,
+  true)` — an upstream arg slip (push=false / emote=true) that made
+  the quest layer disable the stopper's own circles (byte-confirmed:
+  spawn arms enable=01 at 14:55:04, quest kills enable=00 at
+  14:57:31). Aligned with the sibling pattern (man0g0 BLOCKER1,
+  man0u0's own SEQ_010 BLOCKER): `(QFLAG_NONE, false, true)`.
+
+## Round 4 — north/south/east exits: MapObj doors had no body
+
+With the west street bouncing, the player could still leave N/S/E.
+Meteor seals those with **closed-door MapObj actors** (class 5900004,
+spawn rows 628/629/938 — all present in our seed and spawning) bound
+to background layout geometry via the `server_eventnpc_mapobj` table
+(id → layoutId, instanceId; door1→421/2825, door2→421/2829,
+door3→421/4040). `Npc.GetSpawnPackets` sends
+`SetActorBGProperties(instanceId, layoutId)` INSTEAD of an appearance
+packet for these — the layout object carries the mesh + collision.
+Our pipeline lacked the entire chain, so the doors spawned as
+intangible ghosts. Ported: seed `052_server_eventnpc_mapobj.sql`
+(79 rows), `SpawnLocation.mapobj_layout_id/instance_id` (loader LEFT
+JOIN, Meteor `WorldManager.cs:341`), `BaseActor` carry-through, and
+the spawn-bundle branch (BG-properties vs appearance, wire order
+instanceId-first per `SetActorBGPropertiesPacket.cs`).
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).
