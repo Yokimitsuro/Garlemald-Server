@@ -659,14 +659,7 @@ impl CommandProcessor {
             e2.set_target_id(session_id);
             client.send_bytes(e2.to_bytes()).await;
             let mut pkt = crate::packets::send::build_set_actor_position(
-                actor_id,
-                -1,
-                x,
-                y,
-                z,
-                rotation,
-                0,
-                false,
+                actor_id, -1, x, y, z, rotation, 0, false,
             );
             pkt.set_target_id(session_id);
             client.send_bytes(pkt.to_bytes()).await;
@@ -1301,7 +1294,10 @@ mod tests {
             .unwrap();
 
         // `!givegil 250` from chat — no trailing name, sender is target.
-        let out = cmd.run_as("givegil 250", Some("Implicit Hero")).await.unwrap();
+        let out = cmd
+            .run_as("givegil 250", Some("Implicit Hero"))
+            .await
+            .unwrap();
         assert!(out.contains("gave 250 gil to Implicit Hero"), "got {out}");
     }
 
@@ -1361,7 +1357,10 @@ mod tests {
 
         // Cross-zone form, name omitted → invoker; character exists in
         // the DB but has no live ActorHandle.
-        let out = cmd.run_as("warp 166 0 0 0", Some("Warp Target")).await.unwrap();
+        let out = cmd
+            .run_as("warp 166 0 0 0", Some("Warp Target"))
+            .await
+            .unwrap();
         assert_eq!(out, "Warp Target is not online");
     }
 
