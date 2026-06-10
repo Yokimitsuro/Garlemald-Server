@@ -1181,6 +1181,10 @@ impl WorldManager {
         &self,
         registry: &ActorRegistry,
         db: &crate::database::Database,
+        // Battle-command catalog for hotbar `maxCommandRecastTime`
+        // resolution (#28 S3.1). `None` (Lua-less test harnesses) emits
+        // the hotbar with 0-second recast caps — slots still render.
+        catalogs: Option<&Arc<crate::lua::Catalogs>>,
         session_id: u32,
         spawn_type: u16,
     ) {
@@ -1229,6 +1233,7 @@ impl WorldManager {
             current_job,
             login_director_actor_id,
             active_quests,
+            hotbar,
         ) = {
             let c = actor_handle.character.read().await;
             // (slot, quest_actor_id) pairs for `playerWork.questScenario[N]`
@@ -1264,7 +1269,36 @@ impl WorldManager {
                 c.chara.current_job,
                 c.chara.login_director_actor_id,
                 aq,
+                c.chara.hotbar.clone(),
             )
+        };
+        // #28 S3.1 — resolve the equipped hotbar into the pre-masked
+        // `(slot0, command, maxRecast, recastEnd)` tuples the `/_init`
+        // dump emits. Lobby creation stores RAW command ids, the equip
+        // appliers store masked — `| 0xA0F00000` normalises both
+        // (pmeteor `Database.LoadHotbar`). The recast cap comes from the
+        // battle-command catalog; an unresolvable id ships cap 0 (no
+        // spinner) rather than dropping the slot.
+        let hotbar_props: Vec<(u16, u32, u16, u32)> = {
+            let commands = catalogs.and_then(|c| c.battle_commands.read().ok());
+            hotbar
+                .iter()
+                .filter(|e| e.command_id & 0xFFFF != 0)
+                .map(|e| {
+                    let raw = (e.command_id & 0xFFFF) as u16;
+                    let max_recast_s = commands
+                        .as_ref()
+                        .and_then(|m| m.get(&raw))
+                        .map(|c| c.max_recast_time_seconds as u16)
+                        .unwrap_or(0);
+                    (
+                        e.hotbar_slot,
+                        e.command_id | 0xA0F0_0000,
+                        max_recast_s,
+                        e.recast_time,
+                    )
+                })
+                .collect()
         };
         let has_login_director = login_director_actor_id != 0;
         let login_director_spec = session.login_director.clone();
@@ -1563,6 +1597,7 @@ impl WorldManager {
             initial_town,
             rest_bonus_exp_rate,
             &active_quests,
+            &hotbar_props,
         ));
         // Post-init property emission — C# `PostUpdate` drives these on
         // the first tick after spawn, but the client's

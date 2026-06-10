@@ -520,7 +520,26 @@ async fn resolve_auto_attack(
         {
             d.add_hp(-(dr.amount as i32));
             d.hate.update_hate(attacker_actor_id, dr.enmity as i32);
+            // #28 S3.3 — defender TP on damage taken (pmeteor
+            // `Character.OnDamageTaken`, Character.cs:905-908):
+            // ceil(5 · e^(−0.0667 · level) · damage). The dead bank
+            // nothing (pmeteor `AddTP` IsAlive gate).
+            if d.is_alive() {
+                let gain = (5.0 * (-0.0667 * f64::from(def_level)).exp() * f64::from(dr.amount))
+                    .ceil() as i32;
+                d.add_tp(gain);
+            }
         }
+    }
+
+    // #28 S3.3 — attacker TP per landed swing (pmeteor
+    // `Character.OnAttack`, Character.cs:886-895): delay-seconds × 100.
+    // StoreTp omitted — no lvl-1 sources. Misses bank nothing.
+    let landed = dmg_request.map_or(0, |dr| dr.amount);
+    if landed > 0 {
+        let mut a = attacker_handle.character.write().await;
+        let delay_ms = a.get_attack_delay_ms();
+        a.add_tp((f64::from(delay_ms) / 1000.0 * 100.0) as i32);
     }
 
     // Swing animation per attacker kind — pmeteor `AttackState.cs:141-146`:
@@ -543,6 +562,15 @@ async fn resolve_auto_attack(
         zone,
     )
     .await;
+
+    // #28 S3.3 — HP/TP wire sync: the defender's nameplate/roster HP bar
+    // and the attacker's TP gauge only move when a fresh
+    // `charaWork/stateAtQuicklyForAll` lands; without it the init
+    // bundle's values go stale on the first hit.
+    if landed > 0 {
+        broadcast_state_quickly(registry, world, zone, defender_actor_id).await;
+        broadcast_state_quickly(registry, world, zone, attacker_actor_id).await;
+    }
 
     die_if_defender_fell(
         defender_actor_id,
@@ -673,6 +701,82 @@ async fn resolve_action(
             d_write
                 .hate
                 .update_hate(attacker_actor_id, dr.enmity as i32);
+            // #28 S3.3 — defender TP on damage taken, same formula as
+            // the auto-attack arm (pmeteor `OnDamageTaken` runs for any
+            // landed damage, Character.cs:905-908).
+            if d_write.is_alive() {
+                let gain = (5.0 * (-0.0667 * f64::from(def_level)).exp() * f64::from(dr.amount))
+                    .ceil() as i32;
+                d_write.add_tp(gain);
+            }
+        }
+    }
+
+    // #28 S3.3 — player completion bookkeeping: costs come off the
+    // pools, the used hotbar slot starts its recast (in-memory +
+    // persisted via the equip-ability upsert), and the
+    // `charaWork/commandDetailForSelf` pair reaches the owning client.
+    // pmeteor splits this across `DoBattleCommand` (DelMP/DelTP,
+    // Character.cs:1159-1160) and `Player.OnWeaponSkill/OnAbility/
+    // OnCast` (`UpdateHotbarTimer`, Player.cs:2901-2928).
+    let landed = dmg_request.map_or(0, |dr| dr.amount);
+    if attacker_handle.is_player() {
+        let now_unix = common::utils::unix_timestamp() as u32;
+        let recast_end = now_unix.saturating_add(command.max_recast_time_seconds);
+        let (class_id, slot0) = {
+            let mut a = attacker_handle.character.write().await;
+            if command.mp_cost != 0 {
+                a.add_mp(-i32::from(command.mp_cost));
+            }
+            if command.tp_cost != 0 {
+                a.add_tp(-i32::from(command.tp_cost));
+            }
+            // Abilities accrue TP like swings (pmeteor `OnAttack` gate:
+            // AutoAttack | Ability, non-miss); WS/spells gain none.
+            if command.command_type == CommandType::ABILITY && landed > 0 {
+                let delay_ms = a.get_attack_delay_ms();
+                a.add_tp((f64::from(delay_ms) / 1000.0 * 100.0) as i32);
+            }
+            let class_id = a.chara.class.max(0) as u8;
+            let slot0 = a
+                .chara
+                .hotbar
+                .iter_mut()
+                .find(|e| (e.command_id & 0xFFFF) as u16 == command.id)
+                .map(|e| {
+                    e.recast_time = recast_end;
+                    e.hotbar_slot
+                });
+            (class_id, slot0)
+        };
+        if let Some(slot0) = slot0 {
+            if let Some(db) = db
+                && let Err(e) = db
+                    .equip_ability(
+                        attacker_actor_id,
+                        class_id,
+                        slot0,
+                        u32::from(command.id),
+                        recast_end,
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    player = attacker_actor_id,
+                    command = command.id,
+                    err = %e,
+                    "resolve_action: recast persist failed",
+                );
+            }
+            for sub in tx::actor::build_hotbar_recast_update(
+                attacker_actor_id,
+                slot0,
+                command.max_recast_time_seconds as u16,
+                recast_end,
+            ) {
+                // Self-only; the helper stamps the session id (proxy rule).
+                send_to_self_if_player(registry, world, attacker_actor_id, sub.to_bytes()).await;
+            }
         }
     }
 
@@ -686,6 +790,15 @@ async fn resolve_action(
         zone,
     )
     .await;
+
+    // #28 S3.3 — HP/TP wire sync (see the auto-attack arm). The attacker
+    // re-sync is unconditional for players: costs drain even on a miss.
+    if landed > 0 || is_heal {
+        broadcast_state_quickly(registry, world, zone, defender_actor_id).await;
+    }
+    if attacker_handle.is_player() {
+        broadcast_state_quickly(registry, world, zone, attacker_actor_id).await;
+    }
 
     die_if_defender_fell(
         defender_actor_id,
@@ -758,6 +871,38 @@ async fn broadcast_results(
         // session id into the target_id (proxy drop rule). (#28 S0.6.)
         send_to_self_if_player(registry, world, source_actor_id, bytes.clone()).await;
         broadcast_around_actor(world, registry, zone, source_actor_id, bytes).await;
+    }
+}
+
+/// One `charaWork/stateAtQuicklyForAll` bundle for the actor's current
+/// pools — self-send (the player's own HP/MP/TP gauges) + in-zone
+/// broadcast (nameplate + content-roster HP bars). pmeteor drives the
+/// same wire from `Character.PostUpdate`'s `HpTpMp` update flag; the
+/// resolve fns call this after any pool change. (#28 S3.3.)
+async fn broadcast_state_quickly(
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    zone: &Arc<RwLock<Zone>>,
+    actor_id: u32,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let (hp, hp_max, mp, mp_max, tp) = {
+        let c = handle.character.read().await;
+        (
+            c.chara.hp.max(0) as u16,
+            c.chara.max_hp.max(0) as u16,
+            c.chara.mp.max(0) as u16,
+            c.chara.max_mp.max(0) as u16,
+            c.chara.tp,
+        )
+    };
+    for sub in tx::actor::build_chara_state_at_quickly_for_all(actor_id, hp, hp_max, mp, mp_max, tp)
+    {
+        let bytes = sub.to_bytes();
+        send_to_self_if_player(registry, world, actor_id, bytes.clone()).await;
+        broadcast_around_actor(world, registry, zone, actor_id, bytes).await;
     }
 }
 

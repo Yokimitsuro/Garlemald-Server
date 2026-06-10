@@ -679,6 +679,15 @@ pub fn build_player_property_init(
     // never sees the scenario quest a fresh-character `onBeginLogin` adds, so
     // the journal stays empty and Yda/Papalymo's quest icons never light up.
     active_quests: &[(u32, u32)],
+    // Pre-resolved equipped hotbar: `(slot0, masked_command_id,
+    // max_recast_seconds, recast_end_unix)` per populated slot. pmeteor
+    // `Database.LoadHotbar` + `Player.GetInitPackets` (Player.cs:474-505)
+    // emit these as `charaWork.command[32+slot]` with the recast
+    // companions at the 0-based index; without them the client's action
+    // bar is empty and a press never produces the `0x012D EventStart
+    // owner=0xA0F0xxxx commandDefault` the skill path dispatches on.
+    // (Garlemald-Server #28 S3.1.)
+    hotbar: &[(u16, u32, u16, u32)],
 ) -> Vec<SubPacket> {
     let mut b = ActorPropertyPacketBuilder::new(actor_id, "/_init");
 
@@ -764,7 +773,32 @@ pub fn build_player_property_init(
     for (i, id) in STARTER_COMMANDS.iter().enumerate() {
         b.add_int(&format!("charaWork.command[{}]", i), 0xA0F0_0000 | *id);
     }
-    b.add_byte("charaWork.commandAcquired[1150]", 1);
+    // Equipped hotbar — pmeteor `Player.GetInitPackets` (Player.cs:484-487)
+    // pairs every populated `command[i >= 32]` with that slot's
+    // `maxCommandRecastTime` (u16 seconds) + `commandSlot_recastTime`
+    // (u32 unix END timestamp; DB 0 = ready now). `commandAcquired` is
+    // bool[4096] indexed by raw id − 26000 — pmeteor hardcoded the lone
+    // Fast Blade index 1150 (Player.cs:253); emitting it per equipped
+    // command generalises that. Out-of-window ids are skipped, never
+    // emitted with a bogus index. (#28 S3.1.)
+    for (slot0, cmd_masked, max_recast_s, recast_end) in hotbar {
+        if cmd_masked & 0xFFFF == 0 {
+            continue;
+        }
+        b.add_int(&format!("charaWork.command[{}]", 32 + slot0), *cmd_masked);
+        b.add_short(
+            &format!("charaWork.parameterTemp.maxCommandRecastTime[{slot0}]"),
+            *max_recast_s,
+        );
+        b.add_int(
+            &format!("charaWork.parameterSave.commandSlot_recastTime[{slot0}]"),
+            *recast_end,
+        );
+        let acquired_index = (cmd_masked & 0xFFFF) as i32 - 26000;
+        if (0..4096).contains(&acquired_index) {
+            b.add_byte(&format!("charaWork.commandAcquired[{acquired_index}]"), 1);
+        }
+    }
     for i in 0..36 {
         b.add_byte(&format!("charaWork.additionalCommandAcquired[{}]", i), 1);
     }
@@ -869,6 +903,67 @@ pub fn build_player_journal_property(
             *quest_actor_id,
         );
     }
+    b.done()
+}
+
+/// Per-slot live hotbar refresh — pmeteor `Player.UpdateHotbar(slots)`
+/// (`UpdateHotbarCommands` + `UpdateRecastTimers`, Player.cs:2502-2543):
+/// one `charaWork/command`-targeted packet carrying the slot's command
+/// id and category, one `charaWork/commandDetailForSelf`-targeted packet
+/// carrying compatibility and recast state. Sent after Equip/Unequip/
+/// Swap so live hotbar edits show without re-zoning. An empty slot
+/// (`command_masked == 0`) zeroes the command and disables the slot
+/// (category/compatibility 0), matching pmeteor's
+/// `commandSlot_compatibility[i] = command[i] != 0`. (#28 S3.1.)
+pub fn build_hotbar_slot_update(
+    actor_id: u32,
+    slot0: u16,
+    command_masked: u32,
+    max_recast_s: u16,
+    recast_end: u32,
+) -> Vec<SubPacket> {
+    let slot = 32 + slot0;
+    let occupied = (command_masked & 0xFFFF != 0) as u8;
+    let mut cmd = ActorPropertyPacketBuilder::new(actor_id, "charaWork/command");
+    cmd.add_int(&format!("charaWork.command[{slot}]"), command_masked);
+    cmd.add_byte(&format!("charaWork.commandCategory[{slot}]"), occupied);
+    let mut out = cmd.done();
+    let mut detail = ActorPropertyPacketBuilder::new(actor_id, "charaWork/commandDetailForSelf");
+    detail.add_byte(
+        &format!("charaWork.parameterSave.commandSlot_compatibility[{slot0}]"),
+        occupied,
+    );
+    detail.add_short(
+        &format!("charaWork.parameterTemp.maxCommandRecastTime[{slot0}]"),
+        max_recast_s,
+    );
+    detail.add_int(
+        &format!("charaWork.parameterSave.commandSlot_recastTime[{slot0}]"),
+        recast_end,
+    );
+    out.extend(detail.done());
+    out
+}
+
+/// Recast-only `charaWork/commandDetailForSelf` pair — pmeteor
+/// `Player.UpdateRecastTimers` (Player.cs:2530-2543), fired per used slot
+/// on skill completion (`UpdateHotbarTimer`). The client renders the
+/// spinner as `recast_end − now`. (#28 S3.3.)
+pub fn build_hotbar_recast_update(
+    actor_id: u32,
+    slot0: u16,
+    max_recast_s: u16,
+    recast_end: u32,
+) -> Vec<SubPacket> {
+    let mut b = ActorPropertyPacketBuilder::new(actor_id, "charaWork/commandDetailForSelf");
+    b.add_short(
+        &format!("charaWork.parameterTemp.maxCommandRecastTime[{slot0}]"),
+        max_recast_s,
+    );
+    b.add_int(
+        &format!("charaWork.parameterSave.commandSlot_recastTime[{slot0}]"),
+        recast_end,
+    );
     b.done()
 }
 
@@ -1087,14 +1182,153 @@ mod player_property_init_tests {
     /// ready-command table is empty and F is dead (Garlemald-Server #28).
     #[test]
     fn init_properties_carry_starter_commands() {
-        let subs =
-            build_player_property_init(7, 100, 100, 100, 100, 0, 2, 1, 32, 0, 0, 1, 1, 1, 0, &[]);
+        let subs = build_player_property_init(
+            7,
+            100,
+            100,
+            100,
+            100,
+            0,
+            2,
+            1,
+            32,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            &[],
+            &[],
+        );
         let stream: Vec<u8> = subs.iter().flat_map(|s| s.to_bytes()).collect();
         let activate = 0xA0F0_5209u32.to_le_bytes();
         let hits = stream.windows(4).filter(|w| *w == activate).count();
         assert!(
             hits >= 2,
             "expected charaWork.command[0] and [1] to carry 0xA0F05209 (Activate); found {hits} occurrence(s)",
+        );
+    }
+
+    /// Encode one staged property as the exact wire triple
+    /// `[type_byte, murmur2(name) LE, value LE]` so the assertions below
+    /// can pin both the property id AND its wire type — pmeteor's
+    /// reflection emits command as int, maxCommandRecastTime as short,
+    /// commandSlot_recastTime as int, commandAcquired as byte, and a
+    /// mis-typed field corrupts every property that follows it in the
+    /// 0x0137 stream (the historical `state_mainSkillLevel` crash).
+    fn property_needle(type_byte: u8, name: &str, value_le: &[u8]) -> Vec<u8> {
+        let mut needle = vec![type_byte];
+        needle.extend_from_slice(&common::utils::murmur_hash2(name, 0).to_le_bytes());
+        needle.extend_from_slice(value_le);
+        needle
+    }
+
+    /// #28 S3.1 — a GLA hotbar `[(0, 0xA0F06A0E, 10, 0)]` (Fast Blade
+    /// 27150, masked, 10 s recast, ready now) emits exactly the four
+    /// pmeteor `LoadHotbar`/`GetInitPackets` properties: the masked
+    /// command id at `command[32]`, the recast companions at 0-based
+    /// slot 0, and `commandAcquired[1150]` (= 27150 − 26000).
+    #[test]
+    fn init_properties_carry_hotbar_slots() {
+        let hotbar = [(0u16, 0xA0F0_6A0Eu32, 10u16, 0u32)];
+        let subs = build_player_property_init(
+            7,
+            100,
+            100,
+            100,
+            100,
+            0,
+            3,
+            1,
+            32,
+            0,
+            0,
+            1,
+            1,
+            1,
+            0,
+            &[],
+            &hotbar,
+        );
+        let stream: Vec<u8> = subs.iter().flat_map(|s| s.to_bytes()).collect();
+        for (label, needle) in [
+            (
+                "charaWork.command[32] = 0xA0F06A0E (int)",
+                property_needle(4, "charaWork.command[32]", &0xA0F0_6A0Eu32.to_le_bytes()),
+            ),
+            (
+                "maxCommandRecastTime[0] = 10 (short)",
+                property_needle(
+                    2,
+                    "charaWork.parameterTemp.maxCommandRecastTime[0]",
+                    &10u16.to_le_bytes(),
+                ),
+            ),
+            (
+                "commandSlot_recastTime[0] = 0 (int)",
+                property_needle(
+                    4,
+                    "charaWork.parameterSave.commandSlot_recastTime[0]",
+                    &0u32.to_le_bytes(),
+                ),
+            ),
+            (
+                "commandAcquired[1150] = 1 (byte)",
+                property_needle(1, "charaWork.commandAcquired[1150]", &[1]),
+            ),
+        ] {
+            assert!(
+                stream.windows(needle.len()).any(|w| w == needle),
+                "init stream missing {label}",
+            );
+        }
+    }
+
+    /// #28 S3.1 — the post-equip `UpdateHotbar` pair carries the
+    /// command + category under `charaWork/command` and compat +
+    /// recast under `charaWork/commandDetailForSelf`, and an empty
+    /// slot disables rather than ghosts the button.
+    #[test]
+    fn hotbar_slot_update_pair_carries_both_targets() {
+        let subs = build_hotbar_slot_update(7, 0, 0xA0F0_6A0E, 10, 1234);
+        assert_eq!(subs.len(), 2, "one packet per property target");
+        let cmd_bytes = subs[0].to_bytes();
+        let detail_bytes = subs[1].to_bytes();
+        assert!(
+            cmd_bytes
+                .windows(b"charaWork/command".len())
+                .any(|w| w == b"charaWork/command"),
+            "first packet targets charaWork/command",
+        );
+        assert!(
+            detail_bytes
+                .windows(b"charaWork/commandDetailForSelf".len())
+                .any(|w| w == b"charaWork/commandDetailForSelf"),
+            "second packet targets charaWork/commandDetailForSelf",
+        );
+        let cmd_needle = property_needle(4, "charaWork.command[32]", &0xA0F0_6A0Eu32.to_le_bytes());
+        assert!(cmd_bytes.windows(cmd_needle.len()).any(|w| w == cmd_needle));
+        let recast_needle = property_needle(
+            4,
+            "charaWork.parameterSave.commandSlot_recastTime[0]",
+            &1234u32.to_le_bytes(),
+        );
+        assert!(
+            detail_bytes
+                .windows(recast_needle.len())
+                .any(|w| w == recast_needle)
+        );
+
+        // Empty slot: command 0, category + compatibility 0.
+        let empty = build_hotbar_slot_update(7, 0, 0, 0, 0);
+        let empty_cmd = empty[0].to_bytes();
+        let category_off = property_needle(1, "charaWork.commandCategory[32]", &[0]);
+        assert!(
+            empty_cmd
+                .windows(category_off.len())
+                .any(|w| w == category_off),
+            "empty slot must emit commandCategory[32] = 0",
         );
     }
 }

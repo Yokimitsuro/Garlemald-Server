@@ -426,7 +426,13 @@ impl PacketProcessor {
                 tracing::error!(error = %e, actor = actor_id, "zone change failed");
             } else {
                 self.world
-                    .send_zone_in_bundle(&self.registry, &self.db, session_id, 0x1)
+                    .send_zone_in_bundle(
+                        &self.registry,
+                        &self.db,
+                        self.lua.as_ref().map(|l| l.catalogs()),
+                        session_id,
+                        0x1,
+                    )
                     .await;
             }
         }
@@ -591,7 +597,13 @@ impl PacketProcessor {
             tracing::error!(error = %e, actor = actor_id, "login zone change failed");
         } else {
             self.world
-                .send_zone_in_bundle(&self.registry, &self.db, session_id, 0x1)
+                .send_zone_in_bundle(
+                    &self.registry,
+                    &self.db,
+                    self.lua.as_ref().map(|l| l.catalogs()),
+                    session_id,
+                    0x1,
+                )
                 .await;
         }
 
@@ -3125,7 +3137,13 @@ impl PacketProcessor {
         //    the session + character we just updated, so the bundle
         //    spawns the player at the content-area coords.
         self.world
-            .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
+            .send_zone_in_bundle(
+                &self.registry,
+                &self.db,
+                self.lua.as_ref().map(|l| l.catalogs()),
+                session_id,
+                spawn_type as u16,
+            )
             .await;
 
         // The bundle has now AddActor'd + state-synced the content NPCs on
@@ -4720,6 +4738,50 @@ impl PacketProcessor {
     /// here. The in-memory hotbar snapshot + the
     /// `charaWork.command[N]` SetActorProperty fan-out are deferred
     /// — the next character load picks the row up.
+    /// pmeteor `Player.UpdateHotbar(slots)` — push one slot's live
+    /// command + recast state to the owning client after an
+    /// Equip/Unequip/Swap applier, so hotbar edits render without
+    /// re-zoning. Reads the post-mutation `chara.hotbar` mirror; an
+    /// absent entry emits the disable shape (command 0, category /
+    /// compatibility 0). Self-only, every subpacket target-stamped
+    /// (proxy rule). (#28 S3.1.)
+    async fn send_hotbar_slot_update(&self, player_id: u32, slot0: u16) {
+        let Some(handle) = self.registry.get(player_id).await else {
+            return;
+        };
+        let Some(client) = self.world.client(handle.session_id).await else {
+            return;
+        };
+        let (command_masked, recast_end) = {
+            let c = handle.character.read().await;
+            c.chara
+                .hotbar
+                .iter()
+                .find(|e| e.hotbar_slot == slot0)
+                .map(|e| (e.command_id | 0xA0F0_0000, e.recast_time))
+                .unwrap_or((0, 0))
+        };
+        let max_recast_s = self
+            .lua
+            .as_ref()
+            .and_then(|l| l.catalogs().battle_commands.read().ok())
+            .and_then(|m| {
+                m.get(&((command_masked & 0xFFFF) as u16))
+                    .map(|c| c.max_recast_time_seconds as u16)
+            })
+            .unwrap_or(0);
+        for mut sub in crate::packets::send::actor::build_hotbar_slot_update(
+            player_id,
+            slot0,
+            command_masked,
+            max_recast_s,
+            recast_end,
+        ) {
+            sub.set_target_id(handle.session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
+    }
+
     async fn apply_equip_ability(
         &self,
         player_id: u32,
@@ -4797,6 +4859,10 @@ impl PacketProcessor {
             pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
+
+        // Live hotbar refresh (pmeteor `EquipAbility` tail: UpdateHotbar).
+        self.send_hotbar_slot_update(player_id, zero_based_slot)
+            .await;
     }
 
     /// `player:UnequipAbility(slot)` — DELETE the hotbar row for the
@@ -4874,6 +4940,9 @@ impl PacketProcessor {
             pkt.set_target_id(session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
+
+        // Live hotbar refresh — the emptied slot disables client-side.
+        self.send_hotbar_slot_update(player_id, hotbar_slot).await;
     }
 
     /// `player:SwapAbilities(slot1, slot2)` — exchange two hotbar
@@ -4956,6 +5025,10 @@ impl PacketProcessor {
             slot_2 = hotbar_slot_2,
             "SwapAbilities persisted (both slots swapped) + snapshot mirror",
         );
+
+        // Live hotbar refresh for both slots.
+        self.send_hotbar_slot_update(player_id, zero_1).await;
+        self.send_hotbar_slot_update(player_id, zero_2).await;
     }
 
     /// `player:EquipAbilityInFirstOpenSlot(classId, commandId)` —
@@ -5047,6 +5120,9 @@ impl PacketProcessor {
             pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
+
+        // Live hotbar refresh (pmeteor `EquipAbility` tail: UpdateHotbar).
+        self.send_hotbar_slot_update(player_id, slot).await;
     }
 
     /// `player:SavePlayTime()` — persist the player's play_time so
@@ -7132,7 +7208,10 @@ impl PacketProcessor {
     /// sequence + journalInfo.
     const REQUEST_QUEST_JOURNAL_COMMAND: u32 = 0xA0F0_5E93;
 
-    async fn handle_event_start(&self, session_id: u32, data: &[u8]) -> Result<()> {
+    // `pub(crate)` so the #28 S3.2 integration test can drive a synthetic
+    // retail-shaped 0x012D through the same parse + dispatch path the
+    // socket reader uses.
+    pub(crate) async fn handle_event_start(&self, session_id: u32, data: &[u8]) -> Result<()> {
         let pkt = match EventStartPacket::parse(data) {
             Ok(p) => p,
             Err(e) => {
@@ -7191,6 +7270,36 @@ impl PacketProcessor {
         for e in outbox.drain() {
             dispatch_event_event(&e, &self.registry, &self.world, &self.db, self.lua.as_ref())
                 .await;
+        }
+
+        // Hotbar skill press — retail sends `EventStart` with eventName
+        // `commandDefault` and the command's static-actor id
+        // (`0xA0F00000 | id`) as the owner (D §1.1, combat_skills.pcapng;
+        // the real target rides in the type-6 Actor LuaParam). Resolve the
+        // masked id against the battle-command catalog and execute inline —
+        // the on-disk command scripts are 4-liners with no
+        // WeaponSkill/Ability/Cast bindings (plan R5). The route is
+        // exclusive, mirroring pmeteor's `PacketProcessor` 0x012D which
+        // targets only the command static actor: no quest/director fan-out
+        // for a skill press. The two ActivateCommand ids ride eventName
+        // `commandForced` and stay on the command-script dispatch below;
+        // unresolved 0xA0F0xxxx owners (journal command etc.) fall through
+        // unchanged. (#28 S3.2.)
+        if (owner_actor_id & 0xFFF0_0000) == 0xA0F0_0000 && event_name_for_match == "commandDefault"
+        {
+            let masked_cmd = (owner_actor_id & 0xFFFF) as u16;
+            let command = self.lua.as_ref().and_then(|l| {
+                l.catalogs()
+                    .battle_commands
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(&masked_cmd).cloned())
+            });
+            if let Some(command) = command {
+                self.dispatch_hotbar_command(&handle, session_id, &lua_params_for_cmd, command)
+                    .await;
+                return Ok(());
+            }
         }
 
         // Content-director `onEventStarted` dispatch. When the EventStart's
@@ -7570,6 +7679,223 @@ impl PacketProcessor {
             );
         }
         Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
+    }
+
+    /// One X01 error row — pmeteor `WeaponSkillState.errorResult` shape
+    /// (`CommandResult(owner.Id, textId, 0)` flushed via
+    /// `DoBattleAction(skill.id, 0, errorResult)`): animation 0, the
+    /// pressed command id, the player as the row target, and the error
+    /// text in `worldMasterTextId`. Self-only — the validation error is
+    /// the actor's own feedback line. (#28 S3.2.)
+    async fn send_command_error_result(
+        &self,
+        session_id: u32,
+        actor_id: u32,
+        command_id: u16,
+        text_id: u16,
+    ) {
+        let Some(client) = self.world.client(session_id).await else {
+            return;
+        };
+        let row = crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            worldmaster_text_id: text_id,
+            ..Default::default()
+        };
+        let mut pkt = crate::packets::send::actor_battle::build_command_result_x01(
+            actor_id, 0, command_id, &row,
+        );
+        pkt.set_target_id(session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+    }
+
+    /// End the event-session the press's `start_event` opened — exactly
+    /// one 0x0131 per IN 0x012D (retail shape). Routed through the
+    /// session + event dispatcher so the packet rides the standard
+    /// target-stamped send. (#28 S3.2.)
+    async fn end_command_event(&self, handle: &ActorHandle) {
+        let mut outbox = EventOutbox::new();
+        {
+            let mut c = handle.character.write().await;
+            c.event_session.end_event(handle.actor_id, &mut outbox);
+        }
+        for e in outbox.drain() {
+            dispatch_event_event(&e, &self.registry, &self.world, &self.db, self.lua.as_ref())
+                .await;
+        }
+    }
+
+    /// Inline execution of a hotbar skill press (#28 S3.2) — the Rust port
+    /// of pmeteor's 4-line command scripts (`AttackWeaponSkill.lua` /
+    /// `Ability.lua` / `AttackMagic.lua`) + `Player.CanUse`
+    /// (Player.cs:2809-2877), routed by the catalog's `commandType`
+    /// (2 → weaponskill, 3 → ability, 4 → spell) instead of shipping
+    /// staticactors.bin. Exactly one EndEvent answers every press;
+    /// validation failures additionally carry one X01 error row (or the
+    /// 32503 system line for the active-mode gate). Completion damage
+    /// flows through the existing ticker → `ResolveAction` →
+    /// `resolve_action` pipeline; S3.3 handles costs/recast there.
+    pub(crate) async fn dispatch_hotbar_command(
+        &self,
+        handle: &ActorHandle,
+        session_id: u32,
+        lua_params: &[common::luaparam::LuaParam],
+        command: crate::gamedata::BattleCommand,
+    ) {
+        let actor_id = handle.actor_id;
+
+        // Retail rides the real target in the type-6 Actor param — the
+        // Int32 slot pmeteor's script signature names `targetActor` is 0
+        // on the wire, which is why pmeteor falls through to
+        // `currentTarget` (Player.cs:2685-2701). Same fallback here.
+        let param_target = lua_params.iter().find_map(|p| match p {
+            common::luaparam::LuaParam::Actor(id) if *id != 0 => Some(*id),
+            _ => None,
+        });
+
+        let (main_state, my_x, my_y, my_z, mp, tp, current_target, can_change, recast_end) = {
+            let c = handle.character.read().await;
+            (
+                c.base.current_main_state,
+                c.base.position_x,
+                c.base.position_y,
+                c.base.position_z,
+                c.chara.mp,
+                c.chara.tp,
+                c.chara.current_target,
+                c.ai_container.can_change_state(),
+                c.chara
+                    .hotbar
+                    .iter()
+                    .find(|e| (e.command_id & 0xFFFF) as u16 == command.id)
+                    .map(|e| e.recast_time)
+                    .unwrap_or(0),
+            )
+        };
+
+        // Active-mode gate (commands/AttackWeaponSkill.lua:15-19):
+        // "You are not in active mode" as the WorldMaster system line.
+        if main_state != crate::actor::MAIN_STATE_ACTIVE {
+            if let Some(client) = self.world.client(session_id).await {
+                let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                    crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                    crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                    32503,
+                    crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+                );
+                pkt.set_target_id(session_id);
+                client.send_bytes(pkt.to_bytes()).await;
+            }
+            self.end_command_event(handle).await;
+            return;
+        }
+
+        // Target resolution + the pmeteor `IsValidTarget` null arm
+        // (32511 "Target does not exist"). A dead target takes the same
+        // line — the lvl-1 kit is enemy-single-target only.
+        let target_id = param_target.unwrap_or(current_target);
+        let target_handle = if target_id != 0 && target_id != crate::actor::INVALID_ACTORID {
+            self.registry.get(target_id).await
+        } else {
+            None
+        };
+        let target_state = match &target_handle {
+            Some(t) => {
+                let c = t.character.read().await;
+                c.is_alive()
+                    .then_some((c.base.position_x, c.base.position_y, c.base.position_z))
+            }
+            None => None,
+        };
+        let Some((t_x, t_y, t_z)) = target_state else {
+            self.send_command_error_result(session_id, actor_id, command.id, 32511)
+                .await;
+            self.end_command_event(handle).await;
+            return;
+        };
+
+        // pmeteor `Player.WeaponSkill/Ability/Cast`: a busy state stack
+        // (mid-cast) rejects with the same wait-a-moment line, then
+        // `Player.CanUse` runs the ordered checklist (Player.cs:2809-2877).
+        let now_unix = common::utils::unix_timestamp() as u32;
+        let dist_xz = ((t_x - my_x).powi(2) + (t_z - my_z).powi(2)).sqrt();
+        let half_height = command.range_height as f32 / 2.0;
+        let error_text = if !can_change || recast_end > now_unix {
+            Some(32535) // "Please wait a moment and try again."
+        } else if dist_xz > command.range {
+            Some(32539) // "The target is too far away."
+        } else if dist_xz < command.min_range {
+            Some(32538) // "The target is too close."
+        } else if t_y - my_y > half_height {
+            Some(32540) // "The target is too far above you."
+        } else if my_y - t_y > half_height {
+            Some(32541) // "The target is too far below you."
+        } else if command.mp_cost as i32 > mp as i32 {
+            Some(32545) // "You do not have enough MP."
+        } else if command.tp_cost as i32 > tp as i32 {
+            Some(32546) // "You do not have enough TP."
+        } else {
+            None
+        };
+        if let Some(text_id) = error_text {
+            self.send_command_error_result(session_id, actor_id, command.id, text_id)
+                .await;
+            self.end_command_event(handle).await;
+            return;
+        }
+
+        // Engage-if-not (command-script line: `if not IsEngaged() then
+        // Engage(target)`) + the skill state push. Shared battle clock —
+        // the ticker drives completion in this domain (#28 S0.2).
+        let now_ms = crate::runtime::clock::server_now_ms();
+        let pushed = {
+            let mut c = handle.character.write().await;
+            if !c.ai_container.is_engaged() {
+                let delay = c.get_attack_delay_ms();
+                c.ai_container.internal_engage(target_id, now_ms, delay);
+                // Hate seed — same rationale as `apply_actor_engage`:
+                // without it a controller-less engage has no most-hated
+                // entry for downstream reads. (#28.)
+                c.hate.update_hate(target_id, 1);
+            }
+            let bc = command.to_battle_command();
+            match command.command_type {
+                t if t == crate::battle::CommandType::WEAPON_SKILL.bits() as i16 => {
+                    c.ai_container.internal_weapon_skill(target_id, bc, now_ms)
+                }
+                t if t == crate::battle::CommandType::ABILITY.bits() as i16 => {
+                    c.ai_container.internal_ability(target_id, bc, now_ms)
+                }
+                t if t == crate::battle::CommandType::SPELL.bits() as i16 => {
+                    c.ai_container.internal_cast(target_id, bc, now_ms)
+                }
+                other => {
+                    tracing::debug!(
+                        player = actor_id,
+                        command = command.id,
+                        command_type = other,
+                        "hotbar press for unroutable commandType — dropped",
+                    );
+                    false
+                }
+            }
+        };
+        if !pushed {
+            // State-push raced (stack filled between the gate read and
+            // the lock) — same feedback pmeteor gives.
+            self.send_command_error_result(session_id, actor_id, command.id, 32535)
+                .await;
+        }
+        tracing::debug!(
+            player = actor_id,
+            command = command.id,
+            command_type = command.command_type,
+            target = format!("0x{target_id:08X}"),
+            pushed,
+            "hotbar command dispatched",
+        );
+
+        self.end_command_event(handle).await;
     }
 
     /// Apply a client `SetTarget` (0x00CD). Port of pmeteor

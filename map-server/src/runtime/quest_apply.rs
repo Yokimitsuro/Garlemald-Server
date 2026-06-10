@@ -1774,7 +1774,13 @@ pub(crate) async fn apply_do_zone_change(
     //    from the session + character we just updated, so the
     //    bundle spawns the player at the new coords.
     world
-        .send_zone_in_bundle(registry, db, session_id, spawn_type as u16)
+        .send_zone_in_bundle(
+            registry,
+            db,
+            lua.map(|l| l.catalogs()),
+            session_id,
+            spawn_type as u16,
+        )
         .await;
 
     // 6. pmeteor sends the 34108 "instance" message AFTER the bundle

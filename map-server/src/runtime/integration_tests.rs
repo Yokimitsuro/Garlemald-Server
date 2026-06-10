@@ -12581,3 +12581,317 @@ async fn s2_5_content_onupdate_engages_roster_and_reengages_on_death() {
         "Yda's new target must be a live wolf, got 0x{yda_target:08X}",
     );
 }
+
+// ---------------------------------------------------------------------------
+// #28 Phase 3 — hotbar press dispatch + execution + costs/recast/TP
+// ---------------------------------------------------------------------------
+
+/// Synthetic retail-shaped 0x012D EventStart body (D §1.1): trigger u32,
+/// owner u32 (`0xA0F00000 | command id`), serverCodes, unknown, eventType
+/// u8, NUL-terminated eventName, LuaParam tail with the real target in
+/// the type-6 Actor param.
+fn event_start_body(
+    trigger: u32,
+    owner: u32,
+    event_name: &str,
+    params: &[common::luaparam::LuaParam],
+) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(&trigger.to_le_bytes());
+    v.extend_from_slice(&owner.to_le_bytes());
+    v.extend_from_slice(&0x2680_0000u32.to_le_bytes()); // serverCodes
+    v.extend_from_slice(&0u32.to_le_bytes()); // unknown
+    v.push(0); // event_type
+    v.extend_from_slice(event_name.as_bytes());
+    v.push(0);
+    common::luaparam::write_lua_params(&mut v, params).expect("lua params encode");
+    v
+}
+
+fn parse_all_subpackets(rx: &mut mpsc::Receiver<Vec<u8>>) -> Vec<common::subpacket::SubPacket> {
+    let mut out = Vec::new();
+    while let Ok(bytes) = rx.try_recv() {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            match common::subpacket::SubPacket::parse(&bytes, &mut offset) {
+                Ok(sub) => out.push(sub),
+                Err(_) => break,
+            }
+        }
+    }
+    out
+}
+
+/// X01 rows decoded per the retail layout (#28 S0.6): `(anim, cmd,
+/// target, amount, textId)`.
+fn decode_x01_rows(subs: &[common::subpacket::SubPacket]) -> Vec<(u32, u16, u32, u16, u16)> {
+    subs.iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_COMMAND_RESULT_X01)
+        .map(|s| {
+            (
+                u32::from_le_bytes(s.data[0x04..0x08].try_into().unwrap()),
+                u16::from_le_bytes(s.data[0x24..0x26].try_into().unwrap()),
+                u32::from_le_bytes(s.data[0x28..0x2C].try_into().unwrap()),
+                u16::from_le_bytes(s.data[0x2C..0x2E].try_into().unwrap()),
+                u16::from_le_bytes(s.data[0x2E..0x30].try_into().unwrap()),
+            )
+        })
+        .collect()
+}
+
+fn count_end_events(subs: &[common::subpacket::SubPacket]) -> usize {
+    subs.iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_END_EVENT)
+        .count()
+}
+
+fn contains_target_path(subs: &[common::subpacket::SubPacket], path: &[u8]) -> bool {
+    subs.iter()
+        .any(|s| s.data.windows(path.len()).any(|w| w == path))
+}
+
+/// #28 S3.2 + S3.3 — a Fast Blade hotbar press drives the full pipeline:
+/// the retail-shaped 0x012D dispatches inline (active-mode gate, target
+/// from the type-6 param, CanUse order), pushes the WeaponSkill state +
+/// engages, answers with exactly one EndEvent per press, completes via
+/// the ticker into an X01 carrying cmd 27150 + battleAnimation
+/// 301995007, drains the 1000 TP cost, starts + emits the 10 s recast
+/// (commandDetailForSelf pair), re-presses fail 32535 inside the recast
+/// and 32539 out of range, and subsequent auto-attack swings accrue TP
+/// with the stateAtQuicklyForAll wire sync.
+#[tokio::test]
+async fn hotbar_press_executes_fast_blade_with_costs_and_recast() {
+    use crate::actor::Character;
+    use crate::battle::BattleStateKind;
+    use crate::data::Session as MapSession;
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+    use common::luaparam::LuaParam;
+
+    let db = Arc::new(
+        crate::database::Database::open(tempdb())
+            .await
+            .expect("db stub"),
+    );
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let lua = Arc::new(crate::lua::LuaEngine::new("/nonexistent"));
+    // Real seed catalog — fast_blade 27150 (GLA lvl 1, WS, tp 1000,
+    // range 5, recast 10 s, battleAnimation 301995007).
+    let (catalog, by_level) = db
+        .load_global_battle_command_list()
+        .await
+        .expect("battle command catalog");
+    assert!(catalog.contains_key(&27150), "fast_blade seeded");
+    lua.catalogs()
+        .install_battle_commands_with_level_index(catalog, by_level);
+
+    let mut zone = Zone::new(
+        100,
+        "test",
+        1,
+        "/Area/Zone/Test",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 1,
+            kind: ActorKind::Player,
+            position: Vector3::ZERO,
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 2,
+            kind: ActorKind::BattleNpc,
+            position: Vector3::new(3.0, 0.0, 0.0),
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    world.register_zone(zone).await;
+
+    // GLA player in PASSIVE state first (the active-mode gate phase),
+    // hotbar slot 0 = raw 27150 (lobby-creation shape), tp 1000.
+    let mut player = Character::new(1);
+    player.chara.hp = 1000;
+    player.chara.max_hp = 1000;
+    player.chara.level = 1;
+    player.chara.class = 3;
+    player.chara.tp = 1000;
+    player.chara.hotbar.push(crate::gamedata::HotbarEntry {
+        hotbar_slot: 0,
+        command_id: 27150,
+        recast_time: 0,
+    });
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, player))
+        .await;
+    let mut wolf = Character::new(2);
+    wolf.chara.hp = 5000;
+    wolf.chara.max_hp = 5000;
+    wolf.chara.level = 1;
+    wolf.base.position_x = 3.0;
+    registry
+        .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, wolf))
+        .await;
+
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
+    world.register_client(42, ClientHandle::new(42, tx)).await;
+    world
+        .upsert_session(MapSession {
+            id: 42,
+            current_zone_id: 100,
+            ..MapSession::default()
+        })
+        .await;
+
+    let processor = crate::processor::PacketProcessor {
+        db: db.clone(),
+        world: world.clone(),
+        registry: registry.clone(),
+        lua: Some(lua.clone()),
+        cmd: None,
+    };
+    let handle = registry.get(1).await.expect("player handle");
+    let press = event_start_body(1, 0xA0F0_6A0E, "commandDefault", &[LuaParam::Actor(2)]);
+
+    // Phase 0 — passive mode: gated with the 32503 line, one EndEvent,
+    // no state pushed.
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "exactly one EndEvent per press");
+    {
+        let c = handle.character.read().await;
+        assert!(
+            !c.ai_container.is_engaged(),
+            "passive-mode press must not engage",
+        );
+    }
+
+    // Phase 1 — active mode: the press engages + pushes WeaponSkill.
+    {
+        let mut c = handle.character.write().await;
+        c.base.current_main_state = crate::actor::MAIN_STATE_ACTIVE;
+    }
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "exactly one EndEvent per press");
+    {
+        let c = handle.character.read().await;
+        assert!(c.ai_container.is_engaged(), "press must engage-if-not");
+        assert!(
+            c.ai_container.is_current(BattleStateKind::WeaponSkill),
+            "WeaponSkill state must top the stack",
+        );
+    }
+
+    // Phase 2 — completion via the ticker: damage X01 with the real
+    // command id + battleAnimation, TP drained, recast set + emitted.
+    let ticker = GameTicker::new(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+    );
+    ticker
+        .tick_once(crate::runtime::clock::server_now_ms() + 1)
+        .await;
+    let subs = parse_all_subpackets(&mut rx);
+    let rows = decode_x01_rows(&subs);
+    assert!(
+        rows.iter()
+            .any(|(anim, cmd, target, ..)| *anim == 301_995_007 && *cmd == 27150 && *target == 2),
+        "completion X01 must carry battleAnimation 301995007 + cmd 27150; got {rows:?}",
+    );
+    assert!(
+        contains_target_path(&subs, b"charaWork/commandDetailForSelf"),
+        "recast pair must reach the client on completion",
+    );
+    assert!(
+        contains_target_path(&subs, b"charaWork/stateAtQuicklyForAll"),
+        "HP/TP state sync must reach the client",
+    );
+    let now_unix = common::utils::unix_timestamp() as u32;
+    {
+        let c = handle.character.read().await;
+        assert_eq!(c.chara.tp, 0, "Fast Blade drains the full 1000 TP");
+        let recast = c.chara.hotbar[0].recast_time;
+        assert!(
+            (now_unix + 8..=now_unix + 11).contains(&recast),
+            "slot recast must be ~now+10s, got {recast} (now {now_unix})",
+        );
+    }
+
+    // Phase 3 — re-press inside the recast window: 32535 error row +
+    // EndEvent, no second WeaponSkill push.
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "error path still EndEvents");
+    let rows = decode_x01_rows(&subs);
+    assert!(
+        rows.iter()
+            .any(|(anim, cmd, _, _, text)| *anim == 0 && *cmd == 27150 && *text == 32535),
+        "recast re-press must carry error text 32535; got {rows:?}",
+    );
+
+    // Phase 4 — range gate: recast cleared, target moved to 10 y
+    // (fast_blade range 5) → 32539.
+    {
+        let mut c = handle.character.write().await;
+        c.chara.hotbar[0].recast_time = 0;
+    }
+    {
+        let wolf_handle = registry.get(2).await.unwrap();
+        let mut c = wolf_handle.character.write().await;
+        c.base.position_x = 10.0;
+    }
+    processor.handle_event_start(42, &press).await.unwrap();
+    let subs = parse_all_subpackets(&mut rx);
+    assert_eq!(count_end_events(&subs), 1, "error path still EndEvents");
+    let rows = decode_x01_rows(&subs);
+    assert!(
+        rows.iter()
+            .any(|(_, cmd, _, _, text)| *cmd == 27150 && *text == 32539),
+        "out-of-range press must carry error text 32539; got {rows:?}",
+    );
+
+    // Phase 5 — TP accrual: the engage from Phase 1 keeps swinging
+    // (wolf back in range). Default delay 2500 ms → 250 TP per landed
+    // swing (pmeteor delay-seconds × 100); run several swings so the
+    // miss/zero-roll chance can't flake the assertion.
+    {
+        let wolf_handle = registry.get(2).await.unwrap();
+        let mut c = wolf_handle.character.write().await;
+        c.base.position_x = 2.0;
+    }
+    let base = crate::runtime::clock::server_now_ms();
+    for i in 1..=10u64 {
+        ticker.tick_once(base + i * 2_600).await;
+    }
+    let subs = parse_all_subpackets(&mut rx);
+    {
+        let c = handle.character.read().await;
+        assert!(
+            c.chara.tp > 0 && c.chara.tp.is_multiple_of(250),
+            "swings must bank 250 TP each (delay 2500 ms), got {}",
+            c.chara.tp,
+        );
+    }
+    assert!(
+        contains_target_path(&subs, b"charaWork/stateAtQuicklyForAll"),
+        "TP changes must ride the stateAtQuicklyForAll sync",
+    );
+}
