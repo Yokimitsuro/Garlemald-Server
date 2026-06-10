@@ -3013,4 +3013,93 @@ mod tests {
             "parked on the kick reply",
         );
     }
+
+    /// Cross-thread repro of the LIVE ticker topology: the signal resume
+    /// (and its `wait()` re-park) happens on one thread while a ticker
+    /// thread hammers `engine.tick()` concurrently — mirroring the
+    /// processor async task vs the ticker's `spawn_blocking`. The live
+    /// SEQ_005 run parks on time after the F-press signal resume but the
+    /// production ticker never drains it; if that reproduces here, it is
+    /// an engine bug — if not, it is environmental. (Garlemald-Server #28.)
+    #[test]
+    fn ticker_thread_drains_park_made_on_another_thread() {
+        let root = tmpdir();
+        std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+        std::fs::write(
+            root.join("global.lua"),
+            r#"
+                function wait(seconds)
+                    return coroutine.yield("_WAIT_TIME", seconds);
+                end
+                function waitForSignal(signal)
+                    return coroutine.yield("_WAIT_SIGNAL", signal);
+                end
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("directors/Quest/QuestDirectorThreaded.lua"),
+            r#"
+                require ("global")
+                function onEventStarted(player, director, eventType, eventName)
+                    waitForSignal("playerActive")
+                    wait(0.2)
+                    player:SendMessage(0x20, "", "post-wait")
+                end
+            "#,
+        )
+        .unwrap();
+
+        let engine = Arc::new(LuaEngine::new(&root));
+        let script_path = root.join("directors/Quest/QuestDirectorThreaded.lua");
+        let dummy_queue = CommandQueue::new();
+        let result = engine.call_director_on_event_started(
+            &script_path,
+            sample_snapshot(),
+            sample_director(dummy_queue),
+            "noticeEvent".to_string(),
+            5,
+            vec![],
+        );
+        assert!(result.error.is_none(), "{:?}", result.error);
+
+        // Ticker thread: hammer tick() every 10ms for up to 3s, collect
+        // any drained batches.
+        let tick_engine = engine.clone();
+        let ticker = std::thread::spawn(move || {
+            let mut got: Vec<(u32, Vec<LuaCommand>)> = Vec::new();
+            for _ in 0..300 {
+                got.extend(tick_engine.tick());
+                if !got.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            got
+        });
+
+        // Resume off the signal from THIS thread (the "processor").
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let resumed = engine.fire_signal_and_drain("playerActive");
+        assert!(resumed.is_empty());
+        assert_eq!(
+            engine.scheduler().lock().unwrap().pending_time_count(),
+            1,
+            "wait(0.2) parked on time from the processor thread",
+        );
+
+        let got = ticker.join().unwrap();
+        assert_eq!(
+            got.len(),
+            1,
+            "the ticker thread must drain the cross-thread park; got {got:?}",
+        );
+        assert!(
+            got[0]
+                .1
+                .iter()
+                .any(|c| matches!(c, LuaCommand::SendMessage { .. })),
+            "post-wait continuation must drain; got {got:?}",
+        );
+    }
 }

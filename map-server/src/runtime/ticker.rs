@@ -122,6 +122,9 @@ pub struct GameTicker {
     pub catalogs: Arc<crate::lua::Catalogs>,
     /// Server-start wall-clock — `now_ms` on each tick is relative to this.
     start: Instant,
+    /// Last `now_ms` the per-content-area `onUpdate` driver fired —
+    /// delta-gated (see `tick_once`).
+    last_content_update_ms: tokio::sync::Mutex<u64>,
 }
 
 impl GameTicker {
@@ -153,19 +156,54 @@ impl GameTicker {
             lua,
             catalogs,
             start: Instant::now(),
+            last_content_update_ms: tokio::sync::Mutex::new(0),
         }
     }
 
     /// Run forever — suitable for `tokio::spawn`. Returns only on error.
     pub async fn run(self) -> ! {
+        tracing::info!(
+            interval_ms = self.config.tick_interval.as_millis() as u64,
+            has_lua = self.lua.is_some(),
+            "game ticker started",
+        );
         let mut int = interval(self.config.tick_interval);
         // The first tick fires immediately; we want the period to apply
         // between ticks.
         int.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut frames: u64 = 0;
         loop {
             int.tick().await;
             let now_ms = self.start.elapsed().as_millis() as u64;
             self.tick_once(now_ms).await;
+            frames += 1;
+            // Liveness heartbeat — a frozen/starved ticker (the SEQ_005
+            // wait(1) continuation silently never firing) is otherwise
+            // invisible in the logs. Scheduler depths included so a
+            // parked-but-never-drained coroutine is directly visible.
+            if frames.is_multiple_of(100) {
+                let (t, s, e) = self
+                    .lua
+                    .as_ref()
+                    .and_then(|l| {
+                        l.scheduler().lock().ok().map(|sch| {
+                            (
+                                sch.pending_time_count(),
+                                sch.pending_signal_count(),
+                                sch.pending_event_count(),
+                            )
+                        })
+                    })
+                    .unwrap_or((usize::MAX, usize::MAX, usize::MAX));
+                tracing::debug!(
+                    frames,
+                    now_ms,
+                    parked_time = t,
+                    parked_signal = s,
+                    parked_event = e,
+                    "game ticker heartbeat",
+                );
+            }
         }
     }
 
@@ -244,9 +282,21 @@ impl GameTicker {
         // tick interval. Sessions without an active content script
         // are skipped.
         const CONTENT_UPDATE_PERIOD_MS: u64 = 500;
-        if now_ms.is_multiple_of(CONTENT_UPDATE_PERIOD_MS)
-            && let Some(lua) = self.lua.as_ref()
-        {
+        // Delta-based gate — `now_ms.is_multiple_of(500)` almost never
+        // fired in production because `start.elapsed().as_millis()`
+        // jitters off the exact multiples (the live SEQ_005 sessions
+        // show ZERO content onUpdate activity — the ally-engage loop
+        // was never running). (Garlemald-Server #28.)
+        let content_due = {
+            let mut last = self.last_content_update_ms.lock().await;
+            if now_ms.saturating_sub(*last) >= CONTENT_UPDATE_PERIOD_MS {
+                *last = now_ms;
+                true
+            } else {
+                false
+            }
+        };
+        if content_due && let Some(lua) = self.lua.as_ref() {
             let sessions = self.world.all_sessions().await;
             for session in sessions {
                 let Some(active) = session.active_content_script.clone() else {

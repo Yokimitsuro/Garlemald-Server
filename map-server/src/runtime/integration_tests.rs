@@ -11459,3 +11459,224 @@ async fn apply_login_lua_command_routes_run_event_function_through_outbox() {
     assert!(!second.is_empty(), "EndEvent packet must be non-empty");
     assert_ne!(first, second, "the two packets carry different opcodes");
 }
+
+/// Liveness repro for the SEQ_005 ticker mystery: drive the REAL
+/// `GameTicker::tick_once` (with the Lua engine attached) against the
+/// tutorial state — a player who just pressed F (engaged on TARGET 0,
+/// exactly what `commands/ActivateCommand.lua`'s `player.Engage(0, 2)`
+/// produces), five content BattleNpcs, an active content script
+/// session, and a director coroutine parked on `wait()`. The live
+/// failure signature is: the time park never drains and the ticker
+/// goes silent. If `tick_once` hangs, panics, or fails to resume the
+/// park here, this reproduces it deterministically. (Garlemald-Server #28.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ticker_survives_tutorial_state_and_drains_time_parks() {
+    use crate::data::{ClientHandle, Session as MapSession};
+    use crate::lua::LuaEngine;
+    use crate::lua::command::{CommandQueue, LuaCommand};
+    use crate::runtime::actor_registry::{ActorHandle, ActorKindTag, ActorRegistry};
+    use crate::runtime::ticker::{GameTicker, TickerConfig};
+    use crate::world_manager::WorldManager;
+    use crate::zone::navmesh::StubNavmeshLoader;
+    use crate::zone::outbox::AreaOutbox;
+    use crate::zone::zone::Zone;
+    use crate::zone::{ActorKind, StoredActor};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    // Script root with the real bare-yield helpers + a director that
+    // parks on wait() — the same shape the live SEQ_005 director is in
+    // right after the F-press signal resume.
+    let root = std::env::temp_dir().join(format!(
+        "garlemald-ticker-liveness-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("directors/Quest")).unwrap();
+    std::fs::write(
+        root.join("global.lua"),
+        r#"
+            function wait(seconds)
+                return coroutine.yield("_WAIT_TIME", seconds);
+            end
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("directors/Quest/TickerLiveness.lua"),
+        r#"
+            require ("global")
+            function onEventStarted(player, director, eventType, eventName)
+                wait(0.2)
+                player:SendMessage(0x20, "", "continuation")
+            end
+        "#,
+    )
+    .unwrap();
+    let lua = Arc::new(LuaEngine::new(&root));
+
+    let world = Arc::new(WorldManager::new());
+    let registry = Arc::new(ActorRegistry::new());
+    let db = Arc::new(
+        crate::database::Database::open(std::env::temp_dir().join(format!(
+                "garlemald-ticker-liveness-{}.db",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )))
+        .await
+        .expect("db"),
+    );
+
+    // Zone 166 with the tutorial cast.
+    let mut zone = Zone::new(
+        166,
+        "fst0Battle03",
+        106,
+        "/Area/Zone/ZoneDefault",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    let mut ob = AreaOutbox::new();
+    zone.core.add_actor(
+        StoredActor {
+            actor_id: 1,
+            kind: ActorKind::Player,
+            position: common::Vector3::new(362.0, 4.0, -703.0),
+            grid: (0, 0),
+            is_alive: true,
+        },
+        &mut ob,
+    );
+    for id in [
+        0x4534_0003u32,
+        0x4534_0004,
+        0x4534_0005,
+        0x4534_0006,
+        0x4534_0007,
+    ] {
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: id,
+                kind: ActorKind::BattleNpc,
+                position: common::Vector3::new(370.0, 4.0, -710.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+    }
+    let _ = ob.drain();
+    world.register_zone(zone).await;
+
+    // Player: engaged on TARGET 0 (the ActivateCommand F-press shape).
+    let mut player = Character::new(1);
+    player.base.zone_id = 166;
+    player.base.current_main_state = 2;
+    let now0 = common::utils::millis_unix_timestamp();
+    player.ai_container.internal_engage(0, now0, 3000);
+    registry
+        .insert(ActorHandle::new(1, ActorKindTag::Player, 166, 1, player))
+        .await;
+
+    // Content NPCs: wolves with hate on the player, allies idle —
+    // mirrors the post-spawn state (controllers attach on spawn in
+    // production; hate drives the controller's combat branch).
+    for id in [0x4534_0003u32, 0x4534_0004, 0x4534_0005] {
+        let mut wolf = Character::new(id);
+        wolf.base.zone_id = 166;
+        wolf.base.current_main_state = 2;
+        wolf.hate.update_hate(1, 10);
+        wolf.ai_container.internal_engage(1, now0, 3000);
+        registry
+            .insert(ActorHandle::new(id, ActorKindTag::BattleNpc, 166, 0, wolf))
+            .await;
+    }
+    for id in [0x4534_0006u32, 0x4534_0007] {
+        let mut ally = Character::new(id);
+        ally.base.zone_id = 166;
+        registry
+            .insert(ActorHandle::new(id, ActorKindTag::BattleNpc, 166, 0, ally))
+            .await;
+    }
+
+    // Session with an active content script (drives the B6 content path).
+    let (tx, mut _rx) = mpsc::channel::<Vec<u8>>(64);
+    world.register_client(1, ClientHandle::new(1, tx)).await;
+    world
+        .upsert_session(MapSession {
+            id: 1,
+            current_zone_id: 166,
+            active_content_script: Some(crate::data::ActiveContentScript {
+                parent_zone_id: 166,
+                area_name: "man0g01".to_string(),
+                area_class_path: "/Area/PrivateArea/ContentArea".to_string(),
+                director_name: "Quest/QuestDirectorMan0g001".to_string(),
+                director_actor_id: 0x6530_0003,
+                content_area_actor_id: 0x6534_0002,
+                content_script: "SimpleContent30010".to_string(),
+                warp_complete: true,
+            }),
+            ..MapSession::default()
+        })
+        .await;
+
+    // Park the director coroutine on wait(0.2) via the real dispatch.
+    let script_path = root.join("directors/Quest/TickerLiveness.lua");
+    let snapshot = crate::lua::userdata::PlayerSnapshot {
+        actor_id: 1,
+        ..Default::default()
+    };
+    let director = crate::lua::userdata::LuaDirectorHandle {
+        name: "Quest/TickerLiveness".to_string(),
+        actor_id: 0x6530_0003,
+        class_path: "/Director/Quest/TickerLiveness".to_string(),
+        queue: CommandQueue::new(),
+    };
+    let result = lua.call_director_on_event_started(
+        &script_path,
+        snapshot,
+        director,
+        "noticeEvent".to_string(),
+        5,
+        vec![],
+    );
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert_eq!(lua.scheduler().lock().unwrap().pending_time_count(), 1);
+
+    // Drive the REAL ticker for ~1.5s of frames. If tick_once hangs,
+    // the tokio test timeout (via the watchdog below) fails the test.
+    let ticker = GameTicker::with_lua(
+        TickerConfig::default(),
+        world.clone(),
+        registry.clone(),
+        db.clone(),
+        Some(lua.clone()),
+    );
+    let start = std::time::Instant::now();
+    let mut frame: u64 = 0;
+    while start.elapsed() < std::time::Duration::from_millis(1500) {
+        frame += 100;
+        // Watchdog each frame: a single tick_once must not take >5s.
+        tokio::time::timeout(std::time::Duration::from_secs(5), ticker.tick_once(frame))
+            .await
+            .expect("tick_once hung — ticker liveness bug reproduced");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_time_count(),
+        0,
+        "the wait(0.2) park must have been drained by the ticker",
+    );
+}
