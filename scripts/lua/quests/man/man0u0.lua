@@ -134,7 +134,13 @@ function onStateChange(player, quest, sequence)
         quest:SetENpc(TWITTERING_TOMBOY);
         quest:SetENpc(STOCKY_STRANGER);
         quest:SetENpc(EXIT_TRIGGER, exitFlag, false, true);
-        quest:SetENpc(OPENING_STOPER_ULDAH, QFLAG_NONE, false, false, true);
+        -- Upstream passed (QFLAG_NONE, false, false, true) here — an arg
+        -- slip that lands push=false / emote=true, so the quest layer
+        -- DISABLED the stopper's own "exit"/"caution" push circles and
+        -- the player could walk out of the Merchant Strip. Every sibling
+        -- blocker uses (flag, false, true) = push enabled: man0g0:118
+        -- (BLOCKER1) and this script's own SEQ_010 BLOCKER below.
+        quest:SetENpc(OPENING_STOPER_ULDAH, QFLAG_NONE, false, true);
 
     elseif (sequence == SEQ_010) then
         local yayatokiFlag = data:GetFlag(FLAG_SEQ010_TALK0) and QFLAG_NONE or QFLAG_TALK;
