@@ -6304,9 +6304,22 @@ impl PacketProcessor {
             return;
         };
 
-        let zone_id = player_handle.zone_id;
+        // Session-resolved zone — the ActorHandle's zone_id is frozen at
+        // registration (`reassign_zone` has no production callers), so a
+        // post-warp UpdateENPCs (the SEQ_010 Tkebbe talk flow in zone
+        // 155) would otherwise search the login zone and skip every
+        // broadcast. (Garlemald-Server #28, req 4.)
+        let (zone_id, requester_area) = match self.world.session(session_id).await {
+            Some(s) if s.current_zone_id != 0 => (
+                s.current_zone_id,
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level)),
+            ),
+            _ => (player_handle.zone_id, None),
+        };
         let Some(npc_handle) = self
-            .find_npc_by_class_id(zone_id, enpc.actor_class_id)
+            .find_npc_by_class_id(zone_id, enpc.actor_class_id, requester_area.as_ref())
             .await
         else {
             tracing::debug!(
@@ -6377,9 +6390,18 @@ impl PacketProcessor {
         let Some(client) = self.world.client(session_id).await else {
             return;
         };
-        let zone_id = player_handle.zone_id;
+        // Session-resolved zone + area (see broadcast_quest_enpc_update).
+        let (zone_id, requester_area) = match self.world.session(session_id).await {
+            Some(s) if s.current_zone_id != 0 => (
+                s.current_zone_id,
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level)),
+            ),
+            _ => (player_handle.zone_id, None),
+        };
         let Some(npc_handle) = self
-            .find_npc_by_class_id(zone_id, enpc.actor_class_id)
+            .find_npc_by_class_id(zone_id, enpc.actor_class_id, requester_area.as_ref())
             .await
         else {
             return;
@@ -6411,18 +6433,37 @@ impl PacketProcessor {
     /// `actor_class_id` matches `class_id`. Quest scripts typically
     /// register 2-8 ENPCs per sequence so per-call O(n) isn't a hot
     /// path; a proper index on `ActorRegistry` can come later if needed.
-    async fn find_npc_by_class_id(&self, zone_id: u32, class_id: u32) -> Option<ActorHandle> {
+    /// Area-aware ENPC resolution — prefer the copy whose private-area
+    /// pool matches the requester's routing, fall back to a zone-root
+    /// copy. Mirrors `quest_apply::find_npc_by_class_id` (several city
+    /// NPCs are seeded both at the zone root and inside a private-area
+    /// phase under the same class id; first-match was HashMap-order
+    /// nondeterministic). (Garlemald-Server #28.)
+    async fn find_npc_by_class_id(
+        &self,
+        zone_id: u32,
+        class_id: u32,
+        requester_area: Option<&(String, u32)>,
+    ) -> Option<ActorHandle> {
         let actors = self.registry.actors_in_zone(zone_id).await;
+        let mut root_match: Option<ActorHandle> = None;
         for h in actors {
             let matches = {
                 let c = h.character.read().await;
                 c.chara.actor_class_id == class_id
             };
-            if matches {
-                return Some(h);
+            if !matches {
+                continue;
+            }
+            match (&h.private_area, requester_area) {
+                (Some(npc_area), Some(req)) if npc_area.as_ref() == req => return Some(h),
+                (None, None) => return Some(h),
+                // Root copy — fallback for a private-area player.
+                (None, Some(_)) if root_match.is_none() => root_match = Some(h),
+                _ => {}
             }
         }
-        None
+        root_match
     }
 
     /// `player:AddQuest(id)` — allocate a free slot, build a fresh
@@ -7961,8 +8002,16 @@ impl PacketProcessor {
                 // `apply_actor_engage` / pmeteor `if (IsEngaged) return`).
                 if cur != Some(selected_target) {
                     c.ai_container.clear_states();
-                    c.ai_container
+                    let started = c
+                        .ai_container
                         .internal_engage(selected_target, now_ms, delay);
+                    tracing::debug!(
+                        player = format!("0x{actor_id:08X}"),
+                        target = format!("0x{selected_target:08X}"),
+                        delay,
+                        started,
+                        "player auto-attack engage (0x00CD)",
+                    );
                 }
             } else if !auto_attack {
                 // Auto-attack toggled off (attackTarget == 0xE0000000) — stop

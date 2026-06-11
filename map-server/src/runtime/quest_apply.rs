@@ -457,7 +457,7 @@ pub async fn apply_runtime_lua_command(
             actor_id,
             target_actor_id,
         } => {
-            apply_actor_engage(actor_id, target_actor_id, registry).await;
+            apply_actor_engage(actor_id, target_actor_id, registry, world).await;
             true
         }
         LC::ChangeState {
@@ -590,7 +590,12 @@ pub async fn apply_runtime_lua_command(
 /// engaged — re-engaging the same target would clobber the existing
 /// state's swing clock, restarting the swing window. The C# engage
 /// path has the same gate (`if (IsEngaged) return false`).
-async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &ActorRegistry) {
+async fn apply_actor_engage(
+    actor_id: u32,
+    target_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
     if target_actor_id == 0 {
         tracing::debug!(
             actor = format!("0x{actor_id:08X}"),
@@ -611,26 +616,45 @@ async fn apply_actor_engage(actor_id: u32, target_actor_id: u32, registry: &Acto
     // epoch ms (the pre-#28 bug) parked `is_attack_ready` ~56 years out:
     // script-engaged allies entered the engaged state but never swung.
     let now_ms = crate::runtime::clock::server_now_ms();
-    let mut c = handle.character.write().await;
-    let delay = c.get_attack_delay_ms();
-    let started = c
-        .ai_container
-        .internal_engage(target_actor_id, now_ms, delay);
-    // Seed hate toward the target. AI-controlled actors (allies driven by
-    // `allyGlobal.EngageTarget`, scripted BattleNpcs) run `do_combat_tick`,
-    // which `should_deaggro`s the instant `most_hated()` is None. Attacking
-    // only seeds hate on the *defender* (`resolve_auto_attack`), so without
-    // this the engager would emit a Disengage on its very next tick and spin
-    // an engage/disengage loop while its AttackState keeps swinging. Mirrors
-    // the `BattleEvent::Engage` hate-seed in `dispatcher.rs`. (Garlemald #28.)
-    c.hate.update_hate(target_actor_id, 1);
-    tracing::debug!(
-        actor = format!("0x{actor_id:08X}"),
-        target = format!("0x{target_actor_id:08X}"),
-        delay,
-        started,
-        "ActorEngage applied",
-    );
+    let started = {
+        let mut c = handle.character.write().await;
+        let delay = c.get_attack_delay_ms();
+        let started = c
+            .ai_container
+            .internal_engage(target_actor_id, now_ms, delay);
+        // Seed hate toward the target. AI-controlled actors (allies driven by
+        // `allyGlobal.EngageTarget`, scripted BattleNpcs) run `do_combat_tick`,
+        // which `should_deaggro`s the instant `most_hated()` is None. Attacking
+        // only seeds hate on the *defender* (`resolve_auto_attack`), so without
+        // this the engager would emit a Disengage on its very next tick and spin
+        // an engage/disengage loop while its AttackState keeps swinging. Mirrors
+        // the `BattleEvent::Engage` hate-seed in `dispatcher.rs`. (Garlemald #28.)
+        c.hate.update_hate(target_actor_id, 1);
+        tracing::debug!(
+            actor = format!("0x{actor_id:08X}"),
+            target = format!("0x{target_actor_id:08X}"),
+            delay,
+            started,
+            "ActorEngage applied",
+        );
+        started
+    };
+    // Script-driven engages (allyGlobal.EngageTarget) bypass the
+    // BattleEvent::Engage dispatch arm, so emit the State trio here —
+    // the per-NPC mode-change action pmeteor broadcasts at engage time
+    // that arms the client's combat presentation for this actor (see
+    // `dispatcher::emit_change_state_trio`). Fresh engages only — a
+    // re-engage no-op shouldn't re-spam the trio.
+    if started && let Some(zone_arc) = world.zone(handle.zone_id).await {
+        crate::runtime::dispatcher::emit_change_state_trio(
+            actor_id,
+            crate::actor::MAIN_STATE_ACTIVE,
+            registry,
+            world,
+            &zone_arc,
+        )
+        .await;
+    }
 }
 
 /// `actor:ChangeState(main_state)` — port of pmeteor `Actor.cs::ChangeState`.
@@ -654,38 +678,6 @@ async fn apply_change_state(
         );
         return;
     };
-    // 1. Update the actor's stored main_state so subsequent reads see it.
-    {
-        let mut c = handle.character.write().await;
-        c.base.current_main_state = main_state;
-    }
-    // 1b. Pre-warp content NPCs: suppress the wire broadcast (keep the
-    //     stored-state mutation above). `SimpleContent30010.lua::onCreate`
-    //     fires `ChangeState(2)` on the tutorial roster BEFORE the
-    //     `DoZoneChangeContent` warp, while the client has not been sent
-    //     those actors (their AddActor fan-out is deliberately skipped to
-    //     keep the pre-kick window byte-clean — pmeteor's reference
-    //     capture shows ZERO actor packets there). The post-warp zone-in
-    //     bundle re-emits SetActorState from the stored value, so nothing
-    //     is lost; mid-fight state changes happen post-warp and broadcast
-    //     normally. (Garlemald-Server #28.)
-    for snap in world.all_sessions().await {
-        if let Some(active) = snap.active_content_script.as_ref()
-            && !active.warp_complete
-            && snap
-                .transient_director_members
-                .get(&active.director_actor_id)
-                .is_some_and(|roster| roster.contains(&actor_id))
-        {
-            tracing::debug!(
-                actor = format!("0x{actor_id:08X}"),
-                main_state,
-                "ChangeState stored; broadcast suppressed (pre-warp content roster)",
-            );
-            return;
-        }
-    }
-    // 2. Broadcast 0x0134 SetActorState (main_state | sub_state<<8).
     let Some(zone_arc) = world.zone(handle.zone_id).await else {
         tracing::debug!(
             actor = format!("0x{actor_id:08X}"),
@@ -697,49 +689,15 @@ async fn apply_change_state(
     // pmeteor's State-flag flush (Character.cs PostUpdate:411-419) ships a
     // TRIO, not just the 0x0134: SetActorState + CommandResultX00 (anim
     // 0x72000062) + CommandResultX01 (anim 0x7C000062, command 21001
-    // Activate, one self-hit `CommandResult(Id, 0, 1)`). The 1.x client
-    // plays the draw-/sheathe-weapon animation off the X00/X01 battle
-    // actions — a bare 0x0134 changes the logical state but the model
-    // never draws (the SEQ_005 live test: state toggled 2->0->2 with no
-    // visible weapon). Byte-verified against pmeteor's capture at its
-    // tutorial F-press (map-packets.log:38247ff: 0x134 + 0x13C + 0x139).
-    // (Garlemald-Server #28.)
-    let state_sub =
-        crate::packets::send::actor::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
-    let x00 =
-        crate::packets::send::actor_battle::build_command_result_x00(actor_id, 0x7200_0062, 0);
-    let x01 = crate::packets::send::actor_battle::build_command_result_x01(
-        actor_id,
-        0x7C00_0062,
-        21001,
-        &crate::packets::send::actor_battle::CommandResult {
-            target_id: actor_id,
-            hit_num: 1,
-            hit_effect: 1,
-            ..Default::default()
-        },
-    );
-    let mut bytes = state_sub.to_bytes();
-    bytes.extend(x00.to_bytes());
-    bytes.extend(x01.to_bytes());
-    // Send to the actor's OWN client first when it's a player —
-    // `broadcast_around_actor`'s `actors_around` excludes the source, so
-    // a player's own state change (the F-press Engage drawing the
-    // weapon) otherwise never reaches their client (`recipients=0` in
-    // the SEQ_005 live test). Mirrors `apply_die` / `apply_revive`.
-    // (Garlemald-Server #28.)
-    crate::runtime::dispatcher::send_to_self_if_player(registry, world, actor_id, bytes.clone())
-        .await;
-    let recipients = crate::runtime::broadcast::broadcast_around_actor(
-        world, registry, &zone_arc, actor_id, bytes,
+    // Activate, one self-hit). The 1.x client plays the draw-/sheathe-
+    // weapon animation (and arms per-actor combat presentation) off the
+    // X00/X01 battle actions — a bare 0x0134 changes the logical state
+    // invisibly. The shared helper owns the byte shape, the pre-warp
+    // content-roster suppression, and the corpse guard. (Garlemald #28.)
+    crate::runtime::dispatcher::emit_change_state_trio(
+        actor_id, main_state, registry, world, &zone_arc,
     )
     .await;
-    tracing::debug!(
-        actor = format!("0x{actor_id:08X}"),
-        main_state,
-        recipients,
-        "ChangeState applied (0x134 + draw-anim X00/X01 trio)",
-    );
 }
 
 /// `director:AddMember(actor)` — populates the director's transient
@@ -1071,7 +1029,7 @@ async fn apply_send_data_packet(
 /// `zone:DespawnActor(actor_id)` — port of C# `Zone::DespawnActor`.
 /// Broadcasts `0x00CB RemoveActor` to nearby players and removes the
 /// actor from the registry. Used by cinematics and content cleanup.
-async fn apply_despawn_actor(
+pub(crate) async fn apply_despawn_actor(
     _zone_id: u32,
     actor_id: u32,
     registry: &ActorRegistry,
@@ -3743,7 +3701,7 @@ pub async fn apply_add_gil(actor_id: u32, amount: i32, db: &Database) {
 // ENPC broadcast
 // ---------------------------------------------------------------------------
 
-async fn broadcast_quest_enpc_update(
+pub(crate) async fn broadcast_quest_enpc_update(
     player_id: u32,
     enpc: QuestEnpc,
     registry: &ActorRegistry,
@@ -3759,8 +3717,28 @@ async fn broadcast_quest_enpc_update(
     let Some(client) = world.client(session_id).await else {
         return;
     };
-    let zone_id = player_handle.zone_id;
-    let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
+    // Resolve the player's CURRENT zone + private-area routing from the
+    // session — the ActorHandle's zone_id is frozen at registration
+    // (`reassign_zone` has no production callers), so after the man0g0
+    // zone-166 → 155 warp the handle still says 166 and the SEQ_010
+    // quest NPCs spawned into 155 would never resolve. Pre-warp call
+    // sites read the same zone either way. (Garlemald-Server #28, req 4.)
+    let (zone_id, requester_area) = match world.session(session_id).await {
+        Some(s) if s.current_zone_id != 0 => (
+            s.current_zone_id,
+            s.current_private_area_name
+                .clone()
+                .map(|n| (n, s.current_private_area_level)),
+        ),
+        _ => (player_handle.zone_id, None),
+    };
+    let Some(npc_handle) = find_npc_by_class_id(
+        registry,
+        zone_id,
+        enpc.actor_class_id,
+        requester_area.as_ref(),
+    )
+    .await
     else {
         tracing::debug!(
             player = player_id,
@@ -3815,8 +3793,23 @@ async fn broadcast_quest_enpc_clear(
     let Some(client) = world.client(session_id).await else {
         return;
     };
-    let zone_id = player_handle.zone_id;
-    let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
+    // Session-resolved zone + area (see broadcast_quest_enpc_update).
+    let (zone_id, requester_area) = match world.session(session_id).await {
+        Some(s) if s.current_zone_id != 0 => (
+            s.current_zone_id,
+            s.current_private_area_name
+                .clone()
+                .map(|n| (n, s.current_private_area_level)),
+        ),
+        _ => (player_handle.zone_id, None),
+    };
+    let Some(npc_handle) = find_npc_by_class_id(
+        registry,
+        zone_id,
+        enpc.actor_class_id,
+        requester_area.as_ref(),
+    )
+    .await
     else {
         return;
     };
@@ -3843,22 +3836,40 @@ async fn broadcast_quest_enpc_clear(
     client.send_bytes(graphic.to_bytes()).await;
 }
 
+/// Resolve a quest ENPC by actor class id within a zone, preferring the
+/// copy whose private-area pool matches the requesting player's routing.
+/// Several city NPCs are seeded both at the zone root and inside a
+/// `PrivateAreaMasterPast` phase under the same class id (Baderon,
+/// Momodi, Miounne, …) — without the area preference this pick was
+/// HashMap-iteration-order nondeterministic, and a broadcast bound to
+/// the copy the client never spawned is silently dropped. Falls back to
+/// a zone-root copy when the player's area has none (private-area player
+/// whose quest NPC only exists at the root). (Garlemald-Server #28.)
 async fn find_npc_by_class_id(
     registry: &ActorRegistry,
     zone_id: u32,
     class_id: u32,
+    requester_area: Option<&(String, u32)>,
 ) -> Option<ActorHandle> {
     let actors = registry.actors_in_zone(zone_id).await;
+    let mut root_match: Option<ActorHandle> = None;
     for h in actors {
         let matches = {
             let c = h.character.read().await;
             c.chara.actor_class_id == class_id
         };
-        if matches {
-            return Some(h);
+        if !matches {
+            continue;
+        }
+        match (&h.private_area, requester_area) {
+            (Some(npc_area), Some(req)) if npc_area.as_ref() == req => return Some(h),
+            (None, None) => return Some(h),
+            // Root copy — keep as fallback for a private-area player.
+            (None, Some(_)) if root_match.is_none() => root_match = Some(h),
+            _ => {}
         }
     }
-    None
+    root_match
 }
 
 // ---------------------------------------------------------------------------
@@ -4219,7 +4230,19 @@ pub async fn check_quest_proximity_pushes(
                 let dx = pos.0 - c.base.position_x;
                 let dz = pos.2 - c.base.position_z;
                 let dist_sq = dx * dx + dz * dz;
-                if dist_sq > trigger_radius_sq {
+                // Per-class circle radius from the parsed event
+                // conditions — the client arms its pushDefault circle
+                // with this exact value (the Carline Canopy exit is
+                // r=6.0), so a flat 3.0 server gate rejects pushes the
+                // client legitimately fired from 3-6y out. (#28, req 4.)
+                let class_radius_sq = c
+                    .base
+                    .event_conditions
+                    .push_circle
+                    .iter()
+                    .map(|pc| pc.radius * pc.radius)
+                    .fold(trigger_radius_sq, f32::max);
+                if dist_sq > class_radius_sq {
                     continue;
                 }
                 crate::lua::LuaNpcSpec {
@@ -4399,7 +4422,15 @@ pub async fn kick_quest_proximity_pushes(
                 let dx = pos.0 - c.base.position_x;
                 let dz = pos.2 - c.base.position_z;
                 let dist_sq = dx * dx + dz * dz;
-                if dist_sq > trigger_radius_sq {
+                // Per-class circle radius (see check_quest_proximity_pushes).
+                let class_radius_sq = c
+                    .base
+                    .event_conditions
+                    .push_circle
+                    .iter()
+                    .map(|pc| pc.radius * pc.radius)
+                    .fold(trigger_radius_sq, f32::max);
+                if dist_sq > class_radius_sq {
                     continue;
                 }
                 c.base.actor_id
@@ -5257,7 +5288,7 @@ mod tests {
             assert!(!c.ai_container.is_engaged());
         }
 
-        apply_actor_engage(actor_id, target_id, &registry).await;
+        apply_actor_engage(actor_id, target_id, &registry, &WorldManager::new()).await;
 
         // Post-condition: engaged, current state targets `target_id`.
         let handle = registry.get(actor_id).await.expect("registered");
@@ -5291,11 +5322,11 @@ mod tests {
             ))
             .await;
 
-        apply_actor_engage(actor_id, target_id, &registry).await;
+        apply_actor_engage(actor_id, target_id, &registry, &WorldManager::new()).await;
         // Second call with a different target should NOT change state
         // — re-engage is gated on `IsEngaged` (use ChangeTarget for
         // retargets).
-        apply_actor_engage(actor_id, 0x4000_00AAu32, &registry).await;
+        apply_actor_engage(actor_id, 0x4000_00AAu32, &registry, &WorldManager::new()).await;
 
         let handle = registry.get(actor_id).await.expect("registered");
         let c = handle.character.read().await;
@@ -5340,8 +5371,8 @@ mod tests {
     async fn c3_apply_actor_engage_skips_zero_target_and_missing_actor() {
         let registry = ActorRegistry::new();
         // No registered actors — both calls should log+return.
-        apply_actor_engage(0xDEAD_BEEF, 0x4000_0099, &registry).await;
-        apply_actor_engage(0xDEAD_BEEF, 0, &registry).await;
+        apply_actor_engage(0xDEAD_BEEF, 0x4000_0099, &registry, &WorldManager::new()).await;
+        apply_actor_engage(0xDEAD_BEEF, 0, &registry, &WorldManager::new()).await;
         apply_hate_container_add_base_hate(0xDEAD_BEEF, 0x4000_0099, &registry).await;
         apply_hate_container_add_base_hate(0xDEAD_BEEF, 0, &registry).await;
     }
@@ -5568,7 +5599,7 @@ mod actor_engage_clock_tests {
         }
 
         // Script-driven engage (the `allyGlobal.EngageTarget` path).
-        apply_actor_engage(1, 2, &registry).await;
+        apply_actor_engage(1, 2, &registry, &world).await;
 
         let handle = registry.get(1).await.unwrap();
         let delay = { handle.character.read().await.get_attack_delay_ms() };

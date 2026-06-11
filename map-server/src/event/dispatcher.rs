@@ -347,7 +347,49 @@ async fn dispatch_npc_event_started(
     lua_params: &[LuaParam],
 ) {
     let Some(owner_handle) = registry.get(owner_actor_id).await else {
-        tracing::debug!(owner = owner_actor_id, "event: owner actor missing");
+        // The owner despawned (or never existed). The client just opened
+        // an event against it and is now MODAL — until an EndEvent
+        // arrives it pins its authoritative position and refuses every
+        // further interaction. Live SEQ_005 proof: the post-tutorial warp
+        // despawned the openingstoper 357 ms before the client's box-leave
+        // 'caution'/'exit' EventStarts arrived; with no reply the entire
+        // Gridania phase was dead — 1,672 byte-identical position packets,
+        // zero talk/push EventStarts for five minutes. Answer with an
+        // immediate EndEvent so the client unlocks. Real owners never take
+        // this path (their dispatch blocks answer normally). (#28.)
+        // Static client-side actors (high nibble 0xA — command actors,
+        // quest actors) are answered by their dedicated dispatch paths;
+        // replying here would double the EndEvent per press. Type 127
+        // is the client's Lua-ERROR report tunnel (owner is a pseudo-id
+        // like 4) — an error report is not an open event, so replying
+        // would be noise. Only world-spawned actors (a despawned NPC)
+        // take the release path.
+        if owner_actor_id >> 28 == 0xA || owner_actor_id == 0 || event_type == 127 {
+            tracing::debug!(
+                owner = owner_actor_id,
+                ty = event_type,
+                "event: owner actor missing",
+            );
+            return;
+        }
+        tracing::debug!(
+            owner = owner_actor_id,
+            event = event_name,
+            "event: owner actor missing — releasing client with EndEvent",
+        );
+        if let Some(player_handle) = registry.get(player_actor_id).await
+            && player_handle.session_id != 0
+            && let Some(client) = world.client(player_handle.session_id).await
+        {
+            let mut sub = crate::packets::send::events::build_end_event(
+                player_actor_id,
+                owner_actor_id,
+                event_name,
+                event_type,
+            );
+            sub.set_target_id(player_handle.session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
         return;
     };
     let (class_path, class_name, unique_id, npc_state, npc_pos, npc_rot, actor_class_id) = {

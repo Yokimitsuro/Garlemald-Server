@@ -58,6 +58,14 @@ pub struct ActorHandle {
     /// Session id for Players (0 for NPCs). Used by dispatchers to find
     /// the `ClientHandle` that should receive a packet.
     pub session_id: u32,
+    /// `(name, level)` of the private area whose actor pool this NPC was
+    /// spawned into, or `None` for zone-root actors. Several city NPCs
+    /// are seeded BOTH at the zone root and inside a `PrivateAreaMaster
+    /// Past` phase under the same actor class id (Baderon, Momodi,
+    /// Miounne, …) — class-keyed lookups need this tag to pick the copy
+    /// matching the requesting player's area instead of whichever the
+    /// registry HashMap happens to yield first. (Garlemald-Server #28.)
+    pub private_area: Option<Arc<(String, u32)>>,
     pub character: Arc<RwLock<Character>>,
 }
 
@@ -74,8 +82,16 @@ impl ActorHandle {
             kind,
             zone_id,
             session_id,
+            private_area: None,
             character: Arc::new(RwLock::new(character)),
         }
+    }
+
+    /// Builder: tag the handle with the private area its spatial
+    /// projection lives in (boot spawner, private-area seeds only).
+    pub fn with_private_area(mut self, name: String, level: u32) -> Self {
+        self.private_area = Some(Arc::new((name, level)));
+        self
     }
 
     pub fn is_player(&self) -> bool {

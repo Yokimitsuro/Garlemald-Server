@@ -2793,8 +2793,11 @@ async fn equipped_mainhand_weapon_populates_modifiers_and_damage() {
 
     let handle = registry.get(1).await.unwrap();
     let c = handle.character.read().await;
-    // Weapon-scoped modifiers set by apply_player_weapon_stats.
-    assert_eq!(c.chara.mods.get(Modifier::Delay), 2500.0);
+    // Weapon-scoped modifiers set by apply_player_weapon_stats. Delay
+    // lands in SECONDS (2500 ms → 2.5) — the raw-ms store armed every
+    // player swing clock ×1000 too far out (Garlemald #28).
+    assert_eq!(c.chara.mods.get(Modifier::Delay), 2.5);
+    assert_eq!(c.get_attack_delay_ms(), 2500);
     assert_eq!(c.chara.mods.get(Modifier::AttackType), 1.0);
     assert_eq!(c.chara.mods.get(Modifier::HitCount), 1.0);
     assert_eq!(c.chara.mods.get(Modifier::WeaponDamagePower), 20.0);
@@ -12340,15 +12343,14 @@ async fn s2_1_seed_pool_jobs_mark_papalymo_caster_and_yda_melee() {
         .expect("bnpc 3 seeded");
     assert!(!matches!(wolf.current_job, 22 | 23));
 
-    // Ally HP fallback (B's roster-HP dependency): the spawn path's
-    // level-scaled default replaces the seed's hp=0 so the zone-in
-    // `build_npc_property_init` emits real hp/hpMax.
-    assert_eq!(yda.hp, 0, "seed group ships hp 0 — fallback must cover it");
-    let fallback = yda.min_level.max(1).saturating_mul(100).max(100);
-    assert!(
-        fallback >= 100,
-        "fallback HP must be non-zero, got {fallback}"
-    );
+    // Tutorial pacing seeds (053 migration): wolves 250 / Yda 600 /
+    // Papalymo 500 HP so the fight outlasts the 18-second live failure
+    // (100-HP wolves each one-shot by a flat-100 placeholder cast). The
+    // level-scaled spawn fallback still backstops any group whose seed
+    // hp stays 0.
+    assert_eq!(yda.hp, 600, "053 migration seeds Yda's tutorial HP");
+    assert_eq!(wolf.hp, 250, "053 migration seeds wolf tutorial HP");
+    assert_eq!(papalymo.hp, 500, "053 migration seeds Papalymo's HP");
 }
 
 /// #28 S2.5 — the real `SimpleContent30010.lua` onUpdate against the
@@ -13569,8 +13571,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     .await;
 
     // Stage F — Btl002 returns (EventUpdate): EndEvent, then the
-    // director parks on the kill gate's signal. The fight is
-    // free-running from here.
+    // director parks on the milestone-tooltip chain's first signal.
     let cmds = lua
         .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
         .expect("parked on Btl002");
@@ -13586,9 +13587,54 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     assert_eq!(
         lua.scheduler().lock().unwrap().pending_signal_count(),
         1,
-        "director parked on battleComplete during the fight",
+        "director parked on playerAttack during the fight",
     );
     let _ = parse_all_subpackets(&mut rx);
+
+    // Stage F2 — the milestone tooltip chain (#28 issue 3, MeteorReborn
+    // parity): playerAttack → 9055 success + TP widget; tpOver1000 →
+    // MinimumTpLock + weaponskill widget; weaponskillUsed → 9065
+    // success. Each signal resumes the director through the same bridge
+    // the production emitters in resolve_auto_attack / resolve_action
+    // use, and re-parks it on the next gate.
+    for (signal, expect_widgets) in [
+        ("playerAttack", 3usize), // closeTutorialWidget + 9055 + open TP
+        ("tpOver1000", 2),        // closeTutorialWidget + open WS
+        ("weaponskillUsed", 2),   // closeTutorialWidget + 9065
+    ] {
+        crate::runtime::dispatcher::fire_content_signal(
+            player_id,
+            signal,
+            &registry,
+            &world,
+            Some(&lua),
+            Some(&db),
+        )
+        .await;
+        let subs = parse_all_subpackets(&mut rx);
+        let widget_count = subs
+            .iter()
+            .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA)
+            .count();
+        assert_eq!(
+            widget_count, expect_widgets,
+            "tooltip drain mismatch after signal {signal}",
+        );
+        assert_eq!(
+            lua.scheduler().lock().unwrap().pending_signal_count(),
+            1,
+            "director must re-park on the next gate after {signal}",
+        );
+    }
+    // The TP floor armed at tpOver1000 must release at weaponskillUsed.
+    {
+        let c = handle.character.read().await;
+        assert_eq!(
+            c.chara.mods.get(crate::actor::Modifier::MinimumTpLock),
+            0.0,
+            "MinimumTpLock released after the weaponskill milestone",
+        );
+    }
 
     // Stage G — the fight: three wolves die on the production death
     // path. The third death fires battleComplete in the death-path call
@@ -13620,20 +13666,68 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     {
         let sched = lua.scheduler().lock().unwrap();
         assert_eq!(sched.pending_signal_count(), 0, "battleComplete consumed");
-        assert_eq!(sched.pending_time_count(), 1, "parked on wait(2)");
+        assert_eq!(
+            sched.pending_time_count(),
+            1,
+            "parked on the wait(3) render-settle beat",
+        );
     }
+    // The render-settle beat: NO widgets yet — the third wolf's death
+    // packets must reach the client with a beat to draw the collapse
+    // before the success overlay (the live failure was widgets landing
+    // in the same drain/second as the death). (Garlemald #28.)
     let subs = parse_all_subpackets(&mut rx);
     let widget_count = subs
         .iter()
         .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA)
         .count();
     assert_eq!(
-        widget_count, 4,
-        "closeTutorialWidget + 9055 + 9065 successes + attention toast",
+        widget_count, 0,
+        "success widgets must NOT ship in the same drain as the death",
     );
 
-    // Stage H — wait(2) elapses: ChangeMusic, ChangeState(0) trio, and
-    // processEvent020_1 drain in order; parked on the cutscene.
+    // Stage G2 — wait(3) elapses: the widget tail drains, then the
+    // director parks on the decorative wait(2).
+    tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
+    let batches = lua.tick();
+    assert_eq!(
+        batches.len(),
+        1,
+        "post-wait(3) widget drain; got {batches:?}"
+    );
+    for (owner, cmds) in batches {
+        assert_eq!(owner, player_id);
+        crate::runtime::quest_apply::apply_event_script_commands(
+            &handle,
+            cmds,
+            &registry,
+            &db,
+            &world,
+            Some(&lua),
+        )
+        .await;
+    }
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_time_count(),
+        1,
+        "parked on wait(2)",
+    );
+    let subs = parse_all_subpackets(&mut rx);
+    let widget_count = subs
+        .iter()
+        .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA)
+        .count();
+    assert_eq!(
+        widget_count, 2,
+        "closeTutorialWidget + attention toast (successes moved into the milestone chain)",
+    );
+
+    // Stage H — wait(2) elapses: ChangeMusic, ChangeState(0) trio, then
+    // the noticeEvent kick that REOPENS the event context — the
+    // director parks until the client answers, and only then delegates
+    // processEvent020_1 inside the open event (the bare delegate
+    // shipped owner=0 and the client echo-dropped it: no cutscene, no
+    // item dialog — live 2026-06-11 03:37:40Z). (#28 issues 3/5.)
     tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     let batches = lua.tick();
     assert_eq!(batches.len(), 1, "post-wait(2) drain; got {batches:?}");
@@ -13656,15 +13750,45 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     let state = first_idx(crate::packets::opcodes::OP_SET_ACTOR_STATE).expect("0x0134");
     let x00 = first_idx(crate::packets::opcodes::OP_COMMAND_RESULT_X00).expect("0x013C");
     let x01 = first_idx(crate::packets::opcodes::OP_COMMAND_RESULT_X01).expect("0x0139");
-    let run_fn = first_idx(crate::packets::opcodes::OP_RUN_EVENT_FUNCTION).expect("020_1");
+    let kick = first_idx(crate::packets::opcodes::OP_KICK_EVENT).expect("context-reopen kick");
     assert!(
-        music < state && state < x00 && x00 < x01 && x01 < run_fn,
-        "order must be ChangeMusic → ChangeState trio → processEvent020_1; \
-         got music={music} state={state} x00={x00} x01={x01} run_fn={run_fn}",
+        music < state && state < x00 && x00 < x01 && x01 < kick,
+        "order must be ChangeMusic → ChangeState trio → reopen kick; \
+         got music={music} state={state} x00={x00} x01={x01} kick={kick}",
     );
 
-    // Stage I — processEvent020_1 returns (EventUpdate): the director's
-    // final batch in command order, then the teardown + warp effects.
+    // Stage I — the client answers the kick (EventStart, owner =
+    // director): the 020_1 delegate goes out inside the open event and
+    // the director re-parks until the client finishes the cinematic +
+    // item-dialog chain.
+    let cmds = lua
+        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .expect("parked on the reopen kick");
+    assert!(
+        cmds.iter()
+            .any(|c| matches!(c, LuaCommand::RunEventFunction { .. })),
+        "processEvent020_1 must drain inside the reopened event; got {cmds:?}",
+    );
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        cmds,
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_event_count(),
+        1,
+        "director parked on the 020_1 delegate",
+    );
+    let _ = parse_all_subpackets(&mut rx);
+
+    // Stage I2 — the client returns from 020_1 (EventUpdate — cinematic
+    // + item dialog complete): the director's final batch drains in
+    // plan order and the warp fires immediately (the client sits in
+    // startFadeInCutSceneAfterWarp expecting it).
     let cmds = lua
         .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
         .expect("parked on processEvent020_1");
@@ -13685,7 +13809,6 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
             "end_event",
             "content_finished",
             "do_zone_change_155",
-            "end_event",
         ],
         "the director tail must drain in plan order; got {cmds:?}",
     );

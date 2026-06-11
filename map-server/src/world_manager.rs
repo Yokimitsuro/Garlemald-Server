@@ -386,7 +386,7 @@ pub fn build_retainer_spawn_bundle(
     zone_name: &str,
 ) -> Vec<common::subpacket::SubPacket> {
     let mut out = Vec::new();
-    push_npc_spawn(&mut out, character, zone_name, 0);
+    push_npc_spawn(&mut out, character, zone_name, 0, None);
     out
 }
 
@@ -395,6 +395,13 @@ fn push_npc_spawn(
     character: &crate::actor::Character,
     zone_name: &str,
     priv_level: u32,
+    // Registry kind of the actor, when known. `Some(BattleNpc)` /
+    // `Some(Ally)` means the actor went through the REAL BattleNpc
+    // pipeline (stats, state_mainSkill, battleSave populated) and may
+    // keep `charaWork.property[2]` + a combat hateType; `None` keeps
+    // the legacy populace-pipeline behavior (bit-2 mask + hateType 0
+    // for `/Monster/` class paths).
+    battle_kind: Option<crate::runtime::actor_registry::ActorKindTag>,
 ) {
     let actor_id = character.base.actor_id;
     // Meteor's `Actor.CreateNamePacket` (Map Server/Actors/Actor.cs:153)
@@ -556,9 +563,22 @@ fn push_npc_spawn(
     //   01>DepictionJudge:judgeNameplate() [?:900]
     //     program => CharaBaseClass:_onUpdateWork() [?:5685]
     // Masking bit 2 off for `/monster/` actors routes the client
-    // through the populace nameplate path and suppresses the three
-    // "An error has occurred" popups. Bit 2 needs to come back the
-    // moment these actors spawn through the real BattleNpc pipeline.
+    // through the populace nameplate path and suppresses the
+    // "An error has occurred" popups. This mask is UNCONDITIONAL and
+    // must stay that way: a 2026-06-11 live A/B with bit 2 restored for
+    // real-pipeline BattleNpcs crashed the client's
+    // `NpcBaseClass:_onUpdateWork()` ("attempt to index field
+    // 'parameterTemp' (a nil value)") — the NpcBase work struct never
+    // allocates the battle-branch fields bit 2 makes the client read,
+    // regardless of what the /_init delivers. pmeteor hit the same
+    // wall: `charaWork.property[2] = 1` is COMMENTED OUT in both its
+    // Npc.cs:174 and BattleNpc.cs:97, and its tutorial renders mob HP
+    // bars via npcWork.hateType alone. (Garlemald-Server #28.)
+    use crate::runtime::actor_registry::ActorKindTag;
+    let is_real_battle_npc = matches!(
+        battle_kind,
+        Some(ActorKindTag::BattleNpc) | Some(ActorKindTag::Ally)
+    );
     let property_flags = if is_monster {
         character.chara.property_flags & !(1u32 << 2)
     } else {
@@ -599,10 +619,27 @@ fn push_npc_spawn(
 
     // BattleNpc `/npcWork/hate` tail is load-bearing — omitting it
     // for monster-path actors Wine-hard-crashes on zone-in (confirmed
-    // 2026-04-21). Keep the emission; it stays at `hateType = 0` so
-    // the client routes the nameplate judge through the passive path.
-    if is_monster {
-        subpackets.push(tx::actor::build_npc_hate_type_packet(actor_id));
+    // 2026-04-21). Hate type by archetype, pmeteor parity:
+    //   * hostile BattleNpc → 3 (ENGAGED_PARTY). pmeteor stomps 3
+    //     unconditionally at spawn (BattleNpc.cs:160) and its tutorial
+    //     renders mob HP gauges on this exact client. The wiki notes the
+    //     hateType evaluation is NOT retroactive — the judge reads it
+    //     when the nameplate is first built, so an engage-time flip
+    //     alone never lit the gauge (live 2026-06-11 run). The
+    //     2026-04-21 "hateType=3 crashes the judge" incident predated
+    //     the solo-party 0x017C group registration the judge's
+    //     `getPlayerParty():_getOccupancyGroup()` deref needs; that
+    //     trio ships in every zone-in bundle now.
+    //   * Ally → 1 (friendly passive).
+    //   * populace-pipeline monsters keep the legacy 0.
+    // See `build_npc_hate_type_packet` for the judge contract. (#28.)
+    if is_monster || is_real_battle_npc {
+        let hate_type = match battle_kind {
+            Some(ActorKindTag::BattleNpc) => 3,
+            Some(ActorKindTag::Ally) => 1,
+            _ => 0,
+        };
+        subpackets.push(tx::actor::build_npc_hate_type_packet(actor_id, hate_type));
     }
 }
 
@@ -1840,17 +1877,56 @@ impl WorldManager {
         const CONTENT_ACTOR_BAND_BIT: u32 = 0x0004_0000;
         let neighbours: Vec<(u32, crate::zone::area::ActorKind)> = {
             let z = zone_arc.read().await;
-            z.core
-                .actors_around(actor_id, 50.0)
-                .into_iter()
-                .filter(|a| a.actor_id != actor_id)
-                .filter(|a| {
-                    !in_content_instance
-                        || matches!(a.kind, crate::zone::area::ActorKind::Player)
-                        || (a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
-                })
-                .map(|a| (a.actor_id, a.kind))
-                .collect()
+            // Private-area routing — sessions flagged into a named
+            // PrivateArea scan that area's own actor pool (where the
+            // private-area spawn seeds now materialise, e.g. the zone-155
+            // 'PrivateAreaMasterPast' level-1 SEQ_010 quest NPCs).
+            // Content-instance names (the SEQ_005 'man0g01' tutorial) and
+            // unknown names miss `private_areas` and fall back to the
+            // zone root — same resolution rule as
+            // `runtime::broadcast::broadcast_around_actor`. The private
+            // pool sees the player too: `do_zone_change_with_private_area`
+            // re-inserts the arriving player's StoredActor there before
+            // this bundle runs. (Garlemald-Server #28.)
+            let private_core = match (
+                &session.current_private_area_name,
+                session.current_private_area_level,
+            ) {
+                (Some(name), level) => z
+                    .private_areas
+                    .get(name)
+                    .and_then(|m| m.get(&level))
+                    .map(|pa| &pa.core),
+                _ => None,
+            };
+            match private_core {
+                // Private areas are small bounded instances (the zone-155
+                // 'PrivateAreaMasterPast' level 1 holds 8 NPC seeds) and
+                // pmeteor spawns the WHOLE private-area population at
+                // zone-in. A radius scan dropped the Carline Canopy
+                // exit-push trigger (1099046, ~115y from the warp point)
+                // — the quest's pushDefault circle was enabled for an
+                // actor the client never received, so finishing the
+                // opener was impossible. (Garlemald-Server #28, req 4.)
+                Some(core) => core
+                    .actors
+                    .values()
+                    .filter(|a| a.actor_id != actor_id)
+                    .map(|a| (a.actor_id, a.kind))
+                    .collect(),
+                None => z
+                    .core
+                    .actors_around(actor_id, 50.0)
+                    .into_iter()
+                    .filter(|a| a.actor_id != actor_id)
+                    .filter(|a| {
+                        !in_content_instance
+                            || matches!(a.kind, crate::zone::area::ActorKind::Player)
+                            || (a.actor_id & CONTENT_ACTOR_BAND_BIT) != 0
+                    })
+                    .map(|a| (a.actor_id, a.kind))
+                    .collect(),
+            }
         };
         tracing::info!(
             session = session_id,
@@ -1910,6 +1986,7 @@ impl WorldManager {
                 // PrivateArea spawns route through a different fanout
                 // and will need their own priv-level threading later.
                 0,
+                Some(handle.kind),
             );
             for mut sub in npc_bundle {
                 sub.set_target_id(session_id);
@@ -2108,6 +2185,33 @@ impl WorldManager {
         for mut sub in director_subpackets {
             sub.set_target_id(session_id);
             client.send_bytes(sub.to_bytes()).await;
+        }
+
+        // Quest-ENPC re-emission. SetEventStatus + quest-graphic
+        // broadcasts fire when a quest mutates (StartSequence /
+        // UpdateENPCs) — but a sequence bump immediately before a warp
+        // (man0g0's StartSequence(10) → DoZoneChange) runs while the
+        // player's zone holds no matching NPC, so every broadcast is
+        // skipped ("no live NPC" ×7 in the live log) and the new zone's
+        // quest NPCs render without their talk icons / event statuses.
+        // The QuestState mutations themselves landed fine; re-emit the
+        // CURRENT registrations now that this zone's populace is in the
+        // bundle. NPCs not in this zone skip harmlessly (same lookup the
+        // original broadcast uses). (Garlemald-Server #28, req 4.)
+        let active_enpcs: Vec<crate::actor::quest::QuestEnpc> = {
+            let c = actor_handle.character.read().await;
+            c.quest_journal
+                .slots
+                .iter()
+                .flatten()
+                .flat_map(|q| q.state.current.values().copied())
+                .collect()
+        };
+        for enpc in active_enpcs {
+            crate::runtime::quest_apply::broadcast_quest_enpc_update(
+                actor_id, enpc, registry, self,
+            )
+            .await;
         }
 
         // KickEvent emission — DEFERRED to the very end of the bundle.
@@ -2318,8 +2422,13 @@ impl WorldManager {
         session_id: u32,
         new_position: Vector3,
     ) {
-        let zone_id = match self.session(session_id).await {
-            Some(s) => s.current_zone_id,
+        let (zone_id, private_area) = match self.session(session_id).await {
+            Some(s) => (
+                s.current_zone_id,
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level)),
+            ),
             None => return,
         };
         let Some(zone_arc) = self.zone(zone_id).await else {
@@ -2327,6 +2436,22 @@ impl WorldManager {
         };
         let mut zone = zone_arc.write().await;
         let mut ob = crate::zone::outbox::AreaOutbox::new();
+        // Sessions routed into a named PrivateArea keep their StoredActor
+        // in that area's core (`do_zone_change_with_private_area` attach)
+        // — updating `zone.core` would silently no-op and the player's
+        // grid position would freeze at the warp-in point. Content-
+        // instance names (not in `private_areas`) fall back to the zone
+        // root, same rule as `broadcast_around_actor`. (Garlemald #28.)
+        if let Some((name, level)) = private_area
+            && let Some(pa) = zone
+                .private_areas
+                .get_mut(&name)
+                .and_then(|m| m.get_mut(&level))
+        {
+            pa.core
+                .update_actor_position(actor_id, new_position, &mut ob);
+            return;
+        }
         zone.core
             .update_actor_position(actor_id, new_position, &mut ob);
     }

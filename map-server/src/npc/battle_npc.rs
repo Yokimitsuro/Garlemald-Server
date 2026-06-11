@@ -333,6 +333,30 @@ impl BattleNpc {
             .chara
             .mods
             .set(crate::actor::modifier::Modifier::MovementSpeed, 5.0);
+        // Level-scaled fallback combat stats. The genus/pool mod seed
+        // tables carry no stat rows (016_server_battlenpc_genus_mods.sql
+        // is empty), so `attack_calculate_base_damage` — WeaponDamagePower
+        // + 0.85·Strength + Attack — read all zeros and every BNpc melee
+        // swing clamped to 1 damage (the SEQ_005 live fight: wolves and
+        // Yda chipping 0–1 while Papalymo's cast did all the killing).
+        // Mirrors the HP fallback in the spawn path: only fill stats the
+        // seed layers left at zero, so a future real stat derivation
+        // (pmeteor `CalculateBaseStats`) overrides cleanly. lvl 1 →
+        // base ≈ 3 + 0.85·7 + 3 ≈ 12 per swing. (Garlemald-Server #28.)
+        {
+            use crate::actor::modifier::Modifier;
+            let level = f64::from(self.npc.character.chara.level.max(1));
+            let mods = &mut self.npc.character.chara.mods;
+            if mods.get(Modifier::Strength) == 0.0 {
+                mods.set(Modifier::Strength, 5.0 + 2.0 * level);
+            }
+            if mods.get(Modifier::Attack) == 0.0 {
+                mods.set(Modifier::Attack, 2.0 + level);
+            }
+            if mods.get(Modifier::WeaponDamagePower) == 0.0 {
+                mods.set(Modifier::WeaponDamagePower, 2.0 + level);
+            }
+        }
         // Caster archetype: pool currentJob 22 (THM) / 23 (CNJ). Casters
         // stand back instead of closing to melee and never auto-attack
         // (replaces the content script's `isAutoAttackEnabled` NewIndex
