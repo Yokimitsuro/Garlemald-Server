@@ -2253,6 +2253,155 @@ async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
 }
 
 #[tokio::test]
+async fn ported_man0l0_hob_handoff_starts_man0l1_inn_warp() {
+    // Garlemald-Server #25 follow-up: Hob's "go to the Mizzenmast Inn?"
+    // choice hands Man0l0 off to Man0l1. The resumed batch carries
+    // CompleteQuest + AddQuest (from player:ReplaceQuest) —
+    // `handle_event_update` must route it through the login applier so
+    // AddQuest fires Man0l1's onStart through a drain that bridges its
+    // inn-warp RPC (the runtime drain's AddQuest arm fires onStart with
+    // world=None and DROPS the hook's commands — the black-screen-at-Hob
+    // softlock). Stage C then drives Man0l1's onStart park/resume to the
+    // DoZoneChange(133, "PrivateAreaMasterPast", 2) inn warp.
+    use crate::lua::command::{CommandQueue, LuaCommand};
+    use crate::lua::userdata::{LuaQuestHandle, PlayerSnapshot};
+    use crate::lua::{LuaEngine, LuaNpcSpec, QuestHookArg, QuestStateSnapshot};
+    use common::luaparam::LuaParam;
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("scripts/lua");
+    let man0l0 = script_root.join("quests/man/man0l0.lua");
+    let man0l1 = script_root.join("quests/man/man0l1.lua");
+    if !man0l0.exists() || !man0l1.exists() {
+        return; // trimmed artifact; skip
+    }
+    let engine = LuaEngine::new(&script_root);
+
+    // Unique id so the shared scheduler can't collide with other tests.
+    const PLAYER_ID: u32 = 0x0250_4243;
+    const HOB: u32 = 1_000_151;
+
+    let make_player = |quest_id: u32, sequence: u32| PlayerSnapshot {
+        actor_id: PLAYER_ID,
+        zone_id: 230,
+        active_quests: vec![quest_id],
+        active_quest_states: vec![QuestStateSnapshot {
+            quest_id,
+            sequence,
+            flags: 0,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }],
+        ..Default::default()
+    };
+    let make_quest = |quest_id: u32, sequence: u32| LuaQuestHandle {
+        player_id: PLAYER_ID,
+        quest_id,
+        has_quest: true,
+        sequence,
+        flags: 0,
+        counters: [0; 3],
+        npc_ls_from: 0,
+        npc_ls_msg_step: 0,
+        queue: CommandQueue::new(),
+    };
+
+    // Stage A — Hob talk at SEQ_010: parks on the processEvent020_9
+    // choice RPC.
+    let hob = QuestHookArg::Npc(LuaNpcSpec {
+        actor_id: 0x4708_0001,
+        name: "hob".to_string(),
+        class_name: "PopulaceStandard".to_string(),
+        class_path: "/Chara/Npc/Populace/PopulaceStandard".to_string(),
+        unique_id: "hob".to_string(),
+        zone_id: 230,
+        zone_name: "sea0Town01a".to_string(),
+        state: 0,
+        pos: (-834.77, 6.0, 241.55),
+        rotation: -2.79,
+        actor_class_id: HOB,
+        quest_graphic: 2,
+    });
+    let result = engine.call_quest_hook(
+        &man0l0,
+        "onTalk",
+        make_player(110_001, 10),
+        make_quest(110_001, 10),
+        vec![hob],
+    );
+    assert!(result.error.is_none(), "onTalk errored: {:?}", result.error);
+
+    // Stage B — the client answers "yes" (choice 1): the handoff burst
+    // must contain CompleteQuest(110001) + AddQuest(110002) — the
+    // commands `handle_event_update` keys its login-drain routing on.
+    let cmds = engine
+        .fire_player_event_and_drain(PLAYER_ID, &[LuaParam::Int32(1)])
+        .expect("Hob talk must be parked on the choice reply");
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            LuaCommand::CompleteQuest {
+                quest_id: 110_001,
+                ..
+            }
+        )),
+        "handoff must complete Man0l0; got {cmds:?}",
+    );
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            LuaCommand::AddQuest {
+                quest_id: 110_002,
+                ..
+            }
+        )),
+        "handoff must add Man0l1; got {cmds:?}",
+    );
+
+    // Stage C — Man0l1's onStart (fired by the AddQuest applier): emits
+    // StartSequence(0) + the inn-warp RPC, then parks; the RPC's
+    // EventUpdate resume must emit the DoZoneChange into zone 133's
+    // Drowning Wench private area.
+    let result = engine.call_quest_hook(
+        &man0l1,
+        "onStart",
+        make_player(110_002, 0),
+        make_quest(110_002, 0),
+        Vec::new(),
+    );
+    assert!(
+        result.error.is_none(),
+        "man0l1:onStart errored: {:?}",
+        result.error
+    );
+    assert!(
+        result
+            .commands
+            .iter()
+            .any(|c| matches!(c, LuaCommand::RunEventFunction { .. })),
+        "man0l1:onStart must fire the processEvent010 inn RPC; got {:?}",
+        result.commands,
+    );
+    let cmds = engine
+        .fire_player_event_and_drain(PLAYER_ID, &[])
+        .expect("man0l1:onStart must be parked on the processEvent010 reply");
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            LuaCommand::DoZoneChange {
+                zone_id: 133,
+                private_area_type: 2,
+                ..
+            }
+        )),
+        "man0l1:onStart continuation must warp to the zone-133 inn; got {cmds:?}",
+    );
+}
+
+#[tokio::test]
 async fn set_quest_complete_flips_bitstream_both_directions() {
     use crate::runtime::quest_apply::apply_set_quest_complete;
 

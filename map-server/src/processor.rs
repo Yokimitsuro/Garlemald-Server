@@ -8228,34 +8228,51 @@ impl PacketProcessor {
                 commands = cmds.len(),
                 "EventUpdate resumed parked director coroutine",
             );
-            // A resumed QUEST-hook continuation can carry the content-warp
-            // burst (CreateContentArea / StartDirectorMain / SetLoginDirector
-            // / DoZoneChangeContent): man0l0's doExitDoor parks on the
-            // NewRectAsk RPC and emits the whole burst when this EventUpdate
-            // resumes it. Those commands are login-scoped — only
-            // `apply_login_lua_command` creates the content area, and its
-            // KickEvent CAPTURE (emitted at the END of the content zone-in
-            // bundle, after the director's spawn packet) is the proven
-            // ordering; the shared event-script drain's immediate KickEvent
-            // dispatch would race the director spawn and the client would
-            // silently drop the kick (decomp: KickClientOrderEventReceiver
-            // drops kicks for unspawned owners). Gridania never hits this
-            // branch because its doContentArea burst comes out of the onTalk
-            // hook's FIRST slice (drained by fire_quest_event_hook via
-            // apply_login_lua_command); the Limsa exit door is the first
-            // content warp emitted from a resumed continuation. Director-
-            // coroutine continuations (the #28 mid-fight flows) never emit
-            // these commands and keep the shared drain, whose direct
-            // KickEvent dispatch `kickEventContinue` relies on.
+            // A resumed QUEST-hook continuation can carry login-scoped
+            // command bursts the shared event-script drain silently drops:
+            //
+            // 1. The content-warp burst (CreateContentArea /
+            //    StartDirectorMain / SetLoginDirector / DoZoneChangeContent)
+            //    — man0l0's doExitDoor parks on the NewRectAsk RPC and emits
+            //    the whole burst when this EventUpdate resumes it. Only
+            //    `apply_login_lua_command` creates the content area, and its
+            //    KickEvent CAPTURE (emitted at the END of the content
+            //    zone-in bundle, after the director's spawn packet) is the
+            //    proven ordering; the shared drain's immediate KickEvent
+            //    dispatch would race the director spawn and the client would
+            //    silently drop the kick (decomp: KickClientOrderEventReceiver
+            //    drops kicks for unspawned owners).
+            //
+            // 2. The quest-handoff burst (CompleteQuest / AddQuest from
+            //    `player:ReplaceQuest`) — man0l0's Hob talk parks on the
+            //    processEvent020_9 choice RPC and hands off to Man0l1 on
+            //    resume. The runtime drain's AddQuest arm fires the new
+            //    quest's `onStart` with world=None, which LOGS AND DROPS the
+            //    hook's commands (Man0l1's StartSequence + the inn-warp
+            //    processEvent010 RPC never reached the client — the
+            //    black-screen-at-Hob softlock). The processor's
+            //    apply_add_quest drains `onStart` through
+            //    apply_login_lua_command, bridging the RPC to the wire and
+            //    parking the onStart coroutine for the next EventUpdate.
+            //
+            // Gridania never hits either case because its equivalents come
+            // out of hook FIRST slices (drained by fire_quest_event_hook via
+            // apply_login_lua_command); the Limsa opener is the first to
+            // emit them from resumed continuations (it parks on choice RPCs
+            // first). Director-coroutine continuations (the #28 mid-fight
+            // flows) never emit these commands and keep the shared drain,
+            // whose direct KickEvent dispatch `kickEventContinue` relies on.
             // (Garlemald-Server #25.)
-            let is_content_warp_burst = cmds.iter().any(|c| {
+            let is_login_scoped_burst = cmds.iter().any(|c| {
                 matches!(
                     c,
                     crate::lua::command::LuaCommand::CreateContentArea { .. }
                         | crate::lua::command::LuaCommand::DoZoneChangeContent { .. }
+                        | crate::lua::command::LuaCommand::AddQuest { .. }
+                        | crate::lua::command::LuaCommand::CompleteQuest { .. }
                 )
             });
-            if is_content_warp_burst {
+            if is_login_scoped_burst {
                 for cmd in cmds {
                     Box::pin(self.apply_login_lua_command(&handle, cmd)).await;
                 }
