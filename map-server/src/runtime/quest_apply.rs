@@ -3948,8 +3948,25 @@ async fn broadcast_quest_enpc_graphic(
     let Some(client) = world.client(session_id).await else {
         return;
     };
-    let zone_id = player_handle.zone_id;
-    let Some(npc_handle) = find_npc_by_class_id(registry, zone_id, enpc.actor_class_id).await
+    // Same session-driven zone + private-area resolution as
+    // `broadcast_quest_enpc_update` — the ActorHandle's zone_id is
+    // frozen at registration.
+    let (zone_id, requester_area) = match world.session(session_id).await {
+        Some(s) if s.current_zone_id != 0 => (
+            s.current_zone_id,
+            s.current_private_area_name
+                .clone()
+                .map(|n| (n, s.current_private_area_level)),
+        ),
+        _ => (player_handle.zone_id, None),
+    };
+    let Some(npc_handle) = find_npc_by_class_id(
+        registry,
+        zone_id,
+        enpc.actor_class_id,
+        requester_area.as_ref(),
+    )
+    .await
     else {
         return;
     };

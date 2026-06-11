@@ -132,6 +132,44 @@ JOIN, Meteor `WorldManager.cs:341`), `BaseActor` carry-through, and
 the spawn-bundle branch (BG-properties vs appearance, wire order
 instanceId-first per `SetActorBGPropertiesPacket.cs`).
 
+## Round 5 — SEQ_005 battle: port the working Gridania/Limsa twins
+
+Live test of the combat tutorial: F armed (PR #35's work, now in
+develop), weapons drew, the `playerActive` signal resumed the director
+— and the tutorial froze. Root cause per upstream's own #25 Limsa port
+notes: our `QuestDirectorMan0u001.lua` + `SimpleContent30079.lua` were
+still the raw upstream import (synthetic `SpawnActor` props, fixed
+`wait(4)/wait(6)` chains, no kill gate) — "the exact shape that
+stalled Gridania before the #28 rewrites".
+
+Ported the same twins develop now ships for Gridania (#28) and Limsa
+(#25):
+
+- `QuestDirectorMan0u001.lua` → Man0l001 shape: DoW branch with the
+  milestone-gated tooltip chain (`playerAttack` → `tpOver1000` →
+  `weaponskillUsed` → `battleComplete` kill gate, Rust-side
+  `fire_content_signal` sources), DoM branch for THM starters, then
+  attention 51073/3 → ChangeState(0) → kickEventContinue →
+  `processEvent020` arrival → StartSequence(10) → ContentFinished →
+  DoZoneChange(175, PrivateAreaMasterPast, 3) into the SEQ_010 strip.
+  No `onCreateContentArea` — spawning moved to the content script.
+- `SimpleContent30079.lua` → SimpleContent30010/30002 shape: real
+  BattleNpcs via `SpawnBattleNpcById` (seed rows 13-15), Thancred +
+  goobbue `ChangeState(2)`, Niellefresne passive (the Papalymo role),
+  party-added allies for HUD HP bars, `MinimumHpLock` no-die
+  guarantees, the engagement-latch `onUpdate` battle driver (latch
+  re-armed in `onCreate` — the VM is process-cached), and the
+  upstream `1090385` arena stopper prop kept.
+- Seed `055_uldah_seq005_tutorial.sql`: pools/groups 8-10 + spawn rows
+  13-15 — Escaped Goobbue (2203301, genus 6, 500 HP per the 053 pacing
+  rationale scaled to a single mob) and Thancred/Niellefresne
+  (allegiance-1 allies → excluded from the battleComplete live count,
+  exactly like Yda/Papalymo and Sthalmann/Y'shtola).
+
+Branch rebased onto develop v0.1.5 (PR #35 + the Limsa #25 routing
+fixes — resumed-burst login-applier routing, EventUpdate LuaParams
+threading — all of which this flow rides).
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).
