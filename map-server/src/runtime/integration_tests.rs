@@ -2204,7 +2204,13 @@ async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
     );
 
     // Stage C — the cutscene RPC returns: EndEvent + StartSequence(5) +
-    // the content-area setup drain.
+    // the content-area warp burst. The burst MUST contain
+    // CreateContentArea + DoZoneChangeContent: `handle_event_update`
+    // keys its drain routing on them (a resumed continuation carrying
+    // the content warp goes through apply_login_lua_command — the only
+    // applier with those arms and the capture-KickEvent ordering; the
+    // shared event-script drain silently drops them, which was the
+    // second "yes does nothing" failure).
     let cmds = engine
         .fire_player_event_and_drain(PLAYER_ID, &[])
         .expect("doExitDoor must be parked on the processEvent000_2 reply");
@@ -2220,6 +2226,30 @@ async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
         "yes-branch must start SEQ_005; got {:?}",
         cmds,
     );
+    for (what, found) in [
+        (
+            "CreateContentArea",
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::CreateContentArea { .. })),
+        ),
+        (
+            "StartDirectorMain",
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::StartDirectorMain { .. })),
+        ),
+        (
+            "KickEvent",
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::KickEvent { .. })),
+        ),
+        (
+            "DoZoneChangeContent",
+            cmds.iter()
+                .any(|c| matches!(c, LuaCommand::DoZoneChangeContent { .. })),
+        ),
+    ] {
+        assert!(found, "yes-branch burst must contain {what}; got {cmds:?}");
+    }
 }
 
 #[tokio::test]

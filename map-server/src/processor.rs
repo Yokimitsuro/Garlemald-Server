@@ -8228,7 +8228,40 @@ impl PacketProcessor {
                 commands = cmds.len(),
                 "EventUpdate resumed parked director coroutine",
             );
-            Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
+            // A resumed QUEST-hook continuation can carry the content-warp
+            // burst (CreateContentArea / StartDirectorMain / SetLoginDirector
+            // / DoZoneChangeContent): man0l0's doExitDoor parks on the
+            // NewRectAsk RPC and emits the whole burst when this EventUpdate
+            // resumes it. Those commands are login-scoped — only
+            // `apply_login_lua_command` creates the content area, and its
+            // KickEvent CAPTURE (emitted at the END of the content zone-in
+            // bundle, after the director's spawn packet) is the proven
+            // ordering; the shared event-script drain's immediate KickEvent
+            // dispatch would race the director spawn and the client would
+            // silently drop the kick (decomp: KickClientOrderEventReceiver
+            // drops kicks for unspawned owners). Gridania never hits this
+            // branch because its doContentArea burst comes out of the onTalk
+            // hook's FIRST slice (drained by fire_quest_event_hook via
+            // apply_login_lua_command); the Limsa exit door is the first
+            // content warp emitted from a resumed continuation. Director-
+            // coroutine continuations (the #28 mid-fight flows) never emit
+            // these commands and keep the shared drain, whose direct
+            // KickEvent dispatch `kickEventContinue` relies on.
+            // (Garlemald-Server #25.)
+            let is_content_warp_burst = cmds.iter().any(|c| {
+                matches!(
+                    c,
+                    crate::lua::command::LuaCommand::CreateContentArea { .. }
+                        | crate::lua::command::LuaCommand::DoZoneChangeContent { .. }
+                )
+            });
+            if is_content_warp_burst {
+                for cmd in cmds {
+                    Box::pin(self.apply_login_lua_command(&handle, cmd)).await;
+                }
+            } else {
+                Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
+            }
             return Ok(());
         }
 
