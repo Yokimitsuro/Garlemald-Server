@@ -359,10 +359,17 @@ async fn dispatch_npc_event_started(
         // this path (their dispatch blocks answer normally). (#28.)
         // Static client-side actors (high nibble 0xA — command actors,
         // quest actors) are answered by their dedicated dispatch paths;
-        // replying here would double the EndEvent per press. Only
-        // world-spawned actors (a despawned NPC) take the release path.
-        if owner_actor_id >> 28 == 0xA || owner_actor_id == 0 {
-            tracing::debug!(owner = owner_actor_id, "event: owner actor missing");
+        // replying here would double the EndEvent per press. Type 127
+        // is the client's Lua-ERROR report tunnel (owner is a pseudo-id
+        // like 4) — an error report is not an open event, so replying
+        // would be noise. Only world-spawned actors (a despawned NPC)
+        // take the release path.
+        if owner_actor_id >> 28 == 0xA || owner_actor_id == 0 || event_type == 127 {
+            tracing::debug!(
+                owner = owner_actor_id,
+                ty = event_type,
+                "event: owner actor missing",
+            );
             return;
         }
         tracing::debug!(

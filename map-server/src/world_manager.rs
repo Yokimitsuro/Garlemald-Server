@@ -563,20 +563,23 @@ fn push_npc_spawn(
     //   01>DepictionJudge:judgeNameplate() [?:900]
     //     program => CharaBaseClass:_onUpdateWork() [?:5685]
     // Masking bit 2 off for `/monster/` actors routes the client
-    // through the populace nameplate path and suppresses the three
-    // "An error has occurred" popups. Bit 2 comes back for actors that
-    // spawned through the REAL BattleNpc pipeline (`battle_kind` is
-    // Some(BattleNpc/Ally)) — their /_init carries the full battle
-    // field set the judge compares against, and without bit 2 the
-    // client never routes them down the HP-gauge branch at all (the
-    // SEQ_005 wolves showed no health overhead or in the target HUD).
-    // (Garlemald-Server #28.)
+    // through the populace nameplate path and suppresses the
+    // "An error has occurred" popups. This mask is UNCONDITIONAL and
+    // must stay that way: a 2026-06-11 live A/B with bit 2 restored for
+    // real-pipeline BattleNpcs crashed the client's
+    // `NpcBaseClass:_onUpdateWork()` ("attempt to index field
+    // 'parameterTemp' (a nil value)") — the NpcBase work struct never
+    // allocates the battle-branch fields bit 2 makes the client read,
+    // regardless of what the /_init delivers. pmeteor hit the same
+    // wall: `charaWork.property[2] = 1` is COMMENTED OUT in both its
+    // Npc.cs:174 and BattleNpc.cs:97, and its tutorial renders mob HP
+    // bars via npcWork.hateType alone. (Garlemald-Server #28.)
     use crate::runtime::actor_registry::ActorKindTag;
     let is_real_battle_npc = matches!(
         battle_kind,
         Some(ActorKindTag::BattleNpc) | Some(ActorKindTag::Ally)
     );
-    let property_flags = if is_monster && !is_real_battle_npc {
+    let property_flags = if is_monster {
         character.chara.property_flags & !(1u32 << 2)
     } else {
         character.chara.property_flags
