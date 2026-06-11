@@ -20,7 +20,6 @@
 //! SendMessage.
 
 use std::io::Cursor;
-use std::io::Write as _;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use common::luaparam::{self, LuaParam};
@@ -166,18 +165,20 @@ pub fn build_game_message_with_actors(
 // Tier table (size figures are SubPacket total = 0x10 header + 0x10 GMHeader
 // + body):
 //   0x0166 (28b) — body  8, params capacity  0  — header-only message
-//   0x0167 (38b) — body 24, params capacity 16  — ~2 params
-//   0x0168 (38b) — body 24, params capacity 16  — ~2 params (alt routing,
-//                   captured in different captures than 0x0167; no
-//                   semantic difference confirmed yet)
+//   0x0167 (38b) — body 24, params capacity  8  — + u32 `8` marker at +0x10
+//   0x0168 (38b) — body 24, params capacity 16  — no marker
 //   0x0169 (48b) — body 40, params capacity 32  — ~4 params
 //   0x016A (68b) — body 72, params capacity 64  — ~8 params
 //
-// Project Meteor never implemented this family. Garlemald's existing
-// `build_game_message_with_actors` covers the 0x0157-0x015B "Source Actor"
-// variants but those require a runtime actor as the message subject;
-// the No-Source variants are what retail uses for system feedback like
-// "You harvest a Maple Log", "Quest accepted", etc.
+// pmeteor DOES implement this family: `GameMessagePacket.BuildPacket`'s
+// WITHOUT_ACTOR overload (GameMessagePacket.cs:296-341) — opcode by params
+// size (<=0x8 -> 0x0167 + a mandatory `u32 = 8` marker at body+0x10,
+// <=0x10 -> 0x0168, <=0x20 -> 0x0169, else 0x016A), header source = the
+// message sender (WorldMaster 0x5FF80001 for system messages — the 1.x
+// client dispatches by header source, so it MUST be an actor that always
+// exists client-side, never the player). The No-Source variants are what
+// retail uses for system feedback like "You harvest a Maple Log",
+// "Quest accepted", etc.
 
 /// Common 8-byte header for the Text Sheet (No Source Actor) family.
 fn write_text_sheet_no_source_header(
@@ -196,36 +197,52 @@ fn write_text_sheet_no_source_header(
 /// no LuaParams. Smallest tier; the simplest "fire a system text id"
 /// emission.
 pub fn build_text_sheet_no_source_x28(
-    receiver_actor_id: u32,
-    sender_actor_id: u32,
+    source_actor_id: u32,
+    text_owner_actor_id: u32,
     text_id: u16,
     log_flag: u8,
 ) -> SubPacket {
     let mut body_buf = Vec::<u8>::with_capacity(8);
-    write_text_sheet_no_source_header(&mut body_buf, sender_actor_id, text_id, log_flag);
+    write_text_sheet_no_source_header(&mut body_buf, text_owner_actor_id, text_id, log_flag);
     let mut data = body(0x28);
     data[..body_buf.len()].copy_from_slice(&body_buf);
-    SubPacket::new(OP_TEXT_SHEET_NO_ACTOR_X28, receiver_actor_id, data)
+    SubPacket::new(OP_TEXT_SHEET_NO_ACTOR_X28, source_actor_id, data)
 }
 
-/// 0x0167 Text Sheet Message (No Source Actor) (38b). Up to 16 bytes of
-/// LuaParams (~2 typical 8-byte params).
+/// 0x0167 Text Sheet Message (No Source Actor) (38b). Up to 8 bytes of
+/// LuaParams (one typical int param), with a MANDATORY `u32 = 8`
+/// params-region marker at body offset 0x10.
+///
+/// pmeteor `GameMessagePacket.BuildPacket` (WITHOUT_ACTOR family,
+/// GameMessagePacket.cs:296-341): the `lParamsSize <= 0x8` tier picks
+/// opcode 0x0167 and then `binWriter.Seek(0x10); binWriter.Write((UInt32)8)`.
+/// 0x0167 and 0x0168 share the same 0x38 packet size — the marker is
+/// what distinguishes the 8-byte-params layout from 0x0168's 16-byte
+/// one, and the 1.23b client VALIDATES it: omitting the marker (as this
+/// builder originally did) makes the client's 0x0167 handler abort the
+/// process via the CRT `_invalid_parameter` path (exception 0xC000000D
+/// at the login zone-in — the post-PR-#35 character-creation crash).
+/// Byte-validated against pmeteor's login toast in
+/// `captures/pmeteor-quest/20260426-160210-gridania-manual3/map-packets.log:829`.
 pub fn build_text_sheet_no_source_x38(
-    receiver_actor_id: u32,
-    sender_actor_id: u32,
+    source_actor_id: u32,
+    text_owner_actor_id: u32,
     text_id: u16,
     log_flag: u8,
     lua_params: &[LuaParam],
 ) -> SubPacket {
-    build_text_sheet_no_source_n(
-        receiver_actor_id,
-        sender_actor_id,
+    let mut sub = build_text_sheet_no_source_n(
+        source_actor_id,
+        text_owner_actor_id,
         text_id,
         log_flag,
         lua_params,
         OP_TEXT_SHEET_NO_ACTOR_X38,
         0x38,
-    )
+    );
+    // Params region is body bytes 0x8..0x10; the marker lives at 0x10.
+    sub.data[0x10..0x14].copy_from_slice(&8u32.to_le_bytes());
+    sub
 }
 
 /// 0x0168 Text Sheet Message (No Source Actor) (38b alt). Same body
@@ -235,15 +252,15 @@ pub fn build_text_sheet_no_source_x38(
 /// `accept_leve`, `accept_quest`, `sell_item` for 0x0167). Caller
 /// picks based on the message's intended display / log routing.
 pub fn build_text_sheet_no_source_x38_alt(
-    receiver_actor_id: u32,
-    sender_actor_id: u32,
+    source_actor_id: u32,
+    text_owner_actor_id: u32,
     text_id: u16,
     log_flag: u8,
     lua_params: &[LuaParam],
 ) -> SubPacket {
     build_text_sheet_no_source_n(
-        receiver_actor_id,
-        sender_actor_id,
+        source_actor_id,
+        text_owner_actor_id,
         text_id,
         log_flag,
         lua_params,
@@ -255,15 +272,15 @@ pub fn build_text_sheet_no_source_x38_alt(
 /// 0x0169 Text Sheet Message (No Source Actor) (48b). Up to 32 bytes
 /// of LuaParams.
 pub fn build_text_sheet_no_source_x48(
-    receiver_actor_id: u32,
-    sender_actor_id: u32,
+    source_actor_id: u32,
+    text_owner_actor_id: u32,
     text_id: u16,
     log_flag: u8,
     lua_params: &[LuaParam],
 ) -> SubPacket {
     build_text_sheet_no_source_n(
-        receiver_actor_id,
-        sender_actor_id,
+        source_actor_id,
+        text_owner_actor_id,
         text_id,
         log_flag,
         lua_params,
@@ -275,15 +292,15 @@ pub fn build_text_sheet_no_source_x48(
 /// 0x016A Text Sheet Message (No Source Actor) (68b). Up to 64 bytes
 /// of LuaParams. Not observed in the survey but defined for symmetry.
 pub fn build_text_sheet_no_source_x68(
-    receiver_actor_id: u32,
-    sender_actor_id: u32,
+    source_actor_id: u32,
+    text_owner_actor_id: u32,
     text_id: u16,
     log_flag: u8,
     lua_params: &[LuaParam],
 ) -> SubPacket {
     build_text_sheet_no_source_n(
-        receiver_actor_id,
-        sender_actor_id,
+        source_actor_id,
+        text_owner_actor_id,
         text_id,
         log_flag,
         lua_params,
@@ -293,8 +310,8 @@ pub fn build_text_sheet_no_source_x68(
 }
 
 fn build_text_sheet_no_source_n(
-    receiver_actor_id: u32,
-    sender_actor_id: u32,
+    source_actor_id: u32,
+    text_owner_actor_id: u32,
     text_id: u16,
     log_flag: u8,
     lua_params: &[LuaParam],
@@ -302,12 +319,12 @@ fn build_text_sheet_no_source_n(
     packet_size: usize,
 ) -> SubPacket {
     let mut body_buf = Vec::<u8>::with_capacity(packet_size.saturating_sub(0x20));
-    write_text_sheet_no_source_header(&mut body_buf, sender_actor_id, text_id, log_flag);
+    write_text_sheet_no_source_header(&mut body_buf, text_owner_actor_id, text_id, log_flag);
     luaparam::write_lua_params(&mut body_buf, lua_params).unwrap();
     let mut data = body(packet_size);
     let n = body_buf.len().min(data.len());
     data[..n].copy_from_slice(&body_buf[..n]);
-    SubPacket::new(opcode, receiver_actor_id, data)
+    SubPacket::new(opcode, source_actor_id, data)
 }
 
 /// Convenience: pick the smallest tier that fits the LuaParam payload.
@@ -315,8 +332,8 @@ fn build_text_sheet_no_source_n(
 /// for routing reasons — the auto-tier picker defaults to the
 /// "primary" 0x0167 / 0x0168 style based on `prefer_alt`.
 pub fn build_text_sheet_no_source_auto(
-    receiver_actor_id: u32,
-    sender_actor_id: u32,
+    source_actor_id: u32,
+    text_owner_actor_id: u32,
     text_id: u16,
     log_flag: u8,
     lua_params: &[LuaParam],
@@ -324,47 +341,51 @@ pub fn build_text_sheet_no_source_auto(
 ) -> SubPacket {
     if lua_params.is_empty() {
         return build_text_sheet_no_source_x28(
-            receiver_actor_id,
-            sender_actor_id,
+            source_actor_id,
+            text_owner_actor_id,
             text_id,
             log_flag,
         );
     }
-    // Probe param byte length by serializing into a temp buffer.
+    // Probe param byte length by serializing into a temp buffer. The
+    // thresholds mirror pmeteor's `findSizeOfParams` tiers
+    // (GameMessagePacket.cs:302-321): <=0x8 -> 0x0167 (with marker),
+    // <=0x10 -> 0x0168, <=0x20 -> 0x0169, else 0x016A. `prefer_alt`
+    // forces 0x0168 for small payloads where a capture shows retail
+    // using the 16-byte layout.
     let mut probe = Vec::<u8>::new();
     luaparam::write_lua_params(&mut probe, lua_params).unwrap();
     let p_len = probe.len();
+    if p_len <= 8 && !prefer_alt {
+        return build_text_sheet_no_source_x38(
+            source_actor_id,
+            text_owner_actor_id,
+            text_id,
+            log_flag,
+            lua_params,
+        );
+    }
     if p_len <= 16 {
-        return if prefer_alt {
-            build_text_sheet_no_source_x38_alt(
-                receiver_actor_id,
-                sender_actor_id,
-                text_id,
-                log_flag,
-                lua_params,
-            )
-        } else {
-            build_text_sheet_no_source_x38(
-                receiver_actor_id,
-                sender_actor_id,
-                text_id,
-                log_flag,
-                lua_params,
-            )
-        };
+        return build_text_sheet_no_source_x38_alt(
+            source_actor_id,
+            text_owner_actor_id,
+            text_id,
+            log_flag,
+            lua_params,
+        );
     }
     if p_len <= 32 {
         return build_text_sheet_no_source_x48(
-            receiver_actor_id,
-            sender_actor_id,
+            source_actor_id,
+            text_owner_actor_id,
             text_id,
             log_flag,
             lua_params,
         );
     }
     build_text_sheet_no_source_x68(
-        receiver_actor_id,
-        sender_actor_id,
+        source_actor_id,
+        text_owner_actor_id,
         text_id,
         log_flag,
         lua_params,
@@ -551,7 +572,15 @@ fn build_text_sheet_dispid_n(
     SubPacket::new(opcode, receiver_actor_id, data)
 }
 
-/// 0x00CA SendMessagePacket — the general chat relay.
+/// 0x0003 SendMessagePacket — one chat-log line in the receiving
+/// client. Wire layout from Meteor `SendMessagePacket.cs`
+/// (PACKET_SIZE 0x248 → 0x228 body):
+///   +0x00  sender name, ASCII, fixed 0x20 slot
+///   +0x20  u32 message type (1 say … 0x20 system, 0x21 system error)
+///   +0x24  message text, ASCII, max 0x200, zero-padded
+///
+/// The earlier port sent opcode 0x00CA with an ad-hoc layout; the
+/// 1.23b client drops that frame without rendering (issue #10).
 pub fn build_send_message(
     source_session: u32,
     target_session: u32,
@@ -559,16 +588,15 @@ pub fn build_send_message(
     sender_name: &str,
     message: &str,
 ) -> SubPacket {
-    let mut body = Vec::<u8>::with_capacity(0x40 + message.len());
-    body.write_u64::<LittleEndian>(0).unwrap();
-    body.write_u32::<LittleEndian>(0).unwrap();
-    body.write_u8(message_type).unwrap();
-    body.write_u8(0).unwrap();
-    body.write_u16::<LittleEndian>(0).unwrap();
-    write_padded_ascii(&mut body, sender_name, 0x20);
-    body.write_all(message.as_bytes()).unwrap();
-    body.write_u8(0).unwrap();
-    let mut sub = SubPacket::new(OP_SEND_MESSAGE, source_session, body);
+    let mut data = body(0x248);
+    let sender = sender_name.as_bytes();
+    let n = sender.len().min(0x20);
+    data[..n].copy_from_slice(&sender[..n]);
+    data[0x20..0x24].copy_from_slice(&u32::from(message_type).to_le_bytes());
+    let msg = message.as_bytes();
+    let m = msg.len().min(0x200);
+    data[0x24..0x24 + m].copy_from_slice(&msg[..m]);
+    let mut sub = SubPacket::new(OP_SEND_MESSAGE, source_session, data);
     sub.set_target_id(target_session);
     sub
 }
@@ -590,6 +618,21 @@ pub fn build_send_message_public(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Meteor `SendMessagePacket.cs` layout: sender in a 0x20 ASCII
+    /// slot, u32 message type at 0x20, text from 0x24, fixed 0x228
+    /// body, opcode 0x0003.
+    #[test]
+    fn send_message_matches_meteor_layout() {
+        let pkt = build_send_message(2, 2, 0x20, "Sender", "hello");
+        assert_eq!(pkt.data.len(), 0x228);
+        assert_eq!(&pkt.data[..6], b"Sender");
+        assert!(pkt.data[6..0x20].iter().all(|b| *b == 0));
+        assert_eq!(&pkt.data[0x20..0x24], &[0x20, 0, 0, 0]);
+        assert_eq!(&pkt.data[0x24..0x29], b"hello");
+        assert!(pkt.data[0x29..].iter().all(|b| *b == 0));
+        assert_eq!(pkt.game_message.opcode, OP_SEND_MESSAGE);
+    }
 
     /// Reproduce the body bytes of `gather_wood.pcapng` 0x0166 record #1
     /// — sender = 0xA0F4E204 (gamedata static actor), text_id = 0x0024
@@ -717,5 +760,45 @@ mod tests {
         let huge = vec![LuaParam::Int32(1); 8]; // 8 × 6 + 1 = 49 bytes
         let ph = build_text_sheet_no_source_auto(1, 2, 3, 0x20, &huge, false);
         assert_eq!(ph.game_message.opcode, OP_TEXT_SHEET_NO_ACTOR_X68);
+    }
+
+    /// Byte-exact regression test for the 0x0167 tier against pmeteor's
+    /// captured login toast (`captures/pmeteor-quest/
+    /// 20260426-160210-gridania-manual3/map-packets.log:829` — the
+    /// "quest added to journal" message, text 25224, param quest
+    /// 110005). Two details the 1.23b client VALIDATES (omitting either
+    /// made it abort via CRT `_invalid_parameter`, exception 0xC000000D,
+    /// when the toast was first actually delivered):
+    ///   1. header source = WorldMaster 0x5FF80001 (per-actor receiver
+    ///      dispatch keys on it),
+    ///   2. the `u32 = 8` params-region marker at body offset 0x10
+    ///      (GameMessagePacket.cs:332-336).
+    #[test]
+    fn x38_quest_toast_matches_pmeteor_capture() {
+        let pkt = build_text_sheet_no_source_auto(
+            WORLD_MASTER_ACTOR_ID,
+            WORLD_MASTER_ACTOR_ID,
+            25224,
+            MESSAGE_TYPE_SYSTEM,
+            &[LuaParam::UInt32(110005)],
+            false,
+        );
+        assert_eq!(pkt.game_message.opcode, OP_TEXT_SHEET_NO_ACTOR_X38);
+        assert_eq!(pkt.header.source_id, WORLD_MASTER_ACTOR_ID);
+        // pmeteor capture body bytes (0x18 of them):
+        //   01 00 F8 5F  88 62  20 00  00 00 01 AD B5 0F 00 00  08 00 00 00  00 00 00 00
+        let expected: [u8; 0x18] = [
+            0x01, 0x00, 0xF8, 0x5F, // textOwner = WorldMaster
+            0x88, 0x62, // text_id 25224
+            0x20, 0x00, // log 0x20
+            0x00, 0x00, 0x01, 0xAD, 0xB5, 0x0F, 0x00, 0x00, // LuaParams: UInt32 110005 + end
+            0x08, 0x00, 0x00, 0x00, // mandatory params-region marker
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            pkt.data[..],
+            expected[..],
+            "0x0167 body must byte-match the pmeteor reference capture",
+        );
     }
 }

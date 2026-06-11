@@ -57,9 +57,34 @@ pub enum LuaCommand {
         actor_id: u32,
         main_state: u16,
     },
+    /// `sendSignal(name)` (`global.lua` → `GetLuaInstance():OnSignal(name)`).
+    /// Resumes every coroutine parked on `name` via
+    /// `LuaEngine::fire_signal_and_drain`; the resumed coroutines' own
+    /// commands are then applied. This is what wakes a director parked on
+    /// `waitForSignal("playerActive")`. (Garlemald-Server #28.)
+    SendSignal {
+        name: String,
+    },
     ChangeMusic {
         player_id: u32,
         music_id: u16,
+    },
+    /// `player:SendDataPacket(dataType, ...)` — port of C#
+    /// `Player::SendDataPacket` (`Player.cs` → `GenericDataPacket`,
+    /// opcode 0x0133). Emits a 0x0133 GenericData subpacket carrying the
+    /// variadic args as a LuaParam list. This is how the tutorial helpers
+    /// in `tutorial.lua` drive the client: `startTutorialMode` =
+    /// `SendDataPacket(9)` (puts the client into tutorial mode + arms the
+    /// active-mode / draw-weapon F toggle), `openTutorialWidget` =
+    /// `SendDataPacket(4, nil, nil, ctrl, widget)`, `showTutorialSuccessWidget`
+    /// = `SendDataPacket(2, nil, nil, textId)`, `closeTutorialWidget` =
+    /// `SendDataPacket(5)`, plus `SendDataPacket("attention", worldMaster,
+    /// "", textId, n)`. Without it the SEQ_005 director's
+    /// `startTutorialMode(player)` is silently dropped and the client never
+    /// lets the player press F. (Garlemald-Server #28.)
+    SendDataPacket {
+        player_id: u32,
+        params: Vec<LuaCommandArg>,
     },
     PlayAnimation {
         actor_id: u32,
@@ -263,6 +288,31 @@ pub enum LuaCommand {
         item_package: u16,
         item_id: u32,
         quantity: i32,
+    },
+    /// Garlemald-Server #28 — `player:GetEquipment():Set(slots,
+    /// srcPositions, srcPackage)`. Bulk-binds bag-slot items to gear
+    /// slots, the way `player.lua::equipClassItems` equips a fresh
+    /// character's starter kit. For each index `i`, the item currently in
+    /// the bag at `(src_package, src_positions[i])` is equipped into gear
+    /// slot `gear_slots[i]`.
+    ///
+    /// Applied by `apply_equip_from_package` (runtime drain in
+    /// `runtime/quest_apply.rs`). The applier resolves each bag slot to its
+    /// `serverItemId`, equips it via the existing `DbEquip` path (DB write
+    /// plus stat recalc), and ONLY fills gear slots that are currently EMPTY,
+    /// so re-running it on every login backfills broken / seed characters
+    /// without overriding a player's chosen gear. The combat-tutorial
+    /// softlock (SEQ_005 / Garlemald-Server #28) was a fresh Gladiator with
+    /// the Weathered Gladius in the bag but never equipped, so the client
+    /// couldn't enter Active mode.
+    ///
+    /// The two index vectors are paired positionally; trailing entries with
+    /// no partner (length mismatch) are dropped by the `zip` in the applier.
+    EquipFromPackage {
+        player_id: u32,
+        gear_slots: Vec<u16>,
+        src_positions: Vec<u16>,
+        src_package: u32,
     },
     /// `levemete:HandInRegionalLeve(player, leve_id)` — the drain-side
     /// trigger for Tier 3 #13 reward payout + Tier 4 #16 C seal

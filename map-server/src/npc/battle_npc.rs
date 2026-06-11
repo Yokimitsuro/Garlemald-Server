@@ -263,6 +263,11 @@ impl BattleNpc {
     /// `BattleNpcController` / `AllyController` registration that
     /// Meteor handles in the C# base-class ctor.
     ///
+    /// `caster_spell` is the pre-resolved spell for pool-job casters
+    /// (#28 S2.4) — the spawner converts it out of
+    /// `catalogs.battle_commands` because this sync path has no catalog
+    /// access. Ignored for non-casters.
+    ///
     /// Pool / genus / spawn modifier-layer merging (the
     /// `server_battlenpc_pool_mods` / `genus_mods` / `spawn_mods`
     /// rows) is intentionally NOT done here — it's a separate
@@ -274,6 +279,7 @@ impl BattleNpc {
         spawn: &crate::database::BattleNpcSpawn,
         bnpc_id: u32,
         actor_id: u32,
+        caster_spell: Option<crate::battle::BattleCommand>,
     ) {
         self.bnpc_id = bnpc_id;
         self.pool_id = spawn.pool_id;
@@ -308,6 +314,57 @@ impl BattleNpc {
         ctrl.battle.level = self.npc.character.chara.level;
         ctrl.battle.spawn_position =
             common::Vector3::new(spawn.position_x, spawn.position_y, spawn.position_z);
+
+        // #28 S2.1 — combat-feel metadata.
+        // Pool `combatDelay` is ms; garlemald's `Modifier::Delay` is
+        // SECONDS (`chara.rs::get_attack_delay_ms` does `delay * 1000`),
+        // so 4200 → 4.2. Zero keeps the 2500 ms weapon default.
+        if spawn.combat_delay > 0 {
+            self.npc.character.chara.mods.set(
+                crate::actor::modifier::Modifier::Delay,
+                spawn.combat_delay as f64 / 1000.0,
+            );
+        }
+        // pmeteor re-asserts MovementSpeed 5 every combat tick
+        // (`BattleNpcController.cs:234`); setting it once at spawn keeps
+        // the server step speed inside the announced 0x00D0 run band.
+        self.npc
+            .character
+            .chara
+            .mods
+            .set(crate::actor::modifier::Modifier::MovementSpeed, 5.0);
+        // Level-scaled fallback combat stats. The genus/pool mod seed
+        // tables carry no stat rows (016_server_battlenpc_genus_mods.sql
+        // is empty), so `attack_calculate_base_damage` — WeaponDamagePower
+        // + 0.85·Strength + Attack — read all zeros and every BNpc melee
+        // swing clamped to 1 damage (the SEQ_005 live fight: wolves and
+        // Yda chipping 0–1 while Papalymo's cast did all the killing).
+        // Mirrors the HP fallback in the spawn path: only fill stats the
+        // seed layers left at zero, so a future real stat derivation
+        // (pmeteor `CalculateBaseStats`) overrides cleanly. lvl 1 →
+        // base ≈ 3 + 0.85·7 + 3 ≈ 12 per swing. (Garlemald-Server #28.)
+        {
+            use crate::actor::modifier::Modifier;
+            let level = f64::from(self.npc.character.chara.level.max(1));
+            let mods = &mut self.npc.character.chara.mods;
+            if mods.get(Modifier::Strength) == 0.0 {
+                mods.set(Modifier::Strength, 5.0 + 2.0 * level);
+            }
+            if mods.get(Modifier::Attack) == 0.0 {
+                mods.set(Modifier::Attack, 2.0 + level);
+            }
+            if mods.get(Modifier::WeaponDamagePower) == 0.0 {
+                mods.set(Modifier::WeaponDamagePower, 2.0 + level);
+            }
+        }
+        // Caster archetype: pool currentJob 22 (THM) / 23 (CNJ). Casters
+        // stand back instead of closing to melee and never auto-attack
+        // (replaces the content script's `isAutoAttackEnabled` NewIndex
+        // no-ops — deleted in S2.5).
+        let is_caster = matches!(spawn.current_job, 22 | 23);
+        ctrl.battle.is_caster = is_caster;
+        ctrl.battle.spell = if is_caster { caster_spell } else { None };
+        ctrl.auto_attack_enabled = !is_caster;
         self.npc.character.ai_container.controller = Some(ctrl);
     }
 
@@ -527,7 +584,7 @@ mod tests {
         let spawn = make_spawn(
             /*allegiance=*/ 2, /*aggro_type=*/ 1, /*detection=*/ 0x01,
         );
-        bnpc.apply_spawn_metadata(&spawn, 3, bnpc.actor_id());
+        bnpc.apply_spawn_metadata(&spawn, 3, bnpc.actor_id(), None);
 
         assert_eq!(bnpc.bnpc_id, 3);
         assert_eq!(bnpc.pool_id, 2);
@@ -551,7 +608,7 @@ mod tests {
         let spawn = make_spawn(
             /*allegiance=*/ 2, /*aggro_type=*/ 1, /*detection=*/ 0x01,
         );
-        bnpc.apply_spawn_metadata(&spawn, 3, actor_id);
+        bnpc.apply_spawn_metadata(&spawn, 3, actor_id, None);
 
         let ctrl = bnpc
             .npc
@@ -577,7 +634,7 @@ mod tests {
         let spawn = make_spawn(
             /*allegiance=*/ 1, /*aggro_type=*/ 1, /*detection=*/ 0x01,
         );
-        bnpc.apply_spawn_metadata(&spawn, 6, actor_id);
+        bnpc.apply_spawn_metadata(&spawn, 6, actor_id, None);
 
         let ctrl = bnpc
             .npc
@@ -617,7 +674,7 @@ mod tests {
         let spawn = make_spawn(
             /*allegiance=*/ 2, /*aggro_type=*/ 0, /*detection=*/ 0x01,
         );
-        bnpc.apply_spawn_metadata(&spawn, 100, bnpc.actor_id());
+        bnpc.apply_spawn_metadata(&spawn, 100, bnpc.actor_id(), None);
         assert!(bnpc.neutral);
         assert!(
             bnpc.npc
@@ -630,5 +687,76 @@ mod tests {
                 .neutral,
             "Controller.battle.neutral must mirror BattleNpc.neutral",
         );
+    }
+
+    /// #28 S2.1 — caster pool job (currentJob 22 THM, the Papalymo
+    /// shape): is_caster set, auto-attack off, standback ring 15.0,
+    /// pool combatDelay (ms) landed as `Modifier::Delay` seconds, and
+    /// MovementSpeed pinned to 5.0.
+    #[test]
+    fn s2_1_caster_pool_job_disables_auto_attack_and_wires_delay_speed() {
+        let mut bnpc = BattleNpc::new(
+            99,
+            &class(),
+            "papalymo_99",
+            166,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            0,
+            None,
+        );
+        let actor_id = bnpc.actor_id();
+        let mut spawn = make_spawn(
+            /*allegiance=*/ 1, /*aggro_type=*/ 0, /*detection=*/ 0x01,
+        );
+        spawn.current_job = 22;
+        spawn.combat_delay = 4200;
+        let spell = crate::battle::BattleCommand::new(27313, "thunder");
+        bnpc.apply_spawn_metadata(&spawn, 7, actor_id, Some(spell));
+
+        let chara = &bnpc.npc.character;
+        let ctrl = chara.ai_container.controller.as_ref().unwrap();
+        assert!(ctrl.battle.is_caster, "currentJob 22 marks a caster");
+        assert!(
+            !ctrl.auto_attack_enabled,
+            "casters never melee (Papalymo swing gate)",
+        );
+        assert_eq!(ctrl.battle.standback_range, 15.0);
+        assert_eq!(
+            ctrl.battle.spell.as_ref().map(|s| s.id),
+            Some(27313),
+            "pre-resolved loop spell stored on the controller",
+        );
+        assert_eq!(chara.get_attack_delay_ms(), 4200, "combatDelay 4200 ms");
+        assert_eq!(chara.get_speed(), 5.0, "MovementSpeed pinned to 5.0");
+    }
+
+    /// #28 S2.1 — melee pool job (the Yda/wolf shape): no caster flag,
+    /// auto-attack stays on, spell ignored even if supplied.
+    #[test]
+    fn s2_1_melee_pool_job_keeps_auto_attack_defaults() {
+        let mut bnpc = BattleNpc::new(99, &class(), "yda_99", 166, 0.0, 0.0, 0.0, 0.0, 0, 0, None);
+        let actor_id = bnpc.actor_id();
+        let mut spawn = make_spawn(
+            /*allegiance=*/ 1, /*aggro_type=*/ 0, /*detection=*/ 0x01,
+        );
+        spawn.current_job = 3; // PUG — melee
+        spawn.combat_delay = 4200;
+        let spell = crate::battle::BattleCommand::new(27313, "thunder");
+        bnpc.apply_spawn_metadata(&spawn, 6, actor_id, Some(spell));
+
+        let chara = &bnpc.npc.character;
+        let ctrl = chara.ai_container.controller.as_ref().unwrap();
+        assert!(!ctrl.battle.is_caster);
+        assert!(ctrl.auto_attack_enabled, "melee allies swing");
+        assert!(
+            ctrl.battle.spell.is_none(),
+            "loop spell only sticks for casters",
+        );
+        assert_eq!(chara.get_attack_delay_ms(), 4200);
+        assert_eq!(chara.get_speed(), 5.0);
     }
 }

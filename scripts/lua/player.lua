@@ -1,6 +1,6 @@
 require("global");
 
-local initClassItems, initRaceItems;
+local initClassItems, equipClassItems, initRaceItems;
 
 function onBeginLogin(player)
 	--New character, set the initial quest. LuaPlayer's snapshot of
@@ -91,44 +91,50 @@ function onLogin(player)
 
 	if (player:GetPlayTime(false) == 0) then
 		player:SendMessage(0x1D,"",">PlayTime == 0, new player!");
-		
-		initClassItems(player);
-		initRaceItems(player);	
 
-		player:SavePlayTime();		
-	end	
-	
+		initClassItems(player);
+		initRaceItems(player);
+
+		player:SavePlayTime();
+	end
+
+	-- Garlemald-Server #28: always (re-)equip the per-class starter kit.
+	-- `initClassItems` only runs on first login (playTime == 0), so
+	-- existing/seed characters that already have the bag items but nothing
+	-- equipped (the SEQ_005 combat-tutorial softlock) never got a weapon.
+	-- The native `EquipFromPackage` applier only fills EMPTY gear slots, so
+	-- calling this on every login is a safe backfill — a player who already
+	-- chose their own gear has filled slots and is skipped.
+	equipClassItems(player);
+
 end
 
 function initClassItems(player)
 
-	local slotTable;
-	local invSlotTable;
+	-- First-login only (gated by playTime == 0 in onLogin). Adds the
+	-- per-class starter items to the NORMAL bag, then equips them.
+	-- Garlemald-Server #28: the equip step is split out into
+	-- `equipClassItems` so onLogin can re-run it on every login to
+	-- backfill existing/seed characters whose bag was populated but whose
+	-- gear slots were left empty by the old no-op `Set` binding.
 
-	--DoW	
+	--DoW
 	if (player.charaWork.parameterSave.state_mainSkill[0] == 2) then 		--PUG
 		player:GetItemPackage(0):AddItems({4020001, 8030701, 8050728, 8080601, 8090307});
-		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 3) then	--GLA
 		player:GetItemPackage(0):AddItems({4030010, 8031120, 8050245, 8080601, 8090307});
-		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 4) then	--MRD
 		player:GetItemPackage(0):AddItems({4040001, 8011001, 8050621, 8070346, 8090307});
-		player:GetEquipment():Set({0, 8, 12, 13, 15},{0, 1, 2, 3, 4},0);
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 7) then	--ARC
 		player:GetItemPackage(0):AddItems({4070001, 8030601, 8050622, 8080601, 8090307});
-		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 8) then	--LNC
 		player:GetItemPackage(0):AddItems({4080201, 8030801, 8051015, 8080501, 8090307});
-		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 	4},0);
-	--DoM	
+	--DoM
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 22) then	--THM
 		player:GetItemPackage(0):AddItems({5020001, 8030245, 8050346, 8080346, 8090208});
-		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 23) then	--CNJ
 		player:GetItemPackage(0):AddItems({5030101, 8030445, 8050031, 8080246, 8090208});
-		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
-		
+
 	--DoH
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 29) then	--
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 30) then	--
@@ -138,13 +144,44 @@ function initClassItems(player)
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 34) then	--
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 35) then	--
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 36) then	--
-	
+
 	--DoL
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 39) then	--MIN
-	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 40) then	--BTN	
+	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 40) then	--BTN
 	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 41) then	--FSH
 	end
-	
+
+	equipClassItems(player);
+
+end
+
+function equipClassItems(player)
+
+	-- Garlemald-Server #28: equip the per-class starter kit from the
+	-- NORMAL bag (package 0) into the gear slots. The slot/srcPosition
+	-- tables match `initClassItems`'s `AddItems` ordering verbatim per
+	-- class. The native `EquipFromPackage` applier only fills EMPTY gear
+	-- slots, so this is safe to call on every login (idempotent backfill)
+	-- — it never clobbers a player's chosen gear.
+
+	--DoW
+	if (player.charaWork.parameterSave.state_mainSkill[0] == 2) then 		--PUG
+		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
+	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 3) then	--GLA
+		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
+	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 4) then	--MRD
+		player:GetEquipment():Set({0, 8, 12, 13, 15},{0, 1, 2, 3, 4},0);
+	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 7) then	--ARC
+		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
+	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 8) then	--LNC
+		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
+	--DoM
+	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 22) then	--THM
+		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
+	elseif (player.charaWork.parameterSave.state_mainSkill[0] == 23) then	--CNJ
+		player:GetEquipment():Set({0, 10, 12, 14, 15},{0, 1, 2, 3, 4},0);
+	end
+
 end
 
 function initRaceItems(player)

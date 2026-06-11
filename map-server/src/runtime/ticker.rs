@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tokio::time::{Instant, interval};
+use tokio::time::interval;
 
 use crate::actor::Character;
 use crate::actor::modifier::ModifierMap;
@@ -77,6 +77,12 @@ pub const INN_REST_BONUS_CAP: i32 = 100;
 /// playtest value (Meteor's default is 60s).
 pub const BNPC_DEFAULT_RESPAWN_SECS: u32 = 30;
 
+/// Corpse linger time for one-shot (respawn-disabled) BattleNpcs — the
+/// SEQ_005 tutorial wolves. Long enough for the collapse animation +
+/// a beat, short enough that the field clears while the player is
+/// still nearby. pmeteor's DeathState despawn timer is 10s.
+pub const CORPSE_DESPAWN_SECS: u32 = 10;
+
 /// Per-actor death-state tick decision. Returned from the read-lock
 /// scan inside `tick_zone` so the follow-up write lock + dispatcher
 /// call happens after the read lock is released.
@@ -88,6 +94,9 @@ enum DeathTickAction {
     /// BattleNpc whose respawn timer has elapsed — snap back to
     /// spawn position + revive.
     Respawn,
+    /// One-shot (respawn-disabled) BattleNpc whose corpse-linger timer
+    /// elapsed — broadcast RemoveActor + drop from registry/grid.
+    Despawn,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,8 +129,9 @@ pub struct GameTicker {
     /// up Catalogs just to run the ticker. The dispatchers consume this
     /// (gear-paramBonus summer reads `items`).
     pub catalogs: Arc<crate::lua::Catalogs>,
-    /// Server-start wall-clock — `now_ms` on each tick is relative to this.
-    start: Instant,
+    /// Last `now_ms` the per-content-area `onUpdate` driver fired —
+    /// delta-gated (see `tick_once`).
+    last_content_update_ms: tokio::sync::Mutex<u64>,
 }
 
 impl GameTicker {
@@ -145,6 +155,9 @@ impl GameTicker {
             .as_ref()
             .map(|l| l.catalogs().clone())
             .unwrap_or_else(|| Arc::new(crate::lua::Catalogs::default()));
+        // Anchor the shared battle clock now so AI deadlines armed
+        // before the first frame (login-time engages) share the domain.
+        let _ = crate::runtime::clock::server_now_ms();
         Self {
             config,
             world,
@@ -152,20 +165,58 @@ impl GameTicker {
             db,
             lua,
             catalogs,
-            start: Instant::now(),
+            last_content_update_ms: tokio::sync::Mutex::new(0),
         }
     }
 
     /// Run forever — suitable for `tokio::spawn`. Returns only on error.
     pub async fn run(self) -> ! {
+        tracing::info!(
+            interval_ms = self.config.tick_interval.as_millis() as u64,
+            has_lua = self.lua.is_some(),
+            "game ticker started",
+        );
         let mut int = interval(self.config.tick_interval);
         // The first tick fires immediately; we want the period to apply
         // between ticks.
         int.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut frames: u64 = 0;
         loop {
             int.tick().await;
-            let now_ms = self.start.elapsed().as_millis() as u64;
+            // Shared battle-clock anchor (`runtime/clock.rs`) — the same
+            // domain `apply_actor_engage` / the set-target engage arm use
+            // to arm `AttackState.next_swing_ms`. The loop arithmetic
+            // below is unchanged; only the anchor is shared. (#28 S0.2.)
+            let now_ms = crate::runtime::clock::server_now_ms();
             self.tick_once(now_ms).await;
+            frames += 1;
+            // Liveness heartbeat — a frozen/starved ticker (the SEQ_005
+            // wait(1) continuation silently never firing) is otherwise
+            // invisible in the logs. Scheduler depths included so a
+            // parked-but-never-drained coroutine is directly visible.
+            if frames.is_multiple_of(100) {
+                let (t, s, e) = self
+                    .lua
+                    .as_ref()
+                    .and_then(|l| {
+                        l.scheduler().lock().ok().map(|sch| {
+                            (
+                                sch.pending_time_count(),
+                                sch.pending_signal_count(),
+                                sch.pending_event_count(),
+                            )
+                        })
+                    })
+                    .unwrap_or((usize::MAX, usize::MAX, usize::MAX));
+                tracing::debug!(
+                    frames,
+                    now_ms,
+                    parked_time = t,
+                    parked_signal = s,
+                    parked_event = e,
+                    "game ticker heartbeat",
+                );
+            }
         }
     }
 
@@ -188,18 +239,50 @@ impl GameTicker {
         // the dispatcher + seal accrual same as a fresh script call.
         if let Some(lua) = self.lua.as_ref() {
             let lua = lua.clone();
-            let resumed = tokio::task::spawn_blocking(move || lua.tick())
-                .await
-                .unwrap_or_default();
-            if !resumed.is_empty() {
-                crate::runtime::quest_apply::apply_runtime_lua_commands(
-                    resumed,
-                    &self.registry,
-                    &self.db,
-                    &self.world,
-                    self.lua.as_ref(),
-                )
-                .await;
+            let resumed = match tokio::task::spawn_blocking(move || lua.tick()).await {
+                Ok(batches) => batches,
+                Err(e) => {
+                    // A panic inside the scheduler tick would otherwise
+                    // vanish into `unwrap_or_default()` — and a panicked
+                    // resume means a parked coroutine was lost.
+                    tracing::warn!(error = %e, "lua scheduler tick panicked");
+                    Vec::new()
+                }
+            };
+            // Per-owner batches: a coroutine resumed off a `wait(n)` may
+            // queue EVENT-flavoured commands (the SEQ_005 director's
+            // post-`wait(1)` `kickEventContinue` + `processTtrBtl002`
+            // RunEventFunction) which the plain runtime drain DROPS at
+            // its catch-all. Route batches with a known owner player
+            // through the event bridge — same path the F-press command
+            // dispatch uses — and fall back to the runtime drain for
+            // ownerless coroutines. (Garlemald-Server #28.)
+            for (owner, cmds) in resumed {
+                let handle = if owner != 0 {
+                    self.registry.get(owner).await
+                } else {
+                    None
+                };
+                if let Some(handle) = handle {
+                    crate::runtime::quest_apply::apply_event_script_commands(
+                        &handle,
+                        cmds,
+                        &self.registry,
+                        &self.db,
+                        &self.world,
+                        self.lua.as_ref(),
+                    )
+                    .await;
+                } else {
+                    crate::runtime::quest_apply::apply_runtime_lua_commands(
+                        cmds,
+                        &self.registry,
+                        &self.db,
+                        &self.world,
+                        self.lua.as_ref(),
+                    )
+                    .await;
+                }
             }
         }
 
@@ -212,9 +295,21 @@ impl GameTicker {
         // tick interval. Sessions without an active content script
         // are skipped.
         const CONTENT_UPDATE_PERIOD_MS: u64 = 500;
-        if now_ms.is_multiple_of(CONTENT_UPDATE_PERIOD_MS)
-            && let Some(lua) = self.lua.as_ref()
-        {
+        // Delta-based gate — `now_ms.is_multiple_of(500)` almost never
+        // fired in production because `start.elapsed().as_millis()`
+        // jitters off the exact multiples (the live SEQ_005 sessions
+        // show ZERO content onUpdate activity — the ally-engage loop
+        // was never running). (Garlemald-Server #28.)
+        let content_due = {
+            let mut last = self.last_content_update_ms.lock().await;
+            if now_ms.saturating_sub(*last) >= CONTENT_UPDATE_PERIOD_MS {
+                *last = now_ms;
+                true
+            } else {
+                false
+            }
+        };
+        if content_due && let Some(lua) = self.lua.as_ref() {
             let sessions = self.world.all_sessions().await;
             for session in sessions {
                 let Some(active) = session.active_content_script.clone() else {
@@ -224,98 +319,14 @@ impl GameTicker {
                 if !script_path.exists() {
                     continue;
                 }
-                // Phase C2b — build real roster snapshots so the
-                // script's `area:GetPlayers()` / `:GetAllies()` /
-                // `:GetMonsters()` iterators yield real userdata
-                // instead of empty tables. Source the roster from
-                // `session.transient_director_members[director_id]`
-                // (Phase B4 records the director's member list there)
-                // + the live `ActorRegistry`. Classify members by
-                // their `ActorKindTag` so the script's separate
-                // `allies` / `monsters` loops see the right
-                // partition. The session-owning player is always in
-                // `players`.
                 let placeholder_queue = crate::lua::command::CommandQueue::new();
-                let mut players_vec = Vec::new();
-                let mut allies_vec = Vec::new();
-                let mut monsters_vec = Vec::new();
-
-                // Resolve the owning player → PlayerSnapshot.
-                if let Some(player_handle) = self.registry.by_session(session.id).await {
-                    let snap = {
-                        let c = player_handle.character.read().await;
-                        crate::processor::build_player_snapshot_from_character(&c)
-                    };
-                    players_vec.push(snap);
-                }
-
-                // Resolve every director member → LuaActor /
-                // PlayerSnapshot, classified by ActorKindTag.
-                let member_ids = if active.director_actor_id.ne(&0) {
-                    {
-                        session
-                            .transient_director_members
-                            .get(&active.director_actor_id)
-                            .cloned()
-                            .unwrap_or_default()
-                    }
-                } else {
-                    Default::default()
-                };
-                for mid in member_ids {
-                    let Some(handle) = self.registry.get(mid).await else {
-                        continue;
-                    };
-                    let c = handle.character.read().await;
-                    match handle.kind {
-                        crate::runtime::actor_registry::ActorKindTag::Player => {
-                            // Skip the session-owner — already in
-                            // players_vec from the by_session branch.
-                            if mid != players_vec.first().map(|p| p.actor_id).unwrap_or(0) {
-                                players_vec.push(
-                                    crate::processor::build_player_snapshot_from_character(&c),
-                                );
-                            }
-                        }
-                        kind @ (crate::runtime::actor_registry::ActorKindTag::Ally
-                        | crate::runtime::actor_registry::ActorKindTag::BattleNpc
-                        | crate::runtime::actor_registry::ActorKindTag::Npc
-                        | crate::runtime::actor_registry::ActorKindTag::Pet) => {
-                            let actor = crate::lua::userdata::LuaActor {
-                                actor_id: mid,
-                                name: c.base.actor_name.clone(),
-                                class_name: String::new(),
-                                class_path: String::new(),
-                                unique_id: String::new(),
-                                zone_id: handle.zone_id,
-                                zone_name: String::new(),
-                                state: c.base.current_main_state,
-                                pos: (c.base.position_x, c.base.position_y, c.base.position_z),
-                                rotation: c.base.rotation,
-                                queue: placeholder_queue.clone(),
-                                is_engaged: c.is_engaged(),
-                                speed: c.get_speed(),
-                                target_actor_id: c
-                                    .ai_container
-                                    .current_state()
-                                    .map(|s| s.target_actor_id)
-                                    .filter(|id| *id != 0)
-                                    .unwrap_or(0),
-                            };
-                            // Ally if the registered kind says so
-                            // OR the BattleNpc was spawned with
-                            // allegiance==1 (we can't read that from
-                            // ActorKindTag::BattleNpc alone, but B1
-                            // tags ally BNpcs as `Ally`).
-                            match kind {
-                                crate::runtime::actor_registry::ActorKindTag::Ally => {
-                                    allies_vec.push(actor)
-                                }
-                                _ => monsters_vec.push(actor),
-                            }
-                        }
-                    }
-                }
+                let (players_vec, allies_vec, monsters_vec) = build_content_rosters(
+                    &self.registry,
+                    &session,
+                    &active,
+                    placeholder_queue.clone(),
+                )
+                .await;
 
                 let area = crate::lua::userdata::LuaContentArea {
                     parent_zone_id: active.parent_zone_id,
@@ -347,14 +358,34 @@ impl GameTicker {
                     );
                 }
                 if !partial.commands.is_empty() {
-                    crate::runtime::quest_apply::apply_runtime_lua_commands(
-                        partial.commands,
-                        &self.registry,
-                        &self.db,
-                        &self.world,
-                        self.lua.as_ref(),
-                    )
-                    .await;
+                    // Route through the EVENT bridge with the owning
+                    // player's handle so content scripts can `sendSignal`
+                    // (resuming parked director beats — the S4.1 kill
+                    // gate's `battleComplete` shape) and emit event-
+                    // flavoured commands; both were silent drops on the
+                    // plain runtime drain. The bridge falls back to the
+                    // same runtime appliers for everything else, so this
+                    // is a strict superset. (#28 S1.4.)
+                    if let Some(handle) = self.registry.by_session(session.id).await {
+                        crate::runtime::quest_apply::apply_event_script_commands(
+                            &handle,
+                            partial.commands,
+                            &self.registry,
+                            &self.db,
+                            &self.world,
+                            self.lua.as_ref(),
+                        )
+                        .await;
+                    } else {
+                        crate::runtime::quest_apply::apply_runtime_lua_commands(
+                            partial.commands,
+                            &self.registry,
+                            &self.db,
+                            &self.world,
+                            self.lua.as_ref(),
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -378,12 +409,39 @@ impl GameTicker {
             };
 
             // AIContainer::update needs an ActorArena — the zone itself.
-            {
+            // The movement intent (#28 S2.2) is taken in the same lock
+            // scope, gated on `can_change_state()` — a Magic state on
+            // top suppresses the step (pmeteor's HasMoved cast-interrupt
+            // rule, satisfied without implementing interrupts).
+            //
+            // Corpses don't think and don't walk: a DEAD actor's
+            // controller could still hold a MoveTo from its final tick
+            // (live SEQ_005: a killed wolf glided away in its death
+            // pose) — skip the whole AI/movement pass while dead. The
+            // death-state housekeeping below owns dead actors.
+            let is_dead_actor = {
+                let chara = handle.character.read().await;
+                chara.base.current_main_state == crate::actor::MAIN_STATE_DEAD
+            };
+            let movement = if is_dead_actor {
+                let mut chara = handle.character.write().await;
+                chara.ai_container.pending_movement = None;
+                None
+            } else {
                 let zone_read = zone.read().await;
                 let mut chara = handle.character.write().await;
                 chara
                     .ai_container
                     .update(now_ms, owner_view, &*zone_read, &mut battle_outbox);
+                if chara.ai_container.can_change_state() {
+                    chara.ai_container.pending_movement.take()
+                } else {
+                    chara.ai_container.pending_movement = None;
+                    None
+                }
+            };
+            if let Some(step) = movement {
+                apply_npc_movement_step(&self.world, &self.registry, zone, &handle, step).await;
             }
 
             // Chocobo rental expiry — port of Meteor commit `8687e431`'s
@@ -474,14 +532,36 @@ impl GameTicker {
                     if raise > 0.0 {
                         DeathTickAction::AutoRevive
                     } else if !matches!(handle.kind, ActorKindTag::Player)
+                        && !chara.chara.respawn_disabled
                         && chara.chara.time_of_death_utc != 0
-                        && (now_ms / 1000) as u32
+                        // `time_of_death_utc` is wall-clock (apply_die
+                        // stamps `unix_timestamp()`), so the comparison
+                        // must read wall-clock too — never the ticker's
+                        // server-start-relative `now_ms`. (#28 S0.2:
+                        // one clock domain per field, asserted in
+                        // `respawn_timer_compares_wall_clock`.)
+                        && common::utils::unix_timestamp() as u32
                             >= chara
                                 .chara
                                 .time_of_death_utc
                                 .saturating_add(BNPC_DEFAULT_RESPAWN_SECS)
                     {
                         DeathTickAction::Respawn
+                    } else if !matches!(handle.kind, ActorKindTag::Player)
+                        && chara.chara.respawn_disabled
+                        && chara.chara.time_of_death_utc != 0
+                        && common::utils::unix_timestamp() as u32
+                            >= chara
+                                .chara
+                                .time_of_death_utc
+                                .saturating_add(CORPSE_DESPAWN_SECS)
+                    {
+                        // One-shot (respawn-disabled) BNpcs — the SEQ_005
+                        // tutorial wolves — fade their corpse instead of
+                        // respawning (pmeteor DeathState: despawn timer
+                        // after the collapse). Registry removal inside
+                        // the applier is the once-only latch. (#28.)
+                        DeathTickAction::Despawn
                     } else {
                         DeathTickAction::None
                     }
@@ -489,6 +569,15 @@ impl GameTicker {
             };
             match action {
                 DeathTickAction::None => {}
+                DeathTickAction::Despawn => {
+                    crate::runtime::quest_apply::apply_despawn_actor(
+                        zone_id,
+                        handle.actor_id,
+                        &self.registry,
+                        &self.world,
+                    )
+                    .await;
+                }
                 DeathTickAction::AutoRevive | DeathTickAction::Respawn => {
                     // For respawn, also snap back to the spawn
                     // position before reviving — matches Meteor's
@@ -541,6 +630,246 @@ impl GameTicker {
     }
 }
 
+/// Phase C2b — build the content-area roster snapshots for the 500 ms
+/// `onUpdate(tick, area)` driver, so the script's `area:GetPlayers()` /
+/// `:GetAllies()` / `:GetMonsters()` iterators yield real userdata
+/// instead of empty tables. Sources the roster from
+/// `session.transient_director_members[director_id]` (Phase B4 records
+/// the director's member list there) + the live `ActorRegistry`,
+/// classified by `ActorKindTag`. The session-owning player is always in
+/// `players`.
+///
+/// #28 S0.5 — dead actors are filtered out of the ally/monster vectors:
+/// "in the roster table ≡ alive", so the content script needs no
+/// liveness checks and corpses leave `GetMonsters()` the tick they die.
+pub(crate) async fn build_content_rosters(
+    registry: &ActorRegistry,
+    session: &crate::data::Session,
+    active: &crate::data::ActiveContentScript,
+    placeholder_queue: std::sync::Arc<std::sync::Mutex<crate::lua::command::CommandQueue>>,
+) -> (
+    Vec<crate::lua::userdata::PlayerSnapshot>,
+    Vec<crate::lua::userdata::LuaActor>,
+    Vec<crate::lua::userdata::LuaActor>,
+) {
+    let mut players_vec = Vec::new();
+    let mut allies_vec = Vec::new();
+    let mut monsters_vec = Vec::new();
+
+    // Resolve the owning player → PlayerSnapshot.
+    if let Some(player_handle) = registry.by_session(session.id).await {
+        let snap = {
+            let c = player_handle.character.read().await;
+            crate::processor::build_player_snapshot_from_character(&c)
+        };
+        players_vec.push(snap);
+    }
+
+    // Resolve every director member → LuaActor / PlayerSnapshot,
+    // classified by ActorKindTag.
+    let member_ids = if active.director_actor_id.ne(&0) {
+        session
+            .transient_director_members
+            .get(&active.director_actor_id)
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    for mid in member_ids {
+        let Some(handle) = registry.get(mid).await else {
+            continue;
+        };
+        let c = handle.character.read().await;
+        match handle.kind {
+            crate::runtime::actor_registry::ActorKindTag::Player => {
+                // Skip the session-owner — already in players_vec from
+                // the by_session branch.
+                if mid != players_vec.first().map(|p| p.actor_id).unwrap_or(0) {
+                    players_vec.push(crate::processor::build_player_snapshot_from_character(&c));
+                }
+            }
+            kind @ (crate::runtime::actor_registry::ActorKindTag::Ally
+            | crate::runtime::actor_registry::ActorKindTag::BattleNpc
+            | crate::runtime::actor_registry::ActorKindTag::Npc
+            | crate::runtime::actor_registry::ActorKindTag::Pet) => {
+                // S0.5 dead-filter (see fn doc).
+                if c.base.current_main_state == crate::actor::MAIN_STATE_DEAD {
+                    continue;
+                }
+                let actor = crate::lua::userdata::LuaActor {
+                    actor_id: mid,
+                    name: c.base.actor_name.clone(),
+                    class_name: String::new(),
+                    class_path: String::new(),
+                    unique_id: String::new(),
+                    zone_id: handle.zone_id,
+                    zone_name: String::new(),
+                    state: c.base.current_main_state,
+                    pos: (c.base.position_x, c.base.position_y, c.base.position_z),
+                    rotation: c.base.rotation,
+                    queue: placeholder_queue.clone(),
+                    // Engagement = an active AttackState (pmeteor
+                    // `aiContainer.IsEngaged()`), NOT
+                    // `Character::is_engaged()` which reads
+                    // `current_target != INVALID_ACTORID` and
+                    // defaults to `0 != 0xC0000000` = always-true
+                    // for NPCs that never get a `current_target`.
+                    // With the buggy value the content script's
+                    // `if not allies[i]:IsEngaged()` guard never
+                    // passes and allies never engage. (Garlemald #28.)
+                    is_engaged: c.ai_container.is_engaged(),
+                    speed: c.get_speed(),
+                    target_actor_id: c
+                        .ai_container
+                        .current_state()
+                        .map(|s| s.target_actor_id)
+                        .filter(|id| *id != 0)
+                        .unwrap_or(0),
+                };
+                // Ally if the registered kind says so OR the BattleNpc
+                // was spawned with allegiance==1 (we can't read that
+                // from ActorKindTag::BattleNpc alone, but B1 tags ally
+                // BNpcs as `Ally`).
+                match kind {
+                    crate::runtime::actor_registry::ActorKindTag::Ally => allies_vec.push(actor),
+                    _ => monsters_vec.push(actor),
+                }
+            }
+        }
+    }
+    (players_vec, allies_vec, monsters_vec)
+}
+
+/// pmeteor `Actor.LookAt` (Actor.cs:688-704): face `(x, z)` from
+/// `(owner_x, owner_z)` — `rotation = π - atan2(dz, dx) + π/2` with the
+/// deltas measured owner − target.
+pub(crate) fn look_at_rotation(owner_x: f32, owner_z: f32, x: f32, z: f32) -> f32 {
+    if owner_x == x && owner_z == z {
+        return 0.0;
+    }
+    let d_x = owner_x - x;
+    let d_z = owner_z - z;
+    std::f32::consts::PI - d_z.atan2(d_x) + std::f32::consts::FRAC_PI_2
+}
+
+/// #28 S2.2 — apply one straight-line movement step (Option B: the
+/// SEQ_005 arena is flat, ≤ 11 y across and obstacle-free; the `PathFind`
+/// port stays untouched for future zones). Per tick:
+///
+///   1. advance `min(speed * 0.1, dist)` toward the stop-ring destination
+///      (the controller already projected the ring point, so walking the
+///      full remaining distance can never overshoot — pmeteor
+///      `PathFind.StepTo` shape; LSB: mob_controller.cpp::Move (shape
+///      re-derived, GPL-3 — no verbatim copy));
+///   2. rotate toward the destination (same ray as the target);
+///   3. write `Character.base.position_*` then re-insert into the zone's
+///      spatial grid so `actors_around` (the AI arena + broadcast radii)
+///      stays truthful — the S0.3 sibling for the AI path;
+///   4. emit 0x00CF via `broadcast_around_actor` (per-recipient
+///      target-stamping handled there) on the FIRST step, every 3rd step
+///      after (~300 ms — pmeteor's observed 333-360 ms cadence; the
+///      client interpolates between waypoints), and on arrival.
+///      `move_state = 2` (running) while stepping, final packet at the
+///      ring with `move_state = 0` — moveState 2-vs-0 is the one
+///      empirical unknown (pmeteor ships 0; wiki says 2 = running); flip
+///      the constant if the live client double-plays the run animation.
+///
+/// Concrete wire shape per emission (wolf bnpc 3 closing on the player):
+///   SubPacket size=0x50 source=<wolf id> target=<stamped per recipient>
+///   opcode=0x00CF, body +0x00..07 zero | +0x08 f32 x | +0x0C f32 y |
+///   +0x10 f32 z | +0x14 f32 rot | +0x18 u16 moveState | +0x24
+///   floatingHeight = 0 (ground mobs).
+async fn apply_npc_movement_step(
+    world: &Arc<WorldManager>,
+    registry: &Arc<ActorRegistry>,
+    zone: &Arc<RwLock<Zone>>,
+    handle: &crate::runtime::actor_registry::ActorHandle,
+    step: crate::battle::ai_container::MovementStep,
+) {
+    use crate::battle::ai_container::MovementStep;
+
+    let (emit, x, y, z, rot, move_state) = {
+        let mut chara = handle.character.write().await;
+        let pos = chara.base.position();
+        match step {
+            MovementStep::Face { position } => {
+                // In range — rotation only, no translation, no wire (the
+                // arrival packet already carried the facing; combat
+                // result packets keep the client's pose fresh).
+                chara.base.rotation = look_at_rotation(pos.x, pos.z, position.x, position.z);
+                chara.ai_container.movement_step_count = 0;
+                return;
+            }
+            MovementStep::MoveTo { destination } => {
+                let dx = destination.x - pos.x;
+                let dz = destination.z - pos.z;
+                let dist = (dx * dx + dz * dz).sqrt();
+                // speed 5.0 → 0.5 y per 100 ms tick = the announced
+                // 0x00D0 run band, so client animation ≈ server step.
+                let step_len = chara.get_speed() * 0.1;
+                let arrived = step_len >= dist;
+                let advance = step_len.min(dist);
+                let (nx, ny, nz) = if dist > f32::EPSILON {
+                    let t = advance / dist;
+                    (
+                        pos.x + dx * t,
+                        pos.y + (destination.y - pos.y) * t,
+                        pos.z + dz * t,
+                    )
+                } else {
+                    (pos.x, pos.y, pos.z)
+                };
+                let rot = look_at_rotation(pos.x, pos.z, destination.x, destination.z);
+                chara.base.position_x = nx;
+                chara.base.position_y = ny;
+                chara.base.position_z = nz;
+                chara.base.rotation = rot;
+                chara.ai_container.movement_step_count += 1;
+                let count = chara.ai_container.movement_step_count;
+                let emit = arrived || count % 3 == 1;
+                if arrived {
+                    chara.ai_container.movement_step_count = 0;
+                }
+                let move_state = if arrived { 0u16 } else { 2u16 };
+                (emit, nx, ny, nz, rot, move_state)
+            }
+        }
+    };
+
+    // Grid re-insert — keeps `actors_around` (AI arena, broadcast radii)
+    // in sync with the authoritative position we just wrote.
+    {
+        let mut zone_w = zone.write().await;
+        let mut ob = AreaOutbox::new();
+        zone_w
+            .core
+            .update_actor_position(handle.actor_id, common::Vector3::new(x, y, z), &mut ob);
+        // ActorMoved grid events are visibility bookkeeping; the player
+        // position path drops them too (world_manager.rs:2280-2298).
+        let _ = ob.drain();
+    }
+
+    if emit {
+        let sub = crate::packets::send::actor::build_move_actor_to_position(
+            handle.actor_id,
+            x,
+            y,
+            z,
+            rot,
+            move_state,
+        );
+        crate::runtime::broadcast::broadcast_around_actor(
+            world,
+            registry,
+            zone,
+            handle.actor_id,
+            sub.to_bytes(),
+        )
+        .await;
+    }
+}
+
 fn tick_status(chara: &mut Character, now_ms: u64, outbox: &mut StatusOutbox) {
     // Clone the ModifierMap so we can hand it in without aliasing — the
     // underlying HashMap is small enough that this is essentially free.
@@ -548,7 +877,11 @@ fn tick_status(chara: &mut Character, now_ms: u64, outbox: &mut StatusOutbox) {
     chara.status_effects.update(now_ms, &mods_snapshot, outbox);
 }
 
-fn build_owner_view(chara: &Character, actor_id: u32, zone_id: u32) -> ControllerOwnerView {
+pub(crate) fn build_owner_view(
+    chara: &Character,
+    actor_id: u32,
+    zone_id: u32,
+) -> ControllerOwnerView {
     let is_engaged = chara.ai_container.is_engaged();
     let current_target = chara
         .ai_container
@@ -592,6 +925,7 @@ fn build_owner_view(chara: &Character, actor_id: u32, zone_id: u32) -> Controlle
         is_close_to_spawn: true,
         target_is_locked: false,
         attack_delay_ms: chara.get_attack_delay_ms(),
+        attack_range: chara.get_attack_range(),
     }
 }
 
@@ -809,6 +1143,461 @@ mod tests {
         assert!(
             final_hp < initial_hp,
             "npc hp should have dropped after 10 swings, got {final_hp}"
+        );
+    }
+
+    /// #28 S0.5(a) — dead actors leave the onUpdate roster: a wolf at
+    /// `MAIN_STATE_DEAD` must be excluded from the monsters vector so
+    /// the content script's "in the table ≡ alive" invariant holds.
+    #[tokio::test]
+    async fn dead_actor_excluded_from_content_rosters() {
+        let registry = ActorRegistry::new();
+        let director_id = 0x6608_0001u32;
+
+        for (id, kind, dead) in [
+            (0x4000_0010u32, ActorKindTag::BattleNpc, false),
+            (0x4000_0011u32, ActorKindTag::BattleNpc, true),
+            (0x4000_0012u32, ActorKindTag::Ally, true),
+        ] {
+            let mut c = Character::new(id);
+            if dead {
+                c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+            }
+            registry.insert(ActorHandle::new(id, kind, 166, 0, c)).await;
+        }
+
+        let mut session = crate::data::Session::new(7);
+        session
+            .transient_director_members
+            .insert(director_id, vec![0x4000_0010, 0x4000_0011, 0x4000_0012]);
+        let active = crate::data::ActiveContentScript {
+            parent_zone_id: 166,
+            area_name: "man0g01".to_string(),
+            area_class_path: String::new(),
+            director_name: String::new(),
+            director_actor_id: director_id,
+            content_area_actor_id: 0,
+            content_script: "SimpleContent30010".to_string(),
+            warp_complete: true,
+            spawned_actor_ids: Vec::new(),
+        };
+
+        let (players, allies, monsters) = super::build_content_rosters(
+            &registry,
+            &session,
+            &active,
+            crate::lua::command::CommandQueue::new(),
+        )
+        .await;
+        assert!(players.is_empty(), "no player session registered");
+        let monster_ids: Vec<u32> = monsters.iter().map(|m| m.actor_id).collect();
+        assert_eq!(
+            monster_ids,
+            vec![0x4000_0010],
+            "dead wolf must be filtered out of the monsters roster",
+        );
+        assert!(
+            allies.is_empty(),
+            "dead ally must be filtered out of the allies roster",
+        );
+    }
+
+    /// #28 S0.5(b) — `respawn_disabled` corpses stay dead past
+    /// `BNPC_DEFAULT_RESPAWN_SECS` (and despawn entirely once the
+    /// corpse-linger window elapses); without the flag the same corpse
+    /// respawns. Also asserts the S0.2 domain choice: the death-tick
+    /// compares wall-clock `unix_timestamp()` against the wall-clock
+    /// `time_of_death_utc` apply_die stamps — never the ticker's
+    /// relative `now_ms` (which is 0 here and would never trigger).
+    #[tokio::test]
+    async fn respawn_timer_compares_wall_clock() {
+        let (ticker, _zone) = setup_one_zone_one_actor().await;
+        let died_at = common::utils::unix_timestamp() as u32 - (BNPC_DEFAULT_RESPAWN_SECS + 1);
+
+        // Respawn-disabled corpse: stays dead through the respawn
+        // window, then DESPAWNS once the corpse-linger window elapses
+        // (BNPC_DEFAULT_RESPAWN_SECS+1 > CORPSE_DESPAWN_SECS) — the
+        // registry entry is gone, never revived. (#28: tutorial wolves
+        // must fade after defeat.)
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let mut c = handle.character.write().await;
+            c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+            c.chara.hp = 0;
+            c.chara.time_of_death_utc = died_at;
+            c.chara.respawn_disabled = true;
+        }
+        ticker.tick_once(0).await;
+        assert!(
+            ticker.registry.get(1).await.is_none(),
+            "respawn-disabled corpse must despawn after the linger window",
+        );
+
+        // Re-insert the same corpse shape for the respawn-path half.
+        {
+            let mut c = crate::actor::Character::new(1);
+            c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+            c.chara.hp = 0;
+            c.chara.max_hp = 100;
+            c.chara.time_of_death_utc = died_at;
+            c.chara.respawn_disabled = true;
+            ticker
+                .registry
+                .insert(crate::runtime::actor_registry::ActorHandle::new(
+                    1,
+                    crate::runtime::actor_registry::ActorKindTag::BattleNpc,
+                    100,
+                    0,
+                    c,
+                ))
+                .await;
+        }
+
+        // Same corpse with the flag cleared: the elapsed wall-clock
+        // window revives it even though the tick's now_ms is 0.
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let mut c = handle.character.write().await;
+            c.chara.respawn_disabled = false;
+        }
+        ticker.tick_once(0).await;
+        {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let c = handle.character.read().await;
+            assert_ne!(
+                c.base.current_main_state,
+                crate::actor::MAIN_STATE_DEAD,
+                "default corpse must respawn once the wall-clock window elapses",
+            );
+        }
+    }
+
+    /// Shared harness for the #28 S2.2/S2.4 movement + caster tests:
+    /// one zone (100) with a Player (id 1, session 42, client channel
+    /// captured) and one controller-driven NPC (id 2) at `npc_x`,
+    /// engaged on the player with seeded hate.
+    async fn setup_engaged_npc_vs_player(
+        npc_x: f32,
+        configure: impl FnOnce(&mut crate::battle::controller::Controller),
+    ) -> (
+        GameTicker,
+        Arc<RwLock<Zone>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        let db = Arc::new(Database::open(tempdb()).await.expect("database stub"));
+
+        let mut zone = Zone::new(
+            100,
+            "test",
+            1,
+            "/Area/Zone/Test",
+            0,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&StubNavmeshLoader),
+        );
+        let mut ob = AreaOutbox::new();
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 1,
+                kind: ActorKind::Player,
+                position: Vector3::ZERO,
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        zone.core.add_actor(
+            StoredActor {
+                actor_id: 2,
+                kind: ActorKind::BattleNpc,
+                position: Vector3::new(npc_x, 0.0, 0.0),
+                grid: (0, 0),
+                is_alive: true,
+            },
+            &mut ob,
+        );
+        world.register_zone(zone).await;
+
+        let mut player = Character::new(1);
+        player.chara.hp = 1000;
+        player.chara.max_hp = 1000;
+        player.chara.level = 10;
+        registry
+            .insert(ActorHandle::new(1, ActorKindTag::Player, 100, 42, player))
+            .await;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+        world
+            .register_client(42, crate::data::ClientHandle::new(42, tx))
+            .await;
+        world
+            .upsert_session(crate::data::Session {
+                id: 42,
+                current_zone_id: 100,
+                ..crate::data::Session::default()
+            })
+            .await;
+
+        let mut npc = Character::new(2);
+        npc.chara.hp = 1000;
+        npc.chara.max_hp = 1000;
+        npc.chara.level = 10;
+        npc.base.position_x = npc_x;
+        let mut ctrl = crate::battle::controller::BattleNpcController::new_for(2);
+        configure(&mut ctrl);
+        npc.ai_container.controller = Some(ctrl);
+        npc.hate.update_hate(1, 10);
+        npc.ai_container.internal_engage(1, 0, 2500);
+        registry
+            .insert(ActorHandle::new(2, ActorKindTag::BattleNpc, 100, 0, npc))
+            .await;
+
+        let ticker = GameTicker::new(TickerConfig::default(), world.clone(), registry, db);
+        let zone_arc = world.zone(100).await.unwrap();
+        (ticker, zone_arc, rx)
+    }
+
+    fn drain_subpackets(
+        rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) -> Vec<common::subpacket::SubPacket> {
+        let mut out = Vec::new();
+        while let Ok(bytes) = rx.try_recv() {
+            let mut offset = 0;
+            while offset < bytes.len() {
+                match common::subpacket::SubPacket::parse(&bytes, &mut offset) {
+                    Ok(sub) => out.push(sub),
+                    Err(_) => break,
+                }
+            }
+        }
+        out
+    }
+
+    /// #28 S2.2 (a)+(b)+(c) — an engaged wolf 9 y out converges to the
+    /// 2.8 y melee ring in < 2 s of ticks, never steps inside it, keeps
+    /// the spatial grid in sync, and emits 0x00CF on the first step,
+    /// every 3rd step after, and at arrival (final move_state 0).
+    #[tokio::test]
+    async fn s2_2_wolf_pursuit_converges_to_ring_with_throttled_wire() {
+        let (ticker, zone, mut rx) = setup_engaged_npc_vs_player(9.0, |_| {}).await;
+
+        for i in 1..=20u64 {
+            ticker.tick_once(i * 100).await;
+        }
+
+        let handle = ticker.registry.get(2).await.unwrap();
+        let (x, z) = {
+            let c = handle.character.read().await;
+            (c.base.position_x, c.base.position_z)
+        };
+        let dist = (x * x + z * z).sqrt();
+        assert!(
+            (dist - 2.8).abs() < 1e-3,
+            "wolf must park exactly on the 2.8 y stop ring, got {dist}",
+        );
+
+        // Spatial grid tracked the authoritative position.
+        {
+            let zr = zone.read().await;
+            let stored = zr.core.find_actor(2).expect("wolf in grid");
+            assert!(
+                (stored.position.x - x).abs() < 1e-3,
+                "grid x {} must track authoritative x {x}",
+                stored.position.x,
+            );
+        }
+
+        // Wire: 0x00CF at steps 1,4,7,10 (move_state 2) + arrival 13
+        // (move_state 0). 13 steps × 100 ms = 1.3 s < 2 s.
+        let moves: Vec<(f32, u16)> = drain_subpackets(&mut rx)
+            .into_iter()
+            .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_MOVE_ACTOR_TO_POSITION)
+            .map(|s| {
+                let x = f32::from_le_bytes(s.data[0x08..0x0C].try_into().unwrap());
+                let state = u16::from_le_bytes(s.data[0x18..0x1A].try_into().unwrap());
+                (x, state)
+            })
+            .collect();
+        assert_eq!(
+            moves.len(),
+            5,
+            "first step + every 3rd + arrival = 5 emissions, got {moves:?}",
+        );
+        assert!(
+            moves[..4].iter().all(|(_, st)| *st == 2),
+            "in-flight packets run with move_state 2, got {moves:?}",
+        );
+        assert_eq!(moves[4].1, 0, "arrival packet must carry move_state 0");
+        assert!(
+            (moves[4].0 - 2.8).abs() < 1e-3,
+            "arrival packet x must sit on the ring, got {moves:?}",
+        );
+        // Monotonic approach — never inside the ring.
+        for (x, _) in &moves {
+            assert!(
+                *x >= 2.8 - 1e-3,
+                "no packet may report a position inside the ring"
+            );
+        }
+    }
+
+    /// #28 S2.2 (d) — a caster (standback_range 15) closes from 20 y to
+    /// the 15 y ring and parks there.
+    #[tokio::test]
+    async fn s2_2_caster_standoff_stops_at_standback_ring() {
+        let (ticker, _zone, _rx) = setup_engaged_npc_vs_player(20.0, |ctrl| {
+            ctrl.battle.is_caster = true;
+            ctrl.auto_attack_enabled = false;
+            // No spell resolved — the caster stands back without casting.
+        })
+        .await;
+
+        for i in 1..=20u64 {
+            ticker.tick_once(i * 100).await;
+        }
+        let handle = ticker.registry.get(2).await.unwrap();
+        let x = handle.character.read().await.base.position_x;
+        assert!(
+            (x - 15.0).abs() < 1e-3,
+            "caster must park on the 15 y standback ring, got {x}",
+        );
+    }
+
+    /// #28 S2.2 (e) — a Magic state on top suppresses the movement step
+    /// (`can_change_state` gate): the actor holds position for the whole
+    /// cast.
+    #[tokio::test]
+    async fn s2_2_magic_state_suppresses_movement_step() {
+        let (ticker, _zone, _rx) = setup_engaged_npc_vs_player(9.0, |_| {}).await;
+        {
+            let handle = ticker.registry.get(2).await.unwrap();
+            let mut c = handle.character.write().await;
+            let mut cmd = crate::battle::BattleCommand::new(100, "stone");
+            cmd.cast_time_ms = 60_000;
+            assert!(c.ai_container.internal_cast(1, cmd, 0));
+        }
+        for i in 1..=10u64 {
+            ticker.tick_once(i * 100).await;
+        }
+        let handle = ticker.registry.get(2).await.unwrap();
+        let x = handle.character.read().await.base.position_x;
+        assert_eq!(x, 9.0, "casting actor must not take a single step");
+    }
+
+    /// #28 S2.4 — the full caster loop against the REAL seed catalog:
+    /// thunder 27313 resolves through the gamedata→battle converter,
+    /// CastStart renders chant 0xF0 (0x0144) + begin-cast 0x0139 (anim
+    /// 0x6F000002, cmd 27313, text 30128), completion clears the chant
+    /// and lands ResolveAction damage, and the recast clock holds the
+    /// next cast ≥ 8 s after the first.
+    #[tokio::test]
+    async fn s2_4_caster_loop_chants_casts_and_damages() {
+        let (ticker, _zone, mut rx) = setup_engaged_npc_vs_player(10.0, |_| {}).await;
+
+        // Resolve thunder out of the seeded battle-command catalog and
+        // pin the converter's load-bearing fields (report C §5).
+        let (catalog, _) = ticker
+            .db
+            .load_global_battle_command_list()
+            .await
+            .expect("battle command catalog");
+        let thunder = catalog.get(&27313).expect("thunder 27313 seeded");
+        let spell = thunder.to_battle_command();
+        assert_eq!(spell.range, 20.0);
+        assert_eq!(spell.cast_time_ms, 2000);
+        assert_eq!(spell.recast_time_ms, 6000);
+        assert_eq!(spell.cast_type, 2);
+        assert_eq!(spell.battle_animation, 16781815);
+        assert_eq!(spell.base_potency, 100);
+        assert_eq!(spell.command_type, crate::battle::CommandType::SPELL);
+        assert_eq!(spell.action_type, crate::battle::ActionType::Magic);
+
+        {
+            let handle = ticker.registry.get(2).await.unwrap();
+            let mut c = handle.character.write().await;
+            let ctrl = c.ai_container.controller.as_mut().unwrap();
+            ctrl.battle.is_caster = true;
+            ctrl.battle.spell = Some(spell);
+            ctrl.auto_attack_enabled = false;
+        }
+
+        let player_initial_hp = {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let c = handle.character.read().await;
+            c.get_hp()
+        };
+
+        // First tick fires the Cast decision (10 y < range 20, inside the
+        // 15 y ring → no movement); cast completes at 100 + 2000; the
+        // second cast unlocks at 8100 (tick 81).
+        for i in 1..=82u64 {
+            ticker.tick_once(i * 100).await;
+        }
+
+        let subs = drain_subpackets(&mut rx);
+        let substates: Vec<u8> = subs
+            .iter()
+            .filter(|s| {
+                s.game_message.opcode == crate::packets::opcodes::OP_SET_ACTOR_SUB_STATE
+                    && s.header.source_id == 2
+            })
+            .map(|s| s.data[1]) // chant_id byte
+            .collect();
+        assert!(
+            substates.starts_with(&[0xF0, 0x00]),
+            "chant glow on at cast start, off at completion; got {substates:?}",
+        );
+
+        let begin_casts: Vec<(u32, u16, u32, u16)> = subs
+            .iter()
+            .filter(|s| {
+                s.game_message.opcode == crate::packets::opcodes::OP_COMMAND_RESULT_X01
+                    && s.header.source_id == 2
+            })
+            .map(|s| {
+                let anim = u32::from_le_bytes(s.data[0x04..0x08].try_into().unwrap());
+                let cmd = u16::from_le_bytes(s.data[0x24..0x26].try_into().unwrap());
+                let target = u32::from_le_bytes(s.data[0x28..0x2C].try_into().unwrap());
+                let text = u16::from_le_bytes(s.data[0x2E..0x30].try_into().unwrap());
+                (anim, cmd, target, text)
+            })
+            .collect();
+        assert!(
+            begin_casts.contains(&(0x6F00_0002, 27313, 1, 30128)),
+            "begin-cast 0x0139: anim 0x6F000002, cmd 27313, target player, text 30128; got {begin_casts:?}",
+        );
+        assert!(
+            begin_casts
+                .iter()
+                .any(|(anim, cmd, ..)| *anim == 16781815 && *cmd == 27313),
+            "completion damage X01 must ride battleAnimation 16781815; got {begin_casts:?}",
+        );
+
+        // Damage landed on the target.
+        let player_hp = {
+            let handle = ticker.registry.get(1).await.unwrap();
+            let c = handle.character.read().await;
+            c.get_hp()
+        };
+        assert!(
+            player_hp < player_initial_hp,
+            "thunder completion must damage the target ({player_initial_hp} → {player_hp})",
+        );
+
+        // Recast: first cast at t=100 → next no earlier than 8100. Two
+        // chant-on packets across 8 s of ticks (t=100 and t=8100), never
+        // a third.
+        let chant_ons = substates.iter().filter(|b| **b == 0xF0).count();
+        assert_eq!(
+            chant_ons, 2,
+            "exactly two casts in 8 s (recast = cast 2 s + 6 s); got {substates:?}",
         );
     }
 

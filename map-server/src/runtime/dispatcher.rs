@@ -185,6 +185,46 @@ pub async fn dispatch_battle_event(
                 100,
             );
             broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
+            // Seed the hate container so `most_hated()` resolves to the target
+            // we just engaged. Without this, the very next combat tick sees
+            // `most_hated == None` and `should_deaggro` immediately disengages
+            // the mob (controller.rs::do_combat_tick) — the wolf would swing
+            // once and then drop out of combat. The auto-attack swing clock is
+            // driven by the AttackState pushed in `internal_engage`; this entry
+            // is what keeps the controller in its combat branch tick-to-tick.
+            if let Some(handle) = registry.get(*owner_actor_id).await {
+                let mut chara = handle.character.write().await;
+                chara.hate.update_hate(*target_actor_id, 1);
+            }
+            // pmeteor re-broadcasts the State trio per NPC at engage time
+            // (reference capture 15:54:31.414, one per combatant) — the
+            // mode-change action that arms the client's combat
+            // presentation for this actor. See `emit_change_state_trio`.
+            emit_change_state_trio(
+                *owner_actor_id,
+                crate::actor::MAIN_STATE_ACTIVE,
+                registry,
+                world,
+                zone,
+            )
+            .await;
+            // Hostile claim flip: `npcWork.hateType = 3` (ENGAGED_PARTY)
+            // turns on the overhead + target-HUD HP gauge and the
+            // claimed nameplate colour. pmeteor ships 3 unconditionally
+            // from spawn (BattleNpc.cs:160) and the judge tolerates the
+            // absent occupancy group as long as the solo-party 0x017C
+            // group is registered (it is, since the nameplate-crash fix).
+            // Allies/players skip — friendly nameplates stay passive.
+            let is_hostile_bnpc = matches!(
+                registry.get(*owner_actor_id).await.map(|h| h.kind),
+                Some(crate::runtime::actor_registry::ActorKindTag::BattleNpc)
+            );
+            if is_hostile_bnpc {
+                let sub = tx::actor::build_npc_hate_type_packet(*owner_actor_id, 3);
+                send_to_self_if_player(registry, world, *owner_actor_id, sub.to_bytes()).await;
+                broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
+                    .await;
+            }
         }
         BattleEvent::Disengage { owner_actor_id } => {
             tracing::debug!(owner = owner_actor_id, kind = ?event_tag(event), "battle event");
@@ -195,6 +235,26 @@ pub async fn dispatch_battle_event(
                 0,
             );
             broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
+            // State trio back to passive. The helper's corpse guard
+            // keeps a dead actor dead (the death path owns the DEAD
+            // trio; overwriting it would stand the corpse back up).
+            emit_change_state_trio(
+                *owner_actor_id,
+                crate::actor::MAIN_STATE_PASSIVE,
+                registry,
+                world,
+                zone,
+            )
+            .await;
+            // Claim release — hateType back to passive 1 (gauge off).
+            if matches!(
+                registry.get(*owner_actor_id).await.map(|h| h.kind),
+                Some(crate::runtime::actor_registry::ActorKindTag::BattleNpc)
+            ) {
+                let sub = tx::actor::build_npc_hate_type_packet(*owner_actor_id, 1);
+                broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
+                    .await;
+            }
             // 0x00DE ResetHead — stop the mob's head from continuing
             // to track the player's last position. Captured retail
             // pairs this with the gem clear at disengage. Project
@@ -202,6 +262,13 @@ pub async fn dispatch_battle_event(
             // ResetHead returns the mob to its neutral pose.
             let head = tx::actor::build_reset_head(*owner_actor_id);
             broadcast_around_actor(world, registry, zone, *owner_actor_id, head.to_bytes()).await;
+            // Drop all hate so `most_hated()` is None and the controller stays
+            // in its non-combat branch — otherwise residual hate would re-arm
+            // `do_combat_tick` on the next tick and the mob would re-engage.
+            if let Some(handle) = registry.get(*owner_actor_id).await {
+                let mut chara = handle.character.write().await;
+                chara.hate.clear_hate(None);
+            }
         }
         BattleEvent::Spawn { owner_actor_id }
         | BattleEvent::Despawn { owner_actor_id }
@@ -246,7 +313,8 @@ pub async fn dispatch_battle_event(
 
             let mut offset = 0;
             while offset < wire.len() {
-                let sub = if wire.len() - offset <= 16 {
+                // X10 carries 10 rows max post-S0.6 (pmeteor capacity).
+                let sub = if wire.len() - offset <= 10 {
                     tx::actor_battle::build_command_result_x10(
                         *owner_actor_id,
                         *battle_animation,
@@ -274,10 +342,43 @@ pub async fn dispatch_battle_event(
             let sub = tx::actor_battle::build_command_result_x00(*owner_actor_id, *animation, 0);
             broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
         }
-        BattleEvent::CastStart { owner_actor_id, .. }
-        | BattleEvent::CastComplete { owner_actor_id, .. }
+        BattleEvent::CastStart {
+            owner_actor_id,
+            target_actor_id,
+            command_id,
+            cast_time_ms: _,
+            cast_type,
+        } => {
+            // #28 S2.4 — pmeteor `MagicState.OnStart` (MagicState.cs:61-105):
+            // chant glow on (0x0144 chantId 0xF0) + the "You begin
+            // casting" line as a 0x0139 whose animation is
+            // `0x6F000000 | castType` (6F000002 = BLM/THM, 6F000003 =
+            // WHM, 6F000008 = BRD), text 30128, param 1. The anim value
+            // is self-consistent with the seed's castType but visually
+            // unverified — flagged for the live pass.
+            let chant = tx::actor::build_set_actor_sub_state(*owner_actor_id, 0, 0xF0, 0, 0, 0, 0);
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, chant.to_bytes()).await;
+            let row = tx::actor_battle::CommandResult {
+                target_id: *target_actor_id,
+                worldmaster_text_id: 30128,
+                param: 1,
+                hit_num: 1,
+                ..Default::default()
+            };
+            let begin = tx::actor_battle::build_command_result_x01(
+                *owner_actor_id,
+                0x6F00_0000 | *cast_type as u32,
+                *command_id,
+                &row,
+            );
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, begin.to_bytes()).await;
+        }
+        BattleEvent::CastComplete { owner_actor_id, .. }
         | BattleEvent::CastInterrupted { owner_actor_id, .. } => {
-            tracing::debug!(owner = owner_actor_id, "battle: cast-bar (TODO)");
+            // Chant glow off (pmeteor `MagicState.Cleanup`: chantId = 0).
+            // Completion damage rides the separate ResolveAction event.
+            let sub = tx::actor::build_set_actor_sub_state(*owner_actor_id, 0, 0, 0, 0, 0, 0);
+            broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes()).await;
         }
         BattleEvent::HateAdd {
             owner_actor_id,
@@ -468,18 +569,96 @@ async fn resolve_auto_attack(
         {
             d.add_hp(-(dr.amount as i32));
             d.hate.update_hate(attacker_actor_id, dr.enmity as i32);
+            // #28 S3.3 — defender TP on damage taken (pmeteor
+            // `Character.OnDamageTaken`, Character.cs:905-908):
+            // ceil(5 · e^(−0.0667 · level) · damage). The dead bank
+            // nothing (pmeteor `AddTP` IsAlive gate).
+            if d.is_alive() {
+                let gain = (5.0 * (-0.0667 * f64::from(def_level)).exp() * f64::from(dr.amount))
+                    .ceil() as i32;
+                d.add_tp(gain);
+            }
         }
     }
 
+    // #28 S3.3 — attacker TP per landed swing (pmeteor
+    // `Character.OnAttack`, Character.cs:886-895): delay-seconds × 100.
+    // StoreTp omitted — no lvl-1 sources. Misses bank nothing.
+    let landed = dmg_request.map_or(0, |dr| dr.amount);
+    let attacker_tp_after = if landed > 0 {
+        let mut a = attacker_handle.character.write().await;
+        let delay_ms = a.get_attack_delay_ms();
+        a.add_tp((f64::from(delay_ms) / 1000.0 * 100.0) as i32);
+        a.chara.tp
+    } else {
+        0
+    };
+    // Tutorial milestone signals (pmeteor parity): "playerAttack" fires
+    // at the end of every player swing (hit or miss — Player.OnAttack);
+    // "tpOver1000" whenever an accrual leaves the player at/above 1000
+    // (Character.AddTP). Both no-op without an active content script.
+    if attacker_handle.is_player() {
+        fire_content_signal(attacker_actor_id, "playerAttack", registry, world, lua, db).await;
+        if attacker_tp_after >= 1000 {
+            fire_content_signal(attacker_actor_id, "tpOver1000", registry, world, lua, db).await;
+        }
+    }
+    // Defender-side accrual can also cross the threshold (the player
+    // taking wolf hits banks TP too — pmeteor OnDamageTaken → AddTP).
+    if defender_handle.is_player() {
+        let tp = defender_handle.character.read().await.chara.tp;
+        if tp >= 1000 {
+            fire_content_signal(defender_actor_id, "tpOver1000", registry, world, lua, db).await;
+        }
+    }
+    // Combat-resolution log — before this line existed, the entire
+    // damage pipeline was wire-only (zero log vocabulary for swings /
+    // damage / TP), which is why the live SEQ_005 failures took a
+    // packet-capture diff to localise. One line per resolved swing.
+    {
+        let (def_hp, def_max) = {
+            let d = defender_handle.character.read().await;
+            (d.chara.hp, d.chara.max_hp)
+        };
+        tracing::debug!(
+            attacker = format!("0x{attacker_actor_id:08X}"),
+            defender = format!("0x{defender_actor_id:08X}"),
+            damage = landed,
+            defender_hp = format!("{def_hp}/{def_max}"),
+            attacker_tp = attacker_tp_after,
+            "battle: auto-attack resolved",
+        );
+    }
+
+    // Swing animation per attacker kind — pmeteor `AttackState.cs:141-146`:
+    // `(25 << 24 | 1 << 12)` for players, `(17 << 24 | 1 << 12)` for NPCs.
+    // Retail confirms the player value (combat_skills.pcapng record #3,
+    // anim 0x19001000); the NPC value is pmeteor-source INFERENCE flagged
+    // for the live A/B (#28 S0.6).
+    let battle_animation = if attacker_handle.is_player() {
+        0x1900_1000
+    } else {
+        0x1100_1000
+    };
     broadcast_results(
         attacker_actor_id,
-        0, // battle_animation — auto-attacks have no distinct animation id
+        battle_animation,
+        AUTO_ATTACK_COMMAND_ID,
         &container.main_results,
         registry,
         world,
         zone,
     )
     .await;
+
+    // #28 S3.3 — HP/TP wire sync: the defender's nameplate/roster HP bar
+    // and the attacker's TP gauge only move when a fresh
+    // `charaWork/stateAtQuicklyForAll` lands; without it the init
+    // bundle's values go stale on the first hit.
+    if landed > 0 {
+        broadcast_state_quickly(registry, world, zone, defender_actor_id).await;
+        broadcast_state_quickly(registry, world, zone, attacker_actor_id).await;
+    }
 
     die_if_defender_fell(
         defender_actor_id,
@@ -525,10 +704,15 @@ async fn resolve_action(
     // before calling `DoAction`. Until those bindings land, use the
     // command's `base_potency` directly; zero falls back to a conservative
     // placeholder so casts still produce a visible hit number.
+    // The old flat-100 placeholder one-shot the SEQ_005 tutorial wolves
+    // (100 HP fallback) on every Papalymo Thunder — each wolf died to a
+    // single cast ~8 s apart and the whole fight was over in 18 s. Scale
+    // the placeholder by attacker level so a lvl-1 tutorial caster lands
+    // ~20 while higher-level content still produces a visible number.
     result.amount = if command.base_potency > 0 {
         command.base_potency
     } else {
-        100
+        (15 + 5 * i32::from(atk_level.max(1))).min(9999) as u16
     };
     result.enmity = result.amount;
 
@@ -610,18 +794,135 @@ async fn resolve_action(
             d_write
                 .hate
                 .update_hate(attacker_actor_id, dr.enmity as i32);
+            // #28 S3.3 — defender TP on damage taken, same formula as
+            // the auto-attack arm (pmeteor `OnDamageTaken` runs for any
+            // landed damage, Character.cs:905-908).
+            if d_write.is_alive() {
+                let gain = (5.0 * (-0.0667 * f64::from(def_level)).exp() * f64::from(dr.amount))
+                    .ceil() as i32;
+                d_write.add_tp(gain);
+            }
         }
+    }
+
+    // #28 S3.3 — player completion bookkeeping: costs come off the
+    // pools, the used hotbar slot starts its recast (in-memory +
+    // persisted via the equip-ability upsert), and the
+    // `charaWork/commandDetailForSelf` pair reaches the owning client.
+    // pmeteor splits this across `DoBattleCommand` (DelMP/DelTP,
+    // Character.cs:1159-1160) and `Player.OnWeaponSkill/OnAbility/
+    // OnCast` (`UpdateHotbarTimer`, Player.cs:2901-2928).
+    let landed = dmg_request.map_or(0, |dr| dr.amount);
+    if attacker_handle.is_player() {
+        let now_unix = common::utils::unix_timestamp() as u32;
+        let recast_end = now_unix.saturating_add(command.max_recast_time_seconds);
+        let (class_id, slot0) = {
+            let mut a = attacker_handle.character.write().await;
+            if command.mp_cost != 0 {
+                a.add_mp(-i32::from(command.mp_cost));
+            }
+            if command.tp_cost != 0 {
+                a.add_tp(-i32::from(command.tp_cost));
+            }
+            // Abilities accrue TP like swings (pmeteor `OnAttack` gate:
+            // AutoAttack | Ability, non-miss); WS/spells gain none.
+            if command.command_type == CommandType::ABILITY && landed > 0 {
+                let delay_ms = a.get_attack_delay_ms();
+                a.add_tp((f64::from(delay_ms) / 1000.0 * 100.0) as i32);
+            }
+            let class_id = a.chara.class.max(0) as u8;
+            let slot0 = a
+                .chara
+                .hotbar
+                .iter_mut()
+                .find(|e| (e.command_id & 0xFFFF) as u16 == command.id)
+                .map(|e| {
+                    e.recast_time = recast_end;
+                    e.hotbar_slot
+                });
+            (class_id, slot0)
+        };
+        if let Some(slot0) = slot0 {
+            if let Some(db) = db
+                && let Err(e) = db
+                    .equip_ability(
+                        attacker_actor_id,
+                        class_id,
+                        slot0,
+                        u32::from(command.id),
+                        recast_end,
+                    )
+                    .await
+            {
+                tracing::warn!(
+                    player = attacker_actor_id,
+                    command = command.id,
+                    err = %e,
+                    "resolve_action: recast persist failed",
+                );
+            }
+            for sub in tx::actor::build_hotbar_recast_update(
+                attacker_actor_id,
+                slot0,
+                command.max_recast_time_seconds as u16,
+                recast_end,
+            ) {
+                // Self-only; the helper stamps the session id (proxy rule).
+                send_to_self_if_player(registry, world, attacker_actor_id, sub.to_bytes()).await;
+            }
+        }
+    }
+
+    // Combat-resolution log (companion to the auto-attack line).
+    {
+        let (def_hp, def_max) = {
+            let d = defender_handle.character.read().await;
+            (d.chara.hp, d.chara.max_hp)
+        };
+        tracing::debug!(
+            attacker = format!("0x{attacker_actor_id:08X}"),
+            defender = format!("0x{defender_actor_id:08X}"),
+            command = command.id,
+            amount = landed,
+            heal = is_heal,
+            defender_hp = format!("{def_hp}/{def_max}"),
+            "battle: action resolved",
+        );
+    }
+
+    // Tutorial milestone signal: "weaponskillUsed" fires when a player's
+    // weaponskill resolves (pmeteor `WeaponSkillState.OnComplete`).
+    if attacker_handle.is_player() && command.command_type == CommandType::WEAPON_SKILL {
+        fire_content_signal(
+            attacker_actor_id,
+            "weaponskillUsed",
+            registry,
+            world,
+            lua,
+            db,
+        )
+        .await;
     }
 
     broadcast_results(
         attacker_actor_id,
         command.battle_animation,
+        command.id, // raw catalog id — retail stamps it on every row
         &container.main_results,
         registry,
         world,
         zone,
     )
     .await;
+
+    // #28 S3.3 — HP/TP wire sync (see the auto-attack arm). The attacker
+    // re-sync is unconditional for players: costs drain even on a miss.
+    if landed > 0 || is_heal {
+        broadcast_state_quickly(registry, world, zone, defender_actor_id).await;
+    }
+    if attacker_handle.is_player() {
+        broadcast_state_quickly(registry, world, zone, attacker_actor_id).await;
+    }
 
     die_if_defender_fell(
         defender_actor_id,
@@ -635,9 +936,16 @@ async fn resolve_action(
     .await;
 }
 
+/// pmeteor `CommandResultX01PacketCommand.Attack` — the synthetic
+/// command id retail stamps on every auto-attack result row
+/// (`/Command/Game/AttackCommand`; byte-confirmed in
+/// `combat_skills.pcapng` record #3, cmd 0x5658).
+pub(crate) const AUTO_ATTACK_COMMAND_ID: u16 = 22104;
+
 async fn broadcast_results(
     source_actor_id: u32,
     battle_animation: u32,
+    command_id: u16,
     results: &[CommandResult],
     registry: &ActorRegistry,
     world: &WorldManager,
@@ -650,11 +958,24 @@ async fn broadcast_results(
         results.iter().map(battle_result_to_wire).collect();
     let mut offset = 0;
     while offset < wire.len() {
-        let sub = if wire.len() - offset <= 16 {
+        // pmeteor container choice: X01 for the single-row case (what
+        // retail ships per skill press / swing), X10 up to 10 rows,
+        // X18 beyond.
+        let remaining = wire.len() - offset;
+        let sub = if remaining == 1 {
+            let row = &wire[offset];
+            offset += 1;
+            tx::actor_battle::build_command_result_x01(
+                source_actor_id,
+                battle_animation,
+                command_id,
+                row,
+            )
+        } else if remaining <= 10 {
             tx::actor_battle::build_command_result_x10(
                 source_actor_id,
                 battle_animation,
-                0,
+                command_id,
                 &wire,
                 &mut offset,
             )
@@ -662,12 +983,50 @@ async fn broadcast_results(
             tx::actor_battle::build_command_result_x18(
                 source_actor_id,
                 battle_animation,
-                0,
+                command_id,
                 &wire,
                 &mut offset,
             )
         };
-        broadcast_around_actor(world, registry, zone, source_actor_id, sub.to_bytes()).await;
+        let bytes = sub.to_bytes();
+        // The acting player must SEE their own result —
+        // `broadcast_around_actor` excludes the source (same bug class
+        // as the draw trio, quest_apply.rs). The helper stamps the
+        // session id into the target_id (proxy drop rule). (#28 S0.6.)
+        send_to_self_if_player(registry, world, source_actor_id, bytes.clone()).await;
+        broadcast_around_actor(world, registry, zone, source_actor_id, bytes).await;
+    }
+}
+
+/// One `charaWork/stateAtQuicklyForAll` bundle for the actor's current
+/// pools — self-send (the player's own HP/MP/TP gauges) + in-zone
+/// broadcast (nameplate + content-roster HP bars). pmeteor drives the
+/// same wire from `Character.PostUpdate`'s `HpTpMp` update flag; the
+/// resolve fns call this after any pool change. (#28 S3.3.)
+async fn broadcast_state_quickly(
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    zone: &Arc<RwLock<Zone>>,
+    actor_id: u32,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let (hp, hp_max, mp, mp_max, tp) = {
+        let c = handle.character.read().await;
+        (
+            c.chara.hp.max(0) as u16,
+            c.chara.max_hp.max(0) as u16,
+            c.chara.mp.max(0) as u16,
+            c.chara.max_mp.max(0) as u16,
+            c.chara.tp,
+        )
+    };
+    for sub in tx::actor::build_chara_state_at_quickly_for_all(actor_id, hp, hp_max, mp, mp_max, tp)
+    {
+        let bytes = sub.to_bytes();
+        send_to_self_if_player(registry, world, actor_id, bytes.clone()).await;
+        broadcast_around_actor(world, registry, zone, actor_id, bytes).await;
     }
 }
 
@@ -1070,12 +1429,19 @@ pub async fn dispatch_area_event(
             target_actor_id,
             zone_wide,
         } => {
+            // Per-recipient target stamp — untargeted subpackets are
+            // dropped by the world-server proxy fan-out.
             let payload = tx::build_set_weather(*area_id, *weather_id, *transition_time).to_bytes();
             if let (Some(aid), false) = (target_actor_id, zone_wide) {
                 if let Some(handle) = registry.get(*aid).await
                     && let Some(client) = world.client(handle.session_id).await
                 {
-                    client.send_bytes(payload).await;
+                    let mut bytes = payload;
+                    common::subpacket::SubPacket::stamp_target_id_if_zero(
+                        &mut bytes,
+                        handle.session_id,
+                    );
+                    client.send_bytes(bytes).await;
                 }
             } else {
                 // Zone-wide — queue to every player in this zone.
@@ -1085,7 +1451,12 @@ pub async fn dispatch_area_event(
                         continue;
                     }
                     if let Some(client) = world.client(p.session_id).await {
-                        client.send_bytes(payload.clone()).await;
+                        let mut bytes = payload.clone();
+                        common::subpacket::SubPacket::stamp_target_id_if_zero(
+                            &mut bytes,
+                            p.session_id,
+                        );
+                        client.send_bytes(bytes).await;
                     }
                 }
             }
@@ -1377,6 +1748,92 @@ async fn apply_recalc_stats(
 /// is a BattleNpc and the attacker is a Player, fire the hook once per
 /// quest in the attacker's journal (Meteor's convention — scripts
 /// filter by `bnpc_class_id` themselves).
+/// Set an actor's main state and broadcast pmeteor's State-flag flush
+/// TRIO: `0x0134 SetActorState` + `0x013C CommandResultX00` (anim
+/// 0x72000062) + `0x0139 CommandResultX01` (anim 0x7C000062, command
+/// 21001 Activate, one self-hit). The 1.x client keys its per-actor
+/// combat presentation — draw/sheathe animation AND whether subsequent
+/// battle actions/HP/death states are *applied visually* — off this
+/// mode-change action, not the bare 0x0134. The live SEQ_005 run proved
+/// it: every damage/HP/death packet reached the client (ws2_32 trace)
+/// yet none rendered, and the one delta vs pmeteor's reference capture
+/// is that pmeteor re-broadcasts this trio per NPC at engage while
+/// garlemald shipped bare 0x0134s. Mirrors `quest_apply::
+/// apply_change_state` (the player F-press path, which fixed the
+/// identical invisible-draw bug in round 6). (Garlemald-Server #28.)
+pub(crate) async fn emit_change_state_trio(
+    actor_id: u32,
+    main_state: u16,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    zone: &Arc<RwLock<Zone>>,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    {
+        let mut c = handle.character.write().await;
+        // A corpse must stay a corpse: a stale Engage/Disengage event
+        // racing a death would otherwise stand the actor back up
+        // client-side. Revival transitions out of DEAD via
+        // `apply_revive`, which doesn't route through this helper.
+        if c.base.current_main_state == crate::actor::MAIN_STATE_DEAD
+            && main_state != crate::actor::MAIN_STATE_DEAD
+        {
+            return;
+        }
+        c.base.current_main_state = main_state;
+        c.chara.new_main_state = main_state;
+    }
+    // Pre-warp content NPCs: keep the stored-state mutation, suppress
+    // the wire broadcast — the client hasn't been sent those actors yet
+    // (their spawn fan-out is deferred to the zone-in bundle, which
+    // replays the stored state). Engages can't normally fire pre-warp
+    // (the content script's battleStarted latch needs an engaged
+    // player), so on those paths this is belt-and-braces parity with
+    // the Lua ChangeState path that has always enforced it.
+    for snap in world.all_sessions().await {
+        if let Some(active) = snap.active_content_script.as_ref()
+            && !active.warp_complete
+            && snap
+                .transient_director_members
+                .get(&active.director_actor_id)
+                .is_some_and(|roster| roster.contains(&actor_id))
+        {
+            tracing::debug!(
+                actor = format!("0x{actor_id:08X}"),
+                main_state,
+                "state trio stored; broadcast suppressed (pre-warp content roster)",
+            );
+            return;
+        }
+    }
+    let state_sub = tx::build_set_actor_state(actor_id, (main_state & 0xFF) as u8, 0);
+    let x00 = tx::actor_battle::build_command_result_x00(actor_id, 0x7200_0062, 0);
+    let x01 = tx::actor_battle::build_command_result_x01(
+        actor_id,
+        0x7C00_0062,
+        21001,
+        &tx::actor_battle::CommandResult {
+            target_id: actor_id,
+            hit_num: 1,
+            hit_effect: 1,
+            ..Default::default()
+        },
+    );
+    let mut bytes = state_sub.to_bytes();
+    bytes.extend(x00.to_bytes());
+    bytes.extend(x01.to_bytes());
+    send_to_self_if_player(registry, world, actor_id, bytes.clone()).await;
+    let recipients = broadcast_around_actor(world, registry, zone, actor_id, bytes).await;
+    tracing::debug!(
+        actor = format!("0x{actor_id:08X}"),
+        main_state,
+        recipients,
+        "state trio applied (0x134 + X00/X01)",
+    );
+}
+
 pub(crate) async fn die_if_defender_fell(
     defender_actor_id: u32,
     attacker_actor_id: Option<u32>,
@@ -1415,6 +1872,13 @@ pub(crate) async fn die_if_defender_fell(
     if !is_bnpc {
         return;
     }
+    // #28 S4.1 — the content-area kill gate fires from `apply_die`'s tail
+    // (which this function just called with the same lua/db pair), so it
+    // already covered this death — including ally killing blows, whose
+    // attacker the gates below reject. A second call here was a proven
+    // duplicate dispatch (today's live log fired the gate twice for the
+    // third wolf, the second a resumed=0 no-op) and would double-resume
+    // the director if the script ever re-parks on "battleComplete".
     let Some(attacker_id) = attacker_actor_id else {
         return;
     };
@@ -1457,6 +1921,131 @@ pub(crate) async fn die_if_defender_fell(
         world,
     )
     .await;
+}
+
+/// #28 S4.1 — the all-hostiles-dead gate for scripted content (the
+/// SEQ_005 combat tutorial). Scans sessions for the one whose active
+/// content roster (`transient_director_members[director]`) contains the
+/// dead actor, counts roster members that are still-live hostiles
+/// (`kind == BattleNpc` — Yda/Papalymo register as `Ally`, so only wolf
+/// deaths move the count; `apply_die` flips the dying wolf to DEAD
+/// before this runs, so it counts itself out), and on zero live fires
+/// `SendSignal("battleComplete")` through
+/// `quest_apply::apply_event_script_commands` with the owning player's
+/// handle — byte-for-byte the same routing as the working F-press
+/// `playerActive` resume, so the director's continuation (success
+/// widgets → processEvent020_1 → StartSequence(10) → ContentFinished →
+/// DoZoneChange) runs in the death-path call stack with full wire
+/// access. Firing the signal with nothing parked is a logged no-op, and
+/// the caller-side death-transition guards keep this single-fire per
+/// death; signal scoping per player is deferred (single-player server —
+/// `"battleComplete:" .. actorId` is the trivial multi-session upgrade).
+/// Fire a named scheduler signal through the event bridge for a player
+/// who owns an active content script — the tutorial-milestone twin of
+/// `check_content_battle_complete`'s battleComplete dispatch. pmeteor's
+/// emitters: `Player.OnAttack` → "playerAttack" (every swing),
+/// `Character.AddTP` → "tpOver1000" (every accrual past 1000),
+/// `WeaponSkillState.OnComplete` → "weaponskillUsed". Repeat fires with
+/// nothing parked are logged no-ops (waitForSignal de-registers), and
+/// the active-content gate keeps open-world combat off the scheduler.
+/// (Garlemald-Server #28, tutorial tooltip chain.)
+pub(crate) async fn fire_content_signal(
+    player_actor_id: u32,
+    signal: &str,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    lua: Option<&Arc<crate::lua::LuaEngine>>,
+    db: Option<&Arc<crate::database::Database>>,
+) {
+    let (Some(lua), Some(db)) = (lua, db) else {
+        return;
+    };
+    let Some(handle) = registry.get(player_actor_id).await else {
+        return;
+    };
+    if !handle.is_player() || handle.session_id == 0 {
+        return;
+    }
+    let Some(session) = world.session(handle.session_id).await else {
+        return;
+    };
+    if session.active_content_script.is_none() {
+        return;
+    }
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        vec![crate::lua::command::LuaCommand::SendSignal {
+            name: signal.into(),
+        }],
+        registry,
+        db,
+        world,
+        Some(lua),
+    )
+    .await;
+}
+
+pub(crate) async fn check_content_battle_complete(
+    dead_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    db: &Arc<crate::database::Database>,
+    lua: &Arc<crate::lua::LuaEngine>,
+) {
+    for session in world.all_sessions().await {
+        let Some(active) = session.active_content_script.as_ref() else {
+            continue;
+        };
+        let Some(roster) = session
+            .transient_director_members
+            .get(&active.director_actor_id)
+        else {
+            continue;
+        };
+        if !roster.contains(&dead_actor_id) {
+            continue;
+        }
+        let mut live = 0u32;
+        for &member_id in roster {
+            let Some(member) = registry.get(member_id).await else {
+                continue;
+            };
+            if !matches!(
+                member.kind,
+                crate::runtime::actor_registry::ActorKindTag::BattleNpc,
+            ) {
+                continue;
+            }
+            let c = member.character.read().await;
+            if c.base.current_main_state != crate::actor::MAIN_STATE_DEAD {
+                live += 1;
+            }
+        }
+        if live > 0 {
+            return;
+        }
+        let Some(player) = registry.by_session(session.id).await else {
+            return;
+        };
+        tracing::info!(
+            session = session.id,
+            dead = format!("0x{dead_actor_id:08X}"),
+            director = format!("0x{:08X}", active.director_actor_id),
+            "content battle complete — firing battleComplete through the event bridge",
+        );
+        crate::runtime::quest_apply::apply_event_script_commands(
+            &player,
+            vec![crate::lua::command::LuaCommand::SendSignal {
+                name: "battleComplete".into(),
+            }],
+            registry,
+            db,
+            world,
+            Some(lua),
+        )
+        .await;
+        return;
+    }
 }
 
 /// Award GC seals to `attacker_handle` for killing a mob of the given
@@ -1657,15 +2246,73 @@ pub(crate) async fn apply_die(
             crate::status::StatusEffectFlags::LOSE_ON_DEATH,
             &mut status_outbox,
         );
+        // Drop the dead actor's own hate so a respawned NPC starts fresh.
+        c.hate.clear_hate(None);
     }
-    let sub = tx::build_set_actor_state(owner_actor_id, crate::actor::MAIN_STATE_DEAD as u8, 0);
-    let bytes = sub.to_bytes();
-    send_to_self_if_player(registry, world, owner_actor_id, bytes.clone()).await;
-    broadcast_around_actor(world, registry, zone, owner_actor_id, bytes).await;
+
+    // Disengage every OTHER actor that was targeting (or hated) the now-dead
+    // actor. Without this, an attacker's `AttackState` keeps `Continue`-ing on
+    // the corpse — `ai_container.is_engaged()` stays true and `most_hated()`
+    // keeps pointing at the dead id, so `should_deaggro` never fires and the
+    // attacker is permanently combat-locked. For SEQ_005 this is load-bearing:
+    // the content `onUpdate` re-engages an ally onto the next wolf only
+    // `if not ally:IsEngaged()`, so a stale AttackState on the first dead wolf
+    // would stop the ally ever helping with wolves 2 and 3. Mobs locked onto a
+    // dead player would likewise never return to neutral. (Garlemald #28.)
+    let zone_id = handle.zone_id;
+    for other in registry.actors_in_zone(zone_id).await {
+        if other.actor_id == owner_actor_id {
+            continue;
+        }
+        let mut oc = other.character.write().await;
+        let targets_dead = oc
+            .ai_container
+            .current_state()
+            .map(|s| s.target_actor_id == owner_actor_id)
+            .unwrap_or(false);
+        // `clear_hate(Some(id))` is idempotent — a no-op when no entry exists.
+        oc.hate.clear_hate(Some(owner_actor_id));
+        if targets_dead {
+            // Clear the swing state so `is_engaged()` flips false; the next
+            // controller tick re-engages the next live `most_hated` (if any)
+            // via the retaliation branch, or goes idle.
+            oc.ai_container.clear_states();
+        }
+    }
+
+    // DEAD-state trio — pmeteor's `DeathState.OnStart` routes through
+    // `ChangeState(MAIN_STATE_DEAD)`, whose PostUpdate flush is the
+    // 0x0134 + X00/X01 mode-change trio. The bare 0x0134 this used to
+    // send flips the logical state but the client never *plays* the
+    // collapse — the live SEQ_005 run delivered all three wolf deaths
+    // to the client socket and the user still saw standing wolves.
+    // (`emit_change_state_trio` re-stamps current_main_state = DEAD;
+    // the write above already set it, so it's an idempotent set.)
+    emit_change_state_trio(
+        owner_actor_id,
+        crate::actor::MAIN_STATE_DEAD,
+        registry,
+        world,
+        zone,
+    )
+    .await;
     if let (Some(lua_ref), Some(db_ref)) = (lua, db) {
         for evt in status_outbox.drain() {
             dispatch_status_event(&evt, registry, world, db_ref, lua_ref.catalogs()).await;
         }
+    }
+
+    // #28 S4.1 — second gate call site: scripted deaths (`BattleEvent::
+    // Die`, GM `!die`) reach `apply_die` without transiting
+    // `die_if_defender_fell`, so the content kill gate fires here too —
+    // placement-independent. The already-DEAD guard above keeps this on
+    // the death transition only.
+    if matches!(
+        handle.kind,
+        crate::runtime::actor_registry::ActorKindTag::BattleNpc,
+    ) && let (Some(lua_ref), Some(db_ref)) = (lua, db)
+    {
+        check_content_battle_complete(owner_actor_id, registry, world, db_ref, lua_ref).await;
     }
 }
 
@@ -1810,6 +2457,11 @@ pub(crate) async fn send_to_self_if_player(
         return;
     }
     if let Some(client) = world.client(handle.session_id).await {
+        // Same proxy rule as `broadcast_around_actor`: untargeted
+        // subpackets are dropped by the world-server fan-out, so stamp
+        // the recipient's session id into any header still carrying 0.
+        let mut bytes = bytes;
+        common::subpacket::SubPacket::stamp_target_id_if_zero(&mut bytes, handle.session_id);
         client.send_bytes(bytes).await;
     }
 }
@@ -1904,6 +2556,147 @@ mod home_point_revive_tests {
         assert_eq!(session.destination_zone_id, 230);
         assert_eq!(session.destination_x, -407.0);
         assert_eq!(session.destination_spawn_type, 2);
+    }
+
+    /// Corpse-lock regression (#28): when an actor dies, every other actor
+    /// whose `AttackState` targets it must disengage and drop its hate toward
+    /// the dead id — otherwise an ally that kills the first wolf stays
+    /// `is_engaged()` on the corpse and the content `onUpdate` never re-engages
+    /// it onto the next wolf.
+    #[tokio::test]
+    async fn apply_die_disengages_actors_targeting_the_dead() {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        let zone_id = 100u32;
+        world.register_zone(make_zone(zone_id)).await;
+        let zone_arc = world.zone(zone_id).await.expect("zone registered");
+
+        // The wolf that is about to die.
+        let mut wolf = Character::new(2);
+        wolf.chara.max_hp = 100;
+        wolf.chara.hp = 1;
+        wolf.base.zone_id = zone_id;
+        registry
+            .insert(ActorHandle::new(
+                2,
+                ActorKindTag::BattleNpc,
+                zone_id,
+                0,
+                wolf,
+            ))
+            .await;
+
+        // An ally attacking the wolf: AttackState on id 2 + hate toward 2.
+        let mut ally = Character::new(3);
+        ally.base.zone_id = zone_id;
+        ally.ai_container.internal_engage(2, 0, 2000);
+        ally.hate.update_hate(2, 50);
+        let ally_handle = ActorHandle::new(3, ActorKindTag::Ally, zone_id, 0, ally);
+        registry.insert(ally_handle.clone()).await;
+
+        assert!(
+            ally_handle.character.read().await.ai_container.is_engaged(),
+            "pre-condition: ally engaged on the wolf",
+        );
+
+        apply_die(2, &registry, &world, &zone_arc, None, None).await;
+
+        let c = ally_handle.character.read().await;
+        assert!(
+            !c.ai_container.is_engaged(),
+            "ally must disengage from the dead wolf",
+        );
+        assert_eq!(
+            c.hate.most_hated(),
+            None,
+            "ally hate toward the dead wolf must be cleared",
+        );
+    }
+
+    /// NPC death must ship pmeteor's State trio (0x0134 DEAD + X00 +
+    /// X01 cmd-21001 mode-change action), not a bare 0x0134 — the live
+    /// SEQ_005 run delivered bare death states to the client and the
+    /// wolves never visibly fell (Garlemald #28).
+    #[tokio::test]
+    async fn apply_die_broadcasts_dead_state_trio() {
+        let world = Arc::new(WorldManager::new());
+        let registry = Arc::new(ActorRegistry::new());
+        let zone_id = 100u32;
+        world.register_zone(make_zone(zone_id)).await;
+        let zone_arc = world.zone(zone_id).await.expect("zone registered");
+
+        // Grid: dying wolf at origin + a player 5 yalms away.
+        {
+            let mut z = zone_arc.write().await;
+            let mut ob = crate::zone::outbox::AreaOutbox::new();
+            for (id, kind, x) in [
+                (2u32, crate::zone::area::ActorKind::BattleNpc, 0.0f32),
+                (9u32, crate::zone::area::ActorKind::Player, 5.0),
+            ] {
+                z.core.add_actor(
+                    crate::zone::area::StoredActor {
+                        actor_id: id,
+                        kind,
+                        position: common::Vector3::new(x, 0.0, 0.0),
+                        grid: (0, 0),
+                        is_alive: true,
+                    },
+                    &mut ob,
+                );
+            }
+        }
+
+        let mut wolf = Character::new(2);
+        wolf.chara.max_hp = 100;
+        wolf.chara.hp = 0;
+        wolf.base.zone_id = zone_id;
+        registry
+            .insert(ActorHandle::new(
+                2,
+                ActorKindTag::BattleNpc,
+                zone_id,
+                0,
+                wolf,
+            ))
+            .await;
+        registry
+            .insert(ActorHandle::new(
+                9,
+                ActorKindTag::Player,
+                zone_id,
+                /* session */ 77,
+                Character::new(9),
+            ))
+            .await;
+        let (tx_ch, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        world
+            .register_client(77, crate::data::ClientHandle::new(77, tx_ch))
+            .await;
+
+        apply_die(2, &registry, &world, &zone_arc, None, None).await;
+
+        let bytes = rx.try_recv().expect("death trio broadcast to the player");
+        // Walk the concatenated subpackets: opcode lives at +0x12 of
+        // each subpacket (u16 size header first).
+        let mut opcodes = Vec::new();
+        let mut off = 0usize;
+        while off + 0x14 <= bytes.len() {
+            let size = u16::from_le_bytes([bytes[off], bytes[off + 1]]) as usize;
+            let opcode = u16::from_le_bytes([bytes[off + 0x12], bytes[off + 0x13]]);
+            opcodes.push(opcode);
+            off += size.max(0x14);
+        }
+        assert_eq!(
+            opcodes,
+            vec![
+                crate::packets::opcodes::OP_SET_ACTOR_STATE,
+                crate::packets::opcodes::OP_COMMAND_RESULT_X00,
+                crate::packets::opcodes::OP_COMMAND_RESULT_X01,
+            ],
+            "death must ship the 0x0134 + 0x013C + 0x0139 trio in order",
+        );
+        // The 0x0134 body's first byte is the main_state — DEAD = 1.
+        assert_eq!(bytes[0x20], crate::actor::MAIN_STATE_DEAD as u8);
     }
 
     /// Player with `homepoint == 0` (never attuned to an aetheryte)

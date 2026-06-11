@@ -549,6 +549,89 @@ pub struct BattleCommand {
     pub world_master_text_id: u16,
 }
 
+impl BattleCommand {
+    /// Convert the gamedata row into the battle engine's `BattleCommand`
+    /// (#28 S2.4 — `internal_cast` and friends take the battle-side
+    /// type). Field names line up ~1:1; the numeric enum columns map
+    /// straight onto the battle-side wrappers (commandType 4 →
+    /// `CommandType::SPELL`, actionType 2 → `ActionType::Magic`,
+    /// actionProperty 9 → `Lightning`). Fields the gamedata table
+    /// doesn't carry (status tier/magnitude, enmity modifier, crit
+    /// bonus, combo runtime flags) keep the battle-side defaults.
+    pub fn to_battle_command(&self) -> crate::battle::command::BattleCommand {
+        use crate::battle::command as bc;
+        use crate::battle::target_find as tf;
+
+        let mut out = bc::BattleCommand::new(self.id, self.name.clone());
+        out.job = self.job;
+        out.level = self.level;
+        out.requirements = bc::BattleCommandRequirements(self.requirements);
+        out.main_target = tf::ValidTarget(self.main_target);
+        out.valid_target = tf::ValidTarget(self.valid_target);
+        out.aoe_type = match self.aoe_type {
+            1 => tf::TargetFindAOEType::Circle,
+            2 => tf::TargetFindAOEType::Cone,
+            3 => tf::TargetFindAOEType::Box,
+            _ => tf::TargetFindAOEType::None,
+        };
+        out.aoe_target = match self.aoe_target {
+            1 => tf::TargetFindAOETarget::Self_,
+            _ => tf::TargetFindAOETarget::Target,
+        };
+        out.num_hits = self.num_hits;
+        out.position_bonus = match self.position_bonus {
+            0x01 => bc::BattleCommandPositionBonus::Front,
+            0x02 => bc::BattleCommandPositionBonus::Rear,
+            0x04 => bc::BattleCommandPositionBonus::Flank,
+            _ => bc::BattleCommandPositionBonus::None,
+        };
+        out.proc_requirement = match self.proc_requirement {
+            1 => bc::BattleCommandProcRequirement::Miss,
+            2 => bc::BattleCommandProcRequirement::Evade,
+            3 => bc::BattleCommandProcRequirement::Parry,
+            4 => bc::BattleCommandProcRequirement::Block,
+            _ => bc::BattleCommandProcRequirement::None,
+        };
+        out.range = self.range;
+        out.min_range = self.min_range;
+        out.aoe_range = self.aoe_range;
+        out.aoe_min_range = self.aoe_min_range;
+        out.aoe_cone_angle = self.aoe_cone_angle;
+        out.aoe_rotate_angle = self.aoe_rotate_angle;
+        out.range_height = self.range_height as f32;
+        out.range_width = self.range_width as f32;
+        out.status_id = self.status_id;
+        out.status_duration = self.status_duration;
+        out.status_chance = self.status_chance;
+        out.cast_type = self.cast_type;
+        out.cast_time_ms = self.cast_time_ms;
+        out.recast_time_ms = self.recast_time_ms;
+        out.max_recast_time_seconds = self.max_recast_time_seconds;
+        out.mp_cost = self.mp_cost;
+        out.tp_cost = self.tp_cost;
+        out.animation_type = self.animation_type;
+        out.effect_animation = self.effect_animation;
+        out.model_animation = self.model_animation;
+        out.animation_duration_seconds = self.animation_duration_seconds;
+        out.battle_animation = self.battle_animation;
+        out.world_master_text_id = self.world_master_text_id;
+        out.combo_next_command_id = self.combo_next_command_id;
+        out.combo_step = self.combo_step;
+        out.command_type = bc::CommandType(self.command_type as u16);
+        out.action_property =
+            crate::battle::effects::ActionProperty::from_u16(self.action_property as u16);
+        out.action_type = crate::battle::effects::ActionType::from_u16(self.action_type as u16);
+        out.base_potency = self.base_potency;
+        out.accuracy_modifier = self.accuracy_modifier;
+        out.valid_user = match self.valid_user {
+            1 => bc::BattleCommandValidUser::Player,
+            2 => bc::BattleCommandValidUser::Monster,
+            _ => bc::BattleCommandValidUser::All,
+        };
+        out
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BattleTrait {
     pub id: u16,

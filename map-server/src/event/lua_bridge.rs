@@ -99,7 +99,11 @@ pub fn translate_lua_commands_into_outbox(
             // `session.pending_kick_event` for emission either at the
             // end of the next zone-in bundle (OpeningDirector path) OR
             // pre-warp by `apply_do_zone_change_content` (SEQ_005
-            // content-director path).
+            // content-director path). Runtime/event-bridge drains hit
+            // `apply_runtime_lua_command`'s KickEvent arm instead
+            // (immediate send — the mid-flow `kickEventContinue`
+            // shape, #28 S1.1); both homes rely on this exclusion to
+            // stay single-emission.
             //
             // Translating KickEvent here AS WELL produced a duplicate
             // wire emission per quest-hook-driven kick: one fires
@@ -120,7 +124,7 @@ pub fn translate_lua_commands_into_outbox(
     }
 }
 
-fn arg_to_lua_param(arg: &LuaCommandArg) -> LuaParam {
+pub(crate) fn arg_to_lua_param(arg: &LuaCommandArg) -> LuaParam {
     match arg {
         LuaCommandArg::Int(i) => LuaParam::Int32(*i as i32),
         LuaCommandArg::UInt(u) => LuaParam::UInt32(*u as u32),
@@ -151,6 +155,46 @@ mod tests {
             current_event_name: "quest_man0l0".to_string(),
             current_event_type: 2,
         }
+    }
+
+    #[test]
+    fn send_data_packet_args_map_to_lua_params() {
+        // SendDataPacket(9) == startTutorialMode → a single Int32(9) LuaParam.
+        // This is the param that arms the client's active-mode (F) toggle in
+        // SEQ_005; it must encode as Int32, not be dropped. (Garlemald #28.)
+        let p = arg_to_lua_param(&LuaCommandArg::Int(9));
+        assert!(matches!(p, common::luaparam::LuaParam::Int32(9)));
+
+        // The full body for SendDataPacket(9): tag 0x00 + i32 BE 0x00000009 +
+        // LUA_END 0x0F. Mirrors the pmeteor GenericDataPacket(9) wire bytes.
+        let sub = crate::packets::send::player::build_generic_data(
+            1,
+            &[common::luaparam::LuaParam::Int32(9)],
+        );
+        assert_eq!(&sub.data[..6], &[0x00, 0x00, 0x00, 0x00, 0x09, 0x0F]);
+
+        // The richer "attention" shape must marshal every slot (the generic
+        // collector must not drop the Actor-userdata or trailing ints).
+        let params: Vec<_> = [
+            LuaCommandArg::String("attention".to_string()),
+            LuaCommandArg::ActorId(0x4000_0001),
+            LuaCommandArg::String(String::new()),
+            LuaCommandArg::Int(51073),
+            LuaCommandArg::Int(2),
+        ]
+        .iter()
+        .map(arg_to_lua_param)
+        .collect();
+        assert_eq!(params.len(), 5);
+        assert!(matches!(params[0], common::luaparam::LuaParam::String(_)));
+        assert!(matches!(
+            params[1],
+            common::luaparam::LuaParam::Actor(0x4000_0001)
+        ));
+        assert!(matches!(
+            params[3],
+            common::luaparam::LuaParam::Int32(51073)
+        ));
     }
 
     #[test]

@@ -43,9 +43,16 @@ use common::Vector3;
 
 pub const INVALID_ACTORID: u32 = 0xC0000000;
 
+// 1.x wire values (pmeteor `SetActorStatePacket.cs`): PASSIVE=0, DEAD=1,
+// ACTIVE=2. These were previously swapped (ACTIVE=1/DEAD=2), which made
+// `ChangeState(2)` (intended ACTIVE — e.g. content allies standing into combat
+// stance in `SimpleContent30010.lua`) read internally as DEAD, gating the
+// freshly-spawned tutorial allies as dead, and also broadcast the wrong wire
+// byte (2 = client-ACTIVE) for genuinely dead actors. All Rust callers use the
+// symbolic names, so they re-bind consistently. (Garlemald-Server #28.)
 pub const MAIN_STATE_PASSIVE: u16 = 0x00;
-pub const MAIN_STATE_ACTIVE: u16 = 0x01;
-pub const MAIN_STATE_DEAD: u16 = 0x02;
+pub const MAIN_STATE_DEAD: u16 = 0x01;
+pub const MAIN_STATE_ACTIVE: u16 = 0x02;
 /// Retail 1.x mounted state — client flips its own animation and
 /// speed rigs on seeing this. `PopulaceChocoboLender.lua` sets it via
 /// `player:ChangeState(15)`.
@@ -188,6 +195,11 @@ pub struct CharaState {
     /// time, the ticker's NPC respawn pass reads it to decide when
     /// to bring a BattleNpc back. Cleared by `apply_revive`.
     pub time_of_death_utc: u32,
+    /// Opt-out of the ticker's default BNpc respawn pass. Set at spawn
+    /// for content-area NPCs (SEQ_005 tutorial roster): they are
+    /// one-shots, and a wolf respawning at full HP mid-tutorial would
+    /// keep the all-wolves-dead gate from ever firing. (#28 S0.5.)
+    pub respawn_disabled: bool,
     // Mount / chocobo state — the runtime-mutable slice of
     // `PlayerState.has_chocobo` / `chocobo_appearance` /
     // `chocobo_name` / `mount_state` / `rental_expire_time` /
@@ -316,6 +328,7 @@ impl Default for CharaState {
             rest_bonus_exp_rate: 0,
             last_rest_accrual_utc: 0,
             time_of_death_utc: 0,
+            respawn_disabled: false,
             has_chocobo: false,
             mount_state: 0,
             chocobo_appearance: 0,

@@ -347,7 +347,49 @@ async fn dispatch_npc_event_started(
     lua_params: &[LuaParam],
 ) {
     let Some(owner_handle) = registry.get(owner_actor_id).await else {
-        tracing::debug!(owner = owner_actor_id, "event: owner actor missing");
+        // The owner despawned (or never existed). The client just opened
+        // an event against it and is now MODAL — until an EndEvent
+        // arrives it pins its authoritative position and refuses every
+        // further interaction. Live SEQ_005 proof: the post-tutorial warp
+        // despawned the openingstoper 357 ms before the client's box-leave
+        // 'caution'/'exit' EventStarts arrived; with no reply the entire
+        // Gridania phase was dead — 1,672 byte-identical position packets,
+        // zero talk/push EventStarts for five minutes. Answer with an
+        // immediate EndEvent so the client unlocks. Real owners never take
+        // this path (their dispatch blocks answer normally). (#28.)
+        // Static client-side actors (high nibble 0xA — command actors,
+        // quest actors) are answered by their dedicated dispatch paths;
+        // replying here would double the EndEvent per press. Type 127
+        // is the client's Lua-ERROR report tunnel (owner is a pseudo-id
+        // like 4) — an error report is not an open event, so replying
+        // would be noise. Only world-spawned actors (a despawned NPC)
+        // take the release path.
+        if owner_actor_id >> 28 == 0xA || owner_actor_id == 0 || event_type == 127 {
+            tracing::debug!(
+                owner = owner_actor_id,
+                ty = event_type,
+                "event: owner actor missing",
+            );
+            return;
+        }
+        tracing::debug!(
+            owner = owner_actor_id,
+            event = event_name,
+            "event: owner actor missing — releasing client with EndEvent",
+        );
+        if let Some(player_handle) = registry.get(player_actor_id).await
+            && player_handle.session_id != 0
+            && let Some(client) = world.client(player_handle.session_id).await
+        {
+            let mut sub = crate::packets::send::events::build_end_event(
+                player_actor_id,
+                owner_actor_id,
+                event_name,
+                event_type,
+            );
+            sub.set_target_id(player_handle.session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
         return;
     };
     let (class_path, class_name, unique_id, npc_state, npc_pos, npc_rot, actor_class_id) = {
@@ -734,54 +776,61 @@ async fn dispatch_director_event_started(
     // on `_WAIT_EVENT` and the scheduler parks it until the client's
     // `EventUpdate` packet wakes it through `fire_player_event`.
     let result = tokio::task::spawn_blocking(move || {
-        lua_clone.spawn_director_on_event_started(&script_path_clone, |lua_vm, queue| {
-            let player = crate::lua::userdata::LuaPlayer {
-                snapshot,
-                queue: queue.clone(),
-            };
-            let player_ud = lua_vm
-                .create_userdata(player)
-                .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
-            let director = crate::lua::userdata::LuaDirectorHandle {
-                name: actor_name_owned,
-                actor_id: director_actor_id,
-                class_path: class_path_owned,
-                queue: queue.clone(),
-            };
-            let director_ud = lua_vm
-                .create_userdata(director)
-                .map_err(|e| anyhow::anyhow!("create_userdata(LuaDirectorHandle): {e}"))?;
-
-            let mut mv = MultiValue::new();
-            mv.push_back(Value::UserData(player_ud));
-            mv.push_back(Value::UserData(director_ud));
-            mv.push_back(Value::String(
-                lua_vm
-                    .create_string(&event_name_owned)
-                    .map_err(|e| anyhow::anyhow!("create_string(eventName): {e}"))?,
-            ));
-            for p in &lua_params_owned {
-                let v = match p {
-                    LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
-                    LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
-                    LuaParam::String(s) => Value::String(
-                        lua_vm
-                            .create_string(s)
-                            .map_err(|e| anyhow::anyhow!("create_string(lparam): {e}"))?,
-                    ),
-                    LuaParam::True => Value::Boolean(true),
-                    LuaParam::False => Value::Boolean(false),
-                    LuaParam::Nil => Value::Nil,
-                    LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
-                    LuaParam::Type7 { actor_id, .. } => Value::Integer(*actor_id as mlua::Integer),
-                    LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
-                    LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
-                    LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
+        let owner_player_id = snapshot.actor_id;
+        lua_clone.spawn_director_on_event_started(
+            &script_path_clone,
+            owner_player_id,
+            |lua_vm, queue| {
+                let player = crate::lua::userdata::LuaPlayer {
+                    snapshot,
+                    queue: queue.clone(),
                 };
-                mv.push_back(v);
-            }
-            Ok(mv)
-        })
+                let player_ud = lua_vm
+                    .create_userdata(player)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaPlayer): {e}"))?;
+                let director = crate::lua::userdata::LuaDirectorHandle {
+                    name: actor_name_owned,
+                    actor_id: director_actor_id,
+                    class_path: class_path_owned,
+                    queue: queue.clone(),
+                };
+                let director_ud = lua_vm
+                    .create_userdata(director)
+                    .map_err(|e| anyhow::anyhow!("create_userdata(LuaDirectorHandle): {e}"))?;
+
+                let mut mv = MultiValue::new();
+                mv.push_back(Value::UserData(player_ud));
+                mv.push_back(Value::UserData(director_ud));
+                mv.push_back(Value::String(
+                    lua_vm
+                        .create_string(&event_name_owned)
+                        .map_err(|e| anyhow::anyhow!("create_string(eventName): {e}"))?,
+                ));
+                for p in &lua_params_owned {
+                    let v = match p {
+                        LuaParam::Int32(i) => Value::Integer(*i as mlua::Integer),
+                        LuaParam::UInt32(u) => Value::Integer(*u as mlua::Integer),
+                        LuaParam::String(s) => Value::String(
+                            lua_vm
+                                .create_string(s)
+                                .map_err(|e| anyhow::anyhow!("create_string(lparam): {e}"))?,
+                        ),
+                        LuaParam::True => Value::Boolean(true),
+                        LuaParam::False => Value::Boolean(false),
+                        LuaParam::Nil => Value::Nil,
+                        LuaParam::Actor(id) => Value::Integer(*id as mlua::Integer),
+                        LuaParam::Type7 { actor_id, .. } => {
+                            Value::Integer(*actor_id as mlua::Integer)
+                        }
+                        LuaParam::Type9 { item1, .. } => Value::Integer(*item1 as mlua::Integer),
+                        LuaParam::Byte(b) => Value::Integer(*b as mlua::Integer),
+                        LuaParam::Short(s) => Value::Integer(*s as mlua::Integer),
+                    };
+                    mv.push_back(v);
+                }
+                Ok(mv)
+            },
+        )
     })
     .await;
 

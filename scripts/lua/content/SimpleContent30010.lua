@@ -1,5 +1,9 @@
 require ("global")
 require ("modifiers")
+-- onUpdate calls allyGlobal.EngageTarget; without this require the
+-- global is nil and every onUpdate tick errored right after the
+-- speed SetMod (errors swallowed by the ticker drain). (#28 S0.4)
+require ("ally")
 
 function onCreate(starterPlayer, contentArea, director)
 	--papalymo = contentArea:SpawnActor(2290005, "papalymo", 365.89, 4.0943, -706.72, -0.718);
@@ -22,17 +26,24 @@ function onCreate(starterPlayer, contentArea, director)
     mob1:ChangeState(2);
     mob2:ChangeState(2);
     mob3:ChangeState(2);
-	-- Pmeteor's SimpleContent30010.lua does NOT add NPCs to the player's
-	-- party (only to the content director group via director:AddMember
-	-- below). Garlemald's variant previously called
-	-- `starterPlayer.currentParty:AddMember(papalymo.actorId)` +
-	-- `starterPlayer.currentParty:AddMember(yda.actorId)`, which fired
-	-- TWO extra OUT 0x017F GroupHeader/Begin/X08/End party trios pre-
-	-- kick (visible in the seq005-no-prewarp-spawns capture at lines
-	-- 6905..6953 + 6959..7007). Pmeteor's wire trace shows ZERO 0x017F
-	-- broadcasts in the SEQ_005 warp window — only the single 0x0183
-	-- content trio.
+	-- Party-add the allies (MeteorReborn SimpleContent30010.lua:17-18)
+	-- so the HUD roster renders Yda/Papalymo HP bars — the 1.x party
+	-- list reads the real party group (10001), and the content-group
+	-- 30006 roster alone never lit the bars in any live run (#28 issue:
+	-- "Yda and Papalymo's health should show in my Roster"). The
+	-- quest_system_mac variant omits these lines, but its tutorial also
+	-- never shows ally bars; MeteorReborn (Decimus's rescript) is the
+	-- canonical reference. ContentFinished clears the transient party
+	-- roster at teardown, so the party is solo again entering Gridania.
+	starterPlayer.currentParty:AddMember(papalymo.actorId);
+	starterPlayer.currentParty:AddMember(yda.actorId);
 	starterPlayer:SetMod(modifiersGlobal.MinimumHpLock, 1);
+	-- Allies are unkillable for the tutorial too (Modifier::MinimumHpLock
+	-- floor-1 clamp, actor/chara.rs): a dead Yda/Papalymo would otherwise
+	-- ride the default BNpc respawn weirdness mid-fight. The player's lock
+	-- above is cleared at teardown (ContentFinished).
+	yda:SetMod(modifiersGlobal.MinimumHpLock, 1);
+	papalymo:SetMod(modifiersGlobal.MinimumHpLock, 1);
 	
 	
 	openingStoper = contentArea:SpawnActor(1090384, "openingstoper", 356.09, 3.74, -701.62, -1.41);
@@ -53,43 +64,58 @@ function onDestroy()
 
 end
 
+-- #28 S2.5 — everyone fights once the player commits. Per-script VM
+-- global: persists across onUpdate calls (each content area gets its
+-- own VM, so the latch is naturally per-instance).
+battleStarted = false;
+
 function onUpdate(tick, area)
-	if area then
-		local players = area:GetPlayers()
-		local mobs = area:GetMonsters()
-		local allies = area:GetAllies()
-		local resumeChecks = true
-		for player in players do
-			if player then
-				local exitLoop = false
-				
-				if allies then
-					for i = 0, #allies - 1 do
-						if allies[i] then							
-							if not allies[i]:IsEngaged() then
-								if player:IsEngaged() and player.target then
-									
-									allies[i].neutral = false
-									allies[i].isAutoAttackEnabled = true
-									allies[i]:SetMod(modifiersGlobal.Speed, 8)
-									allyGlobal.EngageTarget(allies[i], player.target)
-									exitLoop = true
-									break
-								-- todo: support scripted paths
-								elseif allies[i]:GetSpeed() > 0 then									
-								end
-							end
-						end
-					end
-				end
-				if exitLoop then
-					resumeChecks = false
-					break
-				end
-			end
+	if not area then return end
+	local players = area:GetPlayers()
+	local mobs    = area:GetMonsters()   -- live-only (dead filtered by S0.5)
+	local allies  = area:GetAllies()
+
+	local engagedPlayer = nil
+	for player in players do
+		if player and player:IsEngaged() and player.target then
+			engagedPlayer = player
+			break
 		end
-		if not resumeChecks then
-			return
+	end
+	if not battleStarted then
+		-- Nothing moves until the player attacks. Latching on the
+		-- player's engagement (not the F press) keeps the wolves alive
+		-- and targetable through processTtrBtl002's targeting tutorial
+		-- (plan R8 — allies killing wolves early could soft-lock
+		-- _waitForTargetTutorial client-side).
+		if not engagedPlayer then return end
+		battleStarted = true
+	end
+
+	-- The roster tables are 1-indexed (GetAllies/GetMonsters populate
+	-- Lua-standard arrays); iterate 1..#t, not the legacy 0-based form.
+
+	-- Allies: spread across live wolves; re-engage as wolves die (the
+	-- corpse-disengage sweep clears their state, S0.5 drops the corpse
+	-- from `mobs`).
+	local mi = 0
+	for i = 1, #allies do
+		local ally = allies[i]
+		if ally and not ally:IsEngaged() and #mobs > 0 then
+			local target = mobs[(mi % #mobs) + 1]
+			mi = mi + 1
+			ally:SetMod(modifiersGlobal.MovementSpeed, 8)
+			allyGlobal.EngageTarget(ally, target)   -- Engage + AddBaseHate (ally.lua)
+		end
+	end
+	-- Wolves: proactive once battle starts (retaliation hate already
+	-- covers the struck wolf; this brings the bystanders in).
+	for i = 1, #mobs do
+		local mob = mobs[i]
+		if mob and not mob:IsEngaged() then
+			local foe = (i % 2 == 0 and #allies > 0) and allies[1]
+						or (engagedPlayer or (#allies > 0 and allies[1]))
+			if foe then allyGlobal.EngageTarget(mob, foe) end
 		end
 	end
 end

@@ -117,7 +117,13 @@ impl Character {
     }
 
     pub fn add_tp(&mut self, delta: i32) {
-        let new_tp = (self.chara.tp as i32 + delta).clamp(0, MAX_TP as i32);
+        // `MinimumTpLock` floors the pool (pmeteor `Character.AddTP`:
+        // `addTp.Clamp((int)GetMod(Modifier.MinimumTpLock), 3000)`).
+        // The SEQ_005 tutorial sets it to 1000 between the TP tooltip
+        // and the weaponskill firing so the player can't dribble back
+        // below the WS cost mid-lesson.
+        let floor = (self.chara.mods.get(Modifier::MinimumTpLock) as i32).clamp(0, MAX_TP as i32);
+        let new_tp = (self.chara.tp as i32 + delta).clamp(floor, MAX_TP as i32);
         self.chara.tp = new_tp as u16;
     }
 
@@ -436,7 +442,16 @@ impl Character {
 
         if let Some(w) = main {
             // Main-hand scoped: replace the previous weapon's values.
-            self.chara.mods.set(Modifier::Delay, w.delay_ms as f64);
+            // `Modifier::Delay` is stored in SECONDS — `get_attack_delay_ms`
+            // multiplies by 1000, and the BNpc pool path stores seconds
+            // (battle_npc.rs `apply_spawn_metadata`). Storing the item's
+            // raw `delay_ms` here armed every player swing clock ~2.8
+            // MILLION ms out, so an engaged player never swung, never
+            // dealt damage, and never accrued TP — the SEQ_005 tutorial's
+            // "weaponskill stays grey" live failure. (Garlemald #28.)
+            self.chara
+                .mods
+                .set(Modifier::Delay, f64::from(w.delay_ms) / 1000.0);
             self.chara
                 .mods
                 .set(Modifier::AttackType, w.attack_type as f64);
@@ -641,9 +656,15 @@ impl Character {
         matches!(self.chara.class as u8, 39..=41)
     }
 
-    /// True if this actor is still engaged in combat (main-state bit set).
+    /// True if this actor is actively engaged in combat — i.e. it has a live
+    /// `AttackState`. Delegates to `AIContainer::is_engaged()` to match pmeteor
+    /// (`Character.IsEngaged()` → `aiContainer.IsEngaged()`). The previous
+    /// `current_target != INVALID_ACTORID` test was structurally always-true
+    /// for any actor that never receives a `current_target` (the field defaults
+    /// to `0`, and `INVALID_ACTORID == 0xC0000000`), which made every NPC read
+    /// as "engaged" and broke the content-tutorial engagement gate. (#28.)
     pub fn is_engaged(&self) -> bool {
-        self.chara.current_target != crate::actor::INVALID_ACTORID
+        self.ai_container.is_engaged()
     }
 
     /// Generic is-valid-target helper mirroring the ValidTarget bitmask in
@@ -1015,8 +1036,10 @@ mod recalc_tests {
         let mut c = Character::new(1);
         c.apply_player_weapon_stats(&items, &equipped);
 
-        // Mainhand-scoped sets come from item 100.
-        assert_eq!(c.chara.mods.get(Modifier::Delay), 2800.0);
+        // Mainhand-scoped sets come from item 100. Delay lands in
+        // seconds (2800 ms → 2.8) so `get_attack_delay_ms` round-trips.
+        assert_eq!(c.chara.mods.get(Modifier::Delay), 2.8);
+        assert_eq!(c.get_attack_delay_ms(), 2800);
         assert_eq!(c.chara.mods.get(Modifier::AttackType), 2.0);
         assert_eq!(c.chara.mods.get(Modifier::HitCount), 1.0);
         // Flat Attack/Parry stack across both hands: 5+2=7 and 3+1=4.

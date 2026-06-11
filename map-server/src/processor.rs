@@ -426,7 +426,13 @@ impl PacketProcessor {
                 tracing::error!(error = %e, actor = actor_id, "zone change failed");
             } else {
                 self.world
-                    .send_zone_in_bundle(&self.registry, &self.db, session_id, 0x1)
+                    .send_zone_in_bundle(
+                        &self.registry,
+                        &self.db,
+                        self.lua.as_ref().map(|l| l.catalogs()),
+                        session_id,
+                        0x1,
+                    )
                     .await;
             }
         }
@@ -591,7 +597,13 @@ impl PacketProcessor {
             tracing::error!(error = %e, actor = actor_id, "login zone change failed");
         } else {
             self.world
-                .send_zone_in_bundle(&self.registry, &self.db, session_id, 0x1)
+                .send_zone_in_bundle(
+                    &self.registry,
+                    &self.db,
+                    self.lua.as_ref().map(|l| l.catalogs()),
+                    session_id,
+                    0x1,
+                )
                 .await;
         }
 
@@ -1697,11 +1709,14 @@ impl PacketProcessor {
                 parent_zone_id,
                 area_name,
             } => {
-                tracing::info!(
-                    parent_zone = parent_zone_id,
-                    area = %area_name,
-                    "ContentFinished applied (stub: cleanup not yet wired)",
-                );
+                crate::runtime::quest_apply::apply_content_finished(
+                    parent_zone_id,
+                    &area_name,
+                    &self.registry,
+                    &self.world,
+                    self.lua.as_ref(),
+                )
+                .await;
             }
             // Event-flavoured commands (`RunEventFunction`, `EndEvent`)
             // emitted via the login-scoped pipeline get bridged through
@@ -1759,6 +1774,25 @@ impl PacketProcessor {
                     cmd = ?cmd,
                     "login lua cmd routed via EventOutbox bridge",
                 );
+            }
+            // Equip starting gear at login. `player.lua::equipClassItems`
+            // (called from `onLogin`) does `player:GetEquipment():Set(...)`,
+            // which pushes `EquipFromPackage`. The equip applier lives in the
+            // runtime drain (`apply_runtime_lua_command`); the login drain
+            // otherwise dropped this as "unhandled", so the class weapon was
+            // never actually equipped (it sat in the bag) and a Gladiator could
+            // not draw it → F / Active-mode stayed inert. Route it through the
+            // runtime applier so the equip + 0x014E refresh actually run.
+            // (Garlemald-Server #28.)
+            cmd @ LC::EquipFromPackage { .. } => {
+                crate::runtime::quest_apply::apply_runtime_lua_command(
+                    cmd,
+                    &self.registry,
+                    &self.db,
+                    &self.world,
+                    self.lua.as_ref(),
+                )
+                .await;
             }
             other => {
                 tracing::debug!(?other, "login lua cmd (unhandled)");
@@ -1856,6 +1890,13 @@ impl PacketProcessor {
                 director_actor_id,
                 content_area_actor_id,
                 content_script: content_script.clone(),
+                // Pre-warp window: content NPCs not yet AddActor'd on the
+                // client; roster broadcasts stay suppressed until
+                // `apply_do_zone_change_content` finishes the warp bundle.
+                warp_complete: false,
+                // Filled in by the spawn appliers as onCreate's spawns
+                // land; consumed by the ContentFinished teardown.
+                spawned_actor_ids: Vec::new(),
             });
             self.world.upsert_session(snap).await;
         }
@@ -2112,15 +2153,41 @@ impl PacketProcessor {
             spawn.animation_id,
             None,
         );
-        if spawn.hp > 0 {
-            bnpc.npc.character.chara.hp = spawn.hp.min(i16::MAX as u32) as i16;
-            bnpc.npc.character.chara.max_hp = spawn.hp.min(i16::MAX as u32) as i16;
-        }
+        // Give every script-spawned BattleNpc real HP. The seed `hp` column is
+        // 0 for many groups (incl. the SEQ_005 tutorial wolves/Yda/Papalymo),
+        // and garlemald's spawn path — unlike pmeteor's CalculateBaseStats() —
+        // never derives HP from genus/level, so those actors would spawn at
+        // hp=0 → `is_dead()` → rendered downed and unable to fight. When the
+        // seed gives no HP, fall back to a level-scaled default so the actor is
+        // alive. (Garlemald-Server #28; pmeteor parity TODO: full stat derive.)
+        let resolved_hp: u32 = if spawn.hp > 0 {
+            spawn.hp
+        } else {
+            // `saturating_mul` guards against a malformed seed row with an
+            // absurd `min_level` overflowing u32 (panic in debug / wrap in
+            // release); the result is clamped to i16 below regardless.
+            spawn.min_level.max(1).saturating_mul(100).max(100)
+        };
+        bnpc.npc.character.chara.hp = resolved_hp.min(i16::MAX as u32) as i16;
+        bnpc.npc.character.chara.max_hp = resolved_hp.min(i16::MAX as u32) as i16;
         if spawn.mp > 0 {
             bnpc.npc.character.chara.mp = spawn.mp.min(i16::MAX as u32) as i16;
             bnpc.npc.character.chara.max_mp = spawn.mp.min(i16::MAX as u32) as i16;
         }
         bnpc.npc.character.chara.level = spawn.min_level.clamp(1, i16::MAX as u32) as i16;
+
+        // Stamp the visual model + equipment from `gamedata_actor_appearance`,
+        // exactly as the populace `apply_spawn_actor` path does. Without this
+        // the BattleNpc keeps the constructor defaults (model_id = 0, all 28
+        // appearance slots = 0), so the zone-in 0x00D6 SetActorAppearance ships
+        // an empty model: creature mobs (wolves) have no mesh to draw and are
+        // invisible, and humanoid allies (Yda/Papalymo) fall back to an empty
+        // skeleton that renders as a knocked-out/downed pose. (Garlemald #28.)
+        if let Ok(Some(app)) = self.db.load_npc_appearance(spawn.actor_class_id).await {
+            let (model_id, slots) = app.pack();
+            bnpc.npc.character.chara.model_id = model_id;
+            bnpc.npc.character.chara.appearance_ids = slots;
+        }
 
         let actor_id = bnpc.actor_id();
         if actor_id != expected_actor_id {
@@ -2140,7 +2207,36 @@ impl PacketProcessor {
         //     respawn) and attach the AI Controller so the ticker drives
         //     aggro and engagement. See `BattleNpc::apply_spawn_metadata`
         //     for the full per-field mapping + the Meteor parity notes.
-        bnpc.apply_spawn_metadata(&spawn, bnpc_id, actor_id);
+        //
+        //     #28 S2.4 — pool-job casters (currentJob 22 THM / 23 CNJ)
+        //     get their loop spell pre-resolved out of the boot-time
+        //     battle-command catalog. The seed pools carry no spellListId,
+        //     so the tutorial caster (Papalymo) uses THM lvl-1 `thunder`
+        //     27313 (range 20, cast 2000 ms, recast 6 s) — report C §5.
+        const CASTER_DEFAULT_SPELL_ID: u16 = 27313;
+        let caster_spell = if matches!(spawn.current_job, 22 | 23) {
+            self.lua
+                .as_ref()
+                .and_then(|l| {
+                    l.catalogs()
+                        .battle_commands
+                        .read()
+                        .ok()
+                        .and_then(|m| m.get(&CASTER_DEFAULT_SPELL_ID).cloned())
+                })
+                .map(|gd| gd.to_battle_command())
+        } else {
+            None
+        };
+        if matches!(spawn.current_job, 22 | 23) && caster_spell.is_none() {
+            tracing::warn!(
+                bnpc_id,
+                spell_id = CASTER_DEFAULT_SPELL_ID,
+                "SpawnBattleNpcById: caster pool job but spell not in catalog — \
+                 caster will stand back without casting",
+            );
+        }
+        bnpc.apply_spawn_metadata(&spawn, bnpc_id, actor_id, caster_spell);
 
         // 5. Insert the spatial projection into the parent zone's grid.
         let Some(zone_arc) = self.world.zone(parent_zone_id).await else {
@@ -2171,7 +2267,34 @@ impl PacketProcessor {
         }
 
         // 6. Register the live Character in the ActorRegistry.
-        let character = bnpc.npc.character.clone();
+        let mut character = bnpc.npc.character.clone();
+        // #28 S0.5 — content-spawned NPCs are one-shots: opt them out of
+        // the ticker's default 30 s BNpc respawn. A tutorial wolf
+        // respawning at full HP mid-fight would keep the all-wolves-dead
+        // gate from ever firing (seed `respawnTime` is 0 for all five
+        // anyway). Detection: the spawn fires from a content script's
+        // onCreate, which runs after `active_content_script` is set on
+        // the owning session for this parent zone.
+        let content_spawn = {
+            let mut found = false;
+            for mut snap in self.world.all_sessions().await {
+                if let Some(active) = snap.active_content_script.as_mut()
+                    && active.parent_zone_id == parent_zone_id
+                {
+                    // #28 S1.3 — record the spawn on the owning content so
+                    // the ContentFinished teardown despawns actors the
+                    // script never AddMember'd into the director roster.
+                    if !active.spawned_actor_ids.contains(&actor_id) {
+                        active.spawned_actor_ids.push(actor_id);
+                        self.world.upsert_session(snap).await;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        character.chara.respawn_disabled = content_spawn;
         // Phase C1/C2b — tag ally-allegiance BNpcs as `Ally` in the
         // registry. C# Meteor instantiates `Ally` as a separate
         // subclass of `BattleNpc` (`Map Server/Actors/Chara/Npc/Ally.cs`);
@@ -2399,6 +2522,23 @@ impl PacketProcessor {
                 character,
             ))
             .await;
+
+        // 6b. #28 S1.3 — content-area spawns (openingstoper et al.) are
+        //     recorded on the owning session's ActiveContentScript so the
+        //     ContentFinished teardown can despawn them: the director
+        //     roster alone misses SpawnActor'd trigger NPCs the script
+        //     never AddMember'd.
+        for mut snap in self.world.all_sessions().await {
+            if let Some(active) = snap.active_content_script.as_mut()
+                && active.parent_zone_id == zone_id
+            {
+                if !active.spawned_actor_ids.contains(&actor_id) {
+                    active.spawned_actor_ids.push(actor_id);
+                    self.world.upsert_session(snap).await;
+                }
+                break;
+            }
+        }
 
         // 7. SKIP immediate spawn_bundle_fanout. Same reasoning as
         //    apply_spawn_battle_npc_by_id: the content-area spawns
@@ -2945,21 +3085,76 @@ impl PacketProcessor {
             self.world.upsert_session(snap).await;
         }
 
-        client
-            .send_bytes(
-                crate::packets::send::handshake::build_delete_all_actors(actor_id).to_bytes(),
-            )
-            .await;
-        client
-            .send_bytes(crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes())
-            .await;
+        // pmeteor's content-warp burst opens with a "you have entered an
+        // instance" system message (`SendGameMessage(WorldMaster, 34108,
+        // 0x20)`, WorldManager.cs:999) immediately before DeleteAllActors.
+        // Byte parity with the reference capture
+        // (captures/pmeteor-quest/20260426-160210-gridania-manual3,
+        // map-packets.log ~31938): header source AND body textOwner are both
+        // WorldMaster 0x5FF80001 — the client dispatches game messages
+        // through per-actor receivers keyed on the header source, so
+        // sourcing this from the player would route it to the wrong
+        // receiver class.
+        {
+            let mut msg = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                34108,
+                0x20,
+            );
+            msg.set_target_id(session_id);
+            client.send_bytes(msg.to_bytes()).await;
+        }
+
+        // DeleteAllActors + 0x00E2(0x10) — THE same-zone reload trigger.
+        //
+        // These two were previously sent UNTAGGED (`target_id == 0`), and
+        // every map-server subpacket crosses the world-server proxy, whose
+        // fan-out drops untargeted subpackets (`if target == 0 { continue; }`,
+        // world-server/src/server.rs). So the client never received either
+        // packet: no actor wipe, and — critically — no 0x00E2. The decompiled
+        // client (FUN_0058cca0, case 0x00E2) sets the MapLayoutElement's
+        // force-reload latch [+0xbc]=1 for any subcode except 0x15/0x16; the
+        // SetMap handler (FUN_0059ced0) then schedules a scene reload when
+        // `latch != 0 OR region != resident [+0x94]`. With the 0x00E2 dropped,
+        // a same-region SetMap(106) took the no-op arm and "Now Loading" hung
+        // forever — which is what the high-16 region tag (now removed, see
+        // send_zone_in_bundle) was papering over by forcing the
+        // region-mismatch arm at the cost of committing an invalid resident
+        // region. Tagging the pair delivers the latch, so the unmodified
+        // parent region reloads exactly like pmeteor's capture.
+        // (Garlemald-Server #28.)
+        {
+            let mut wipe = crate::packets::send::handshake::build_delete_all_actors(actor_id);
+            wipe.set_target_id(session_id);
+            client.send_bytes(wipe.to_bytes()).await;
+            let mut e2 = crate::packets::send::handshake::build_0xe2(actor_id, 0x10);
+            e2.set_target_id(session_id);
+            client.send_bytes(e2.to_bytes()).await;
+        }
 
         // 4. Replay the zone-in bundle. `send_zone_in_bundle` reads from
         //    the session + character we just updated, so the bundle
         //    spawns the player at the content-area coords.
         self.world
-            .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
+            .send_zone_in_bundle(
+                &self.registry,
+                &self.db,
+                self.lua.as_ref().map(|l| l.catalogs()),
+                session_id,
+                spawn_type as u16,
+            )
             .await;
+
+        // The bundle has now AddActor'd + state-synced the content NPCs on
+        // the client; lift the pre-warp suppression of roster broadcasts
+        // (see `ActiveContentScript::warp_complete`).
+        if let Some(mut snap) = self.world.session(session_id).await {
+            if let Some(active) = snap.active_content_script.as_mut() {
+                active.warp_complete = true;
+            }
+            self.world.upsert_session(snap).await;
+        }
 
         // 5. B7 of the SEQ_005 unblock plan — fire the content
         //    script's `onZoneIn(player, contentArea, isLogin)`
@@ -3189,112 +3384,26 @@ impl PacketProcessor {
         z: f32,
         rotation: f32,
     ) {
-        let Some(handle) = self.registry.get(player_id).await else {
-            tracing::warn!(player = player_id, "DoZoneChange: actor missing");
-            return;
-        };
-        let session_id = handle.session_id;
-        let actor_id = handle.actor_id;
-        if session_id == 0 {
-            tracing::debug!(player = player_id, "DoZoneChange: no session (NPC?)");
-            return;
-        }
-
-        // 1. Migrate the actor between zones (no-op if zone_id is the
-        //    same as the current zone). `do_zone_change_with_private_area`
-        //    also updates the session's destination + zone +
-        //    private-area fields. `private_area = Some` routes the
-        //    actor into that PrivateArea instance's core pool;
-        //    `None` (or unknown name) goes to the parent zone's core.
-        let spawn = common::Vector3::new(x, y, z);
-        if let Err(e) = self
-            .world
-            .do_zone_change_with_private_area(
-                actor_id,
-                session_id,
-                zone_id,
-                private_area.clone(),
-                private_area_type,
-                spawn,
-                rotation,
-            )
-            .await
-        {
-            tracing::error!(
-                error = %e,
-                player = player_id,
-                zone = zone_id,
-                ?private_area,
-                "DoZoneChange: world.do_zone_change_with_private_area failed"
-            );
-            return;
-        }
-
-        // 2. Update the character's persistent zone_id + position
-        //    (the registry move above only touches the spatial grid;
-        //    the Character row's `base.zone_id` is what `send_zone_in_bundle`
-        //    reads on the next login + what persists to disk). Also
-        //    purge any status effects tagged LOSE_ON_ZONING — mirrors
-        //    Meteor's `Player.CleanupAndSave`
-        //    (`Map Server/Actors/Chara/Player/Player.cs:844`) which
-        //    drops these effects unconditionally as the player crosses
-        //    the zone boundary.
-        let mut status_outbox = crate::status::StatusOutbox::new();
-        {
-            let mut c = handle.character.write().await;
-            c.base.zone_id = zone_id;
-            c.base.position_x = x;
-            c.base.position_y = y;
-            c.base.position_z = z;
-            c.base.rotation = rotation;
-            c.status_effects.remove_by_flag(
-                crate::status::StatusEffectFlags::LOSE_ON_ZONING,
-                &mut status_outbox,
-            );
-        }
-        self.drain_status_outbox(status_outbox).await;
-
-        // 3. Carry the requested spawn_type through to the zone-in
-        //    bundle so the client plays the right "you arrived" anim.
-        if let Some(mut snap) = self.world.session(session_id).await {
-            snap.destination_spawn_type = spawn_type;
-            self.world.upsert_session(snap).await;
-        }
-
-        // 4. Emit the zone-change packet trio — same order as
-        //    `apply_do_zone_change_content`.
-        let Some(client) = self.world.client(session_id).await else {
-            tracing::warn!(player = player_id, "DoZoneChange: no client");
-            return;
-        };
-        client
-            .send_bytes(
-                crate::packets::send::handshake::build_delete_all_actors(actor_id).to_bytes(),
-            )
-            .await;
-        client
-            .send_bytes(crate::packets::send::handshake::build_0xe2(actor_id, 0x10).to_bytes())
-            .await;
-
-        // 5. Replay the zone-in bundle. `send_zone_in_bundle` reads
-        //    from the session + character we just updated, so the
-        //    bundle spawns the player at the new coords.
-        self.world
-            .send_zone_in_bundle(&self.registry, &self.db, session_id, spawn_type as u16)
-            .await;
-
-        tracing::info!(
-            player = player_id,
-            zone = zone_id,
-            ?private_area,
+        // Body extracted to `quest_apply::apply_do_zone_change` (#28
+        // S1.2) so the runtime drain (ticker / signal resumes — the
+        // SEQ_005 director's final warp-out) can reach it without an
+        // `Arc<PacketProcessor>`; this arm just delegates.
+        crate::runtime::quest_apply::apply_do_zone_change(
+            player_id,
+            zone_id,
+            private_area,
             private_area_type,
             spawn_type,
             x,
             y,
             z,
             rotation,
-            "DoZoneChange applied (cross-zone warp + zone-in replay)",
-        );
+            &self.registry,
+            &self.db,
+            &self.world,
+            self.lua.as_ref(),
+        )
+        .await;
     }
 
     /// `WorldManager:WarpToPublicArea(player[, x, y, z, rot])` — quest
@@ -3328,9 +3437,11 @@ impl PacketProcessor {
             )
         };
         let (x, y, z, rotation) = target.unwrap_or((cur_x, cur_y, cur_z, cur_rot));
-        // spawn_type=2 == "warp" (matches Meteor's WarpToPublicArea
-        // path which passes 2 to DoZoneChange).
-        self.apply_do_zone_change(player_id, zone_id, None, 0, 2, x, y, z, rotation)
+        // spawn_type=15 — pmeteor's WarpToPublicArea passes 15 to
+        // DoZoneChange (WorldManager.cs:935-939); the earlier comment
+        // claiming it passes 2 was wrong, and the value feeds the 0x00CE
+        // SetActorPosition tail. (Garlemald-Server #28 review.)
+        self.apply_do_zone_change(player_id, zone_id, None, 0, 15, x, y, z, rotation)
             .await;
     }
 
@@ -3367,12 +3478,14 @@ impl PacketProcessor {
             )
         };
         let (x, y, z, rotation) = target.unwrap_or((cur_x, cur_y, cur_z, cur_rot));
+        // spawn_type=15 — matches pmeteor's WarpToPrivateArea
+        // (WorldManager.cs:925-928).
         self.apply_do_zone_change(
             player_id,
             zone_id,
             Some(area_class),
             area_index,
-            2,
+            15,
             x,
             y,
             z,
@@ -4042,13 +4155,21 @@ impl PacketProcessor {
             2 => crate::packets::send::player::build_set_current_mount_goobbue(handle.actor_id, 1),
             _ => return,
         };
-        if let Ok(base) = common::BasePacket::create_from_subpacket(&pkt, true, false) {
-            let bytes = base.to_bytes();
+        // Raw subpacket bytes — the map-server writer task owns BasePacket
+        // framing (`wrap_subpackets_in_basepacket`); pre-framing here both
+        // double-wrapped the frame AND hid the zero `target_id` from the
+        // stamp helper, so the packet died at the world-server proxy.
+        {
+            let mut self_bytes = pkt.to_bytes();
             // Self-emit — the mount owner needs the packet for their
             // own HUD regardless of whether any neighbours are
             // around to see them.
             if let Some(client) = self.world.client(handle.session_id).await {
-                client.send_bytes(bytes.clone()).await;
+                common::subpacket::SubPacket::stamp_target_id_if_zero(
+                    &mut self_bytes,
+                    handle.session_id,
+                );
+                client.send_bytes(self_bytes).await;
             }
             // Fan to every nearby Player via the shared zone-grid
             // broadcast (source is auto-excluded by `actors_around`).
@@ -4058,7 +4179,7 @@ impl PacketProcessor {
                     &self.registry,
                     &zone,
                     handle.actor_id,
-                    bytes,
+                    pkt.to_bytes(),
                 )
                 .await;
                 tracing::debug!(
@@ -4589,14 +4710,18 @@ impl PacketProcessor {
             && let Some(handle) = self.registry.get(player_id).await
             && let Some(client) = self.world.client(handle.session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25118,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
                 &[common::luaparam::LuaParam::UInt32(npc_ls_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
             tracing::debug!(
                 player = player_id,
@@ -4613,6 +4738,50 @@ impl PacketProcessor {
     /// here. The in-memory hotbar snapshot + the
     /// `charaWork.command[N]` SetActorProperty fan-out are deferred
     /// — the next character load picks the row up.
+    /// pmeteor `Player.UpdateHotbar(slots)` — push one slot's live
+    /// command + recast state to the owning client after an
+    /// Equip/Unequip/Swap applier, so hotbar edits render without
+    /// re-zoning. Reads the post-mutation `chara.hotbar` mirror; an
+    /// absent entry emits the disable shape (command 0, category /
+    /// compatibility 0). Self-only, every subpacket target-stamped
+    /// (proxy rule). (#28 S3.1.)
+    async fn send_hotbar_slot_update(&self, player_id: u32, slot0: u16) {
+        let Some(handle) = self.registry.get(player_id).await else {
+            return;
+        };
+        let Some(client) = self.world.client(handle.session_id).await else {
+            return;
+        };
+        let (command_masked, recast_end) = {
+            let c = handle.character.read().await;
+            c.chara
+                .hotbar
+                .iter()
+                .find(|e| e.hotbar_slot == slot0)
+                .map(|e| (e.command_id | 0xA0F0_0000, e.recast_time))
+                .unwrap_or((0, 0))
+        };
+        let max_recast_s = self
+            .lua
+            .as_ref()
+            .and_then(|l| l.catalogs().battle_commands.read().ok())
+            .and_then(|m| {
+                m.get(&((command_masked & 0xFFFF) as u16))
+                    .map(|c| c.max_recast_time_seconds as u16)
+            })
+            .unwrap_or(0);
+        for mut sub in crate::packets::send::actor::build_hotbar_slot_update(
+            player_id,
+            slot0,
+            command_masked,
+            max_recast_s,
+            recast_end,
+        ) {
+            sub.set_target_id(handle.session_id);
+            client.send_bytes(sub.to_bytes()).await;
+        }
+    }
+
     async fn apply_equip_ability(
         &self,
         player_id: u32,
@@ -4673,8 +4842,11 @@ impl PacketProcessor {
         if let Some(handle) = self.registry.get(player_id).await
             && let Some(client) = self.world.client(handle.session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30603,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -4684,8 +4856,13 @@ impl PacketProcessor {
                 ],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
+
+        // Live hotbar refresh (pmeteor `EquipAbility` tail: UpdateHotbar).
+        self.send_hotbar_slot_update(player_id, zero_based_slot)
+            .await;
     }
 
     /// `player:UnequipAbility(slot)` — DELETE the hotbar row for the
@@ -4746,8 +4923,11 @@ impl PacketProcessor {
             && session_id != 0
             && let Some(client) = self.world.client(session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                player_id,
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30604,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -4757,8 +4937,12 @@ impl PacketProcessor {
                 ],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
+
+        // Live hotbar refresh — the emptied slot disables client-side.
+        self.send_hotbar_slot_update(player_id, hotbar_slot).await;
     }
 
     /// `player:SwapAbilities(slot1, slot2)` — exchange two hotbar
@@ -4841,6 +5025,10 @@ impl PacketProcessor {
             slot_2 = hotbar_slot_2,
             "SwapAbilities persisted (both slots swapped) + snapshot mirror",
         );
+
+        // Live hotbar refresh for both slots.
+        self.send_hotbar_slot_update(player_id, zero_1).await;
+        self.send_hotbar_slot_update(player_id, zero_2).await;
     }
 
     /// `player:EquipAbilityInFirstOpenSlot(classId, commandId)` —
@@ -4915,8 +5103,11 @@ impl PacketProcessor {
         if let Some(handle) = self.registry.get(player_id).await
             && let Some(client) = self.world.client(handle.session_id).await
         {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 30603,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
@@ -4926,8 +5117,12 @@ impl PacketProcessor {
                 ],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
+
+        // Live hotbar refresh (pmeteor `EquipAbility` tail: UpdateHotbar).
+        self.send_hotbar_slot_update(player_id, slot).await;
     }
 
     /// `player:SavePlayTime()` — persist the player's play_time so
@@ -5209,7 +5404,7 @@ impl PacketProcessor {
             self.world.upsert_session(session).await;
         }
         if let Some(client) = self.world.client(session_id).await {
-            let pkt = crate::packets::send::build_set_actor_position(
+            let mut pkt = crate::packets::send::build_set_actor_position(
                 actor_id,
                 actor_id as i32,
                 x,
@@ -5219,6 +5414,10 @@ impl PacketProcessor {
                 spawn_type.into(),
                 false,
             );
+            // Untargeted subpackets are dropped by the world-server proxy
+            // fan-out — without the tag this in-zone warp never moved the
+            // client. (Garlemald-Server #28.)
+            pkt.set_target_id(session_id);
             client.send_bytes(pkt.to_bytes()).await;
             tracing::info!(
                 actor = actor_id,
@@ -5698,12 +5897,19 @@ impl PacketProcessor {
         // `apply_send_mount_appearance:1719-1745`.
         const RANKUP_ANIMATION_ID: u32 = 0x0400_0FFB;
         let sub = tx::actor::build_play_animation_on_actor(handle.actor_id, RANKUP_ANIMATION_ID);
-        if let Ok(base) = common::BasePacket::create_from_subpacket(&sub, true, false) {
-            let bytes = base.to_bytes();
+        // Raw subpacket bytes — the writer task owns BasePacket framing;
+        // pre-framing double-wrapped AND hid the zero `target_id` from the
+        // stamp helper, so the packet died at the world-server proxy.
+        {
+            let mut self_bytes = sub.to_bytes();
             // Self-emit so the promoting player sees the salute
             // regardless of how far from any neighbour they are.
             if let Some(client) = self.world.client(handle.session_id).await {
-                client.send_bytes(bytes.clone()).await;
+                common::subpacket::SubPacket::stamp_target_id_if_zero(
+                    &mut self_bytes,
+                    handle.session_id,
+                );
+                client.send_bytes(self_bytes).await;
             }
             if let Some(zone) = self.world.zone(handle.zone_id).await {
                 let sent = crate::runtime::broadcast::broadcast_around_actor(
@@ -5711,7 +5917,7 @@ impl PacketProcessor {
                     &self.registry,
                     &zone,
                     handle.actor_id,
-                    bytes,
+                    sub.to_bytes(),
                 )
                 .await;
                 tracing::debug!(
@@ -6098,9 +6304,22 @@ impl PacketProcessor {
             return;
         };
 
-        let zone_id = player_handle.zone_id;
+        // Session-resolved zone — the ActorHandle's zone_id is frozen at
+        // registration (`reassign_zone` has no production callers), so a
+        // post-warp UpdateENPCs (the SEQ_010 Tkebbe talk flow in zone
+        // 155) would otherwise search the login zone and skip every
+        // broadcast. (Garlemald-Server #28, req 4.)
+        let (zone_id, requester_area) = match self.world.session(session_id).await {
+            Some(s) if s.current_zone_id != 0 => (
+                s.current_zone_id,
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level)),
+            ),
+            _ => (player_handle.zone_id, None),
+        };
         let Some(npc_handle) = self
-            .find_npc_by_class_id(zone_id, enpc.actor_class_id)
+            .find_npc_by_class_id(zone_id, enpc.actor_class_id, requester_area.as_ref())
             .await
         else {
             tracing::debug!(
@@ -6171,9 +6390,18 @@ impl PacketProcessor {
         let Some(client) = self.world.client(session_id).await else {
             return;
         };
-        let zone_id = player_handle.zone_id;
+        // Session-resolved zone + area (see broadcast_quest_enpc_update).
+        let (zone_id, requester_area) = match self.world.session(session_id).await {
+            Some(s) if s.current_zone_id != 0 => (
+                s.current_zone_id,
+                s.current_private_area_name
+                    .clone()
+                    .map(|n| (n, s.current_private_area_level)),
+            ),
+            _ => (player_handle.zone_id, None),
+        };
         let Some(npc_handle) = self
-            .find_npc_by_class_id(zone_id, enpc.actor_class_id)
+            .find_npc_by_class_id(zone_id, enpc.actor_class_id, requester_area.as_ref())
             .await
         else {
             return;
@@ -6205,18 +6433,37 @@ impl PacketProcessor {
     /// `actor_class_id` matches `class_id`. Quest scripts typically
     /// register 2-8 ENPCs per sequence so per-call O(n) isn't a hot
     /// path; a proper index on `ActorRegistry` can come later if needed.
-    async fn find_npc_by_class_id(&self, zone_id: u32, class_id: u32) -> Option<ActorHandle> {
+    /// Area-aware ENPC resolution — prefer the copy whose private-area
+    /// pool matches the requester's routing, fall back to a zone-root
+    /// copy. Mirrors `quest_apply::find_npc_by_class_id` (several city
+    /// NPCs are seeded both at the zone root and inside a private-area
+    /// phase under the same class id; first-match was HashMap-order
+    /// nondeterministic). (Garlemald-Server #28.)
+    async fn find_npc_by_class_id(
+        &self,
+        zone_id: u32,
+        class_id: u32,
+        requester_area: Option<&(String, u32)>,
+    ) -> Option<ActorHandle> {
         let actors = self.registry.actors_in_zone(zone_id).await;
+        let mut root_match: Option<ActorHandle> = None;
         for h in actors {
             let matches = {
                 let c = h.character.read().await;
                 c.chara.actor_class_id == class_id
             };
-            if matches {
-                return Some(h);
+            if !matches {
+                continue;
+            }
+            match (&h.private_area, requester_area) {
+                (Some(npc_area), Some(req)) if npc_area.as_ref() == req => return Some(h),
+                (None, None) => return Some(h),
+                // Root copy — fallback for a private-area player.
+                (None, Some(_)) if root_match.is_none() => root_match = Some(h),
+                _ => {}
             }
         }
-        None
+        root_match
     }
 
     /// `player:AddQuest(id)` — allocate a free slot, build a fresh
@@ -6289,14 +6536,18 @@ impl PacketProcessor {
         // owning client only (no broadcast — this is a personal
         // system message).
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25224,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
                 &[common::luaparam::LuaParam::UInt32(quest_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
 
@@ -6356,14 +6607,18 @@ impl PacketProcessor {
         // Mirror C# `Quest.OnComplete`'s
         // `SendGameMessage(WorldMaster, 25086, 0x20, GetQuestId())`.
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25086,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
                 &[common::luaparam::LuaParam::UInt32(quest_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
     }
@@ -6410,14 +6665,18 @@ impl PacketProcessor {
         // Mirror C# `WorldManager.AbandonQuest`'s
         // `SendGameMessage(this, WorldMaster, 25236, 0x20, abandoned.GetQuestId())`.
         if let Some(client) = self.world.client(handle.session_id).await {
-            let pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
-                handle.actor_id,
+            let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_auto(
+                // Header source = WorldMaster (the client dispatches by
+                // header source; it must be an always-present static
+                // actor, never the player — Garlemald-Server #28 crash RCA).
+                crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
                 /* text_id */ 25236,
                 crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
                 &[common::luaparam::LuaParam::UInt32(quest_id)],
                 /* prefer_alt */ false,
             );
+            pkt.set_target_id(handle.session_id);
             client.send_bytes(pkt.to_bytes()).await;
         }
     }
@@ -6786,21 +7045,36 @@ impl PacketProcessor {
             }
             OP_RX_SET_TARGET => {
                 // 118 events/session — most-frequent IN gap. Wiki:
-                // "Target Selected". Client sends this on
-                // soft-target / hover-select. Project Meteor parses
-                // it via `SetTargetPacket` and uses
-                // `attackTarget != 0xE0000000` to drive auto-attack
-                // engage state (`PacketProcessor.cs:175`).
-                let attack_target = if sub.data.len() >= 4 {
+                // "Target Selected". `SetTargetPacket` (pmeteor
+                // `PacketProcessor.cs:173`):
+                //   body[0..4] = actorID      — the selected (soft) target
+                //   body[4..8] = attackTarget — 0xE0000000 when there is no
+                //                               locked attack target, else a
+                //                               real actor id (auto-attack on).
+                // pmeteor sets `currentTarget = actorID` and
+                // `isAutoAttackEnabled = attackTarget != 0xE0000000`. The prior
+                // garlemald code mislabelled body[0..4] as `attackTarget` and
+                // only logged it. (Garlemald-Server #28.)
+                let selected_target = if sub.data.len() >= 4 {
                     u32::from_le_bytes(sub.data[..4].try_into().unwrap())
                 } else {
                     0
                 };
+                let attack_target = if sub.data.len() >= 8 {
+                    u32::from_le_bytes(sub.data[4..8].try_into().unwrap())
+                } else {
+                    Self::SET_TARGET_NONE
+                };
+                let auto_attack = attack_target != Self::SET_TARGET_NONE;
                 tracing::debug!(
                     source = source,
+                    selected = format!("0x{:08X}", selected_target),
                     attack_target = format!("0x{:08X}", attack_target),
+                    auto_attack,
                     "RX 0x00CD target-selected",
                 );
+                self.apply_player_set_target(source, selected_target, auto_attack)
+                    .await;
             }
             OP_RX_DATA_REQUEST => {
                 // 44 events/session. Same opcode as outbound
@@ -6975,7 +7249,10 @@ impl PacketProcessor {
     /// sequence + journalInfo.
     const REQUEST_QUEST_JOURNAL_COMMAND: u32 = 0xA0F0_5E93;
 
-    async fn handle_event_start(&self, session_id: u32, data: &[u8]) -> Result<()> {
+    // `pub(crate)` so the #28 S3.2 integration test can drive a synthetic
+    // retail-shaped 0x012D through the same parse + dispatch path the
+    // socket reader uses.
+    pub(crate) async fn handle_event_start(&self, session_id: u32, data: &[u8]) -> Result<()> {
         let pkt = match EventStartPacket::parse(data) {
             Ok(p) => p,
             Err(e) => {
@@ -7015,6 +7292,10 @@ impl PacketProcessor {
         let event_name_for_director = pkt.event_name.clone();
         let event_type_for_director = pkt.event_type;
         let lua_params_for_director = pkt.lua_params.clone();
+        // Same snapshot for the command-static-actor dispatch below.
+        let event_name_for_cmd = pkt.event_name.clone();
+        let event_type_for_cmd = pkt.event_type;
+        let lua_params_for_cmd = pkt.lua_params.clone();
         let mut outbox = EventOutbox::new();
         {
             let mut chara = handle.character.write().await;
@@ -7030,6 +7311,36 @@ impl PacketProcessor {
         for e in outbox.drain() {
             dispatch_event_event(&e, &self.registry, &self.world, &self.db, self.lua.as_ref())
                 .await;
+        }
+
+        // Hotbar skill press — retail sends `EventStart` with eventName
+        // `commandDefault` and the command's static-actor id
+        // (`0xA0F00000 | id`) as the owner (D §1.1, combat_skills.pcapng;
+        // the real target rides in the type-6 Actor LuaParam). Resolve the
+        // masked id against the battle-command catalog and execute inline —
+        // the on-disk command scripts are 4-liners with no
+        // WeaponSkill/Ability/Cast bindings (plan R5). The route is
+        // exclusive, mirroring pmeteor's `PacketProcessor` 0x012D which
+        // targets only the command static actor: no quest/director fan-out
+        // for a skill press. The two ActivateCommand ids ride eventName
+        // `commandForced` and stay on the command-script dispatch below;
+        // unresolved 0xA0F0xxxx owners (journal command etc.) fall through
+        // unchanged. (#28 S3.2.)
+        if (owner_actor_id & 0xFFF0_0000) == 0xA0F0_0000 && event_name_for_match == "commandDefault"
+        {
+            let masked_cmd = (owner_actor_id & 0xFFFF) as u16;
+            let command = self.lua.as_ref().and_then(|l| {
+                l.catalogs()
+                    .battle_commands
+                    .read()
+                    .ok()
+                    .and_then(|m| m.get(&masked_cmd).cloned())
+            });
+            if let Some(command) = command {
+                self.dispatch_hotbar_command(&handle, session_id, &lua_params_for_cmd, command)
+                    .await;
+                return Ok(());
+            }
         }
 
         // Content-director `onEventStarted` dispatch. When the EventStart's
@@ -7135,6 +7446,24 @@ impl PacketProcessor {
             && event_name_for_match == "commandRequest"
         {
             self.send_quest_journal_data(&handle, session_id).await;
+        }
+
+        // Generic client-command dispatch — run `commands/<Name>.lua::
+        // onEventStarted` for a command static actor. This is how the client's
+        // active-mode toggle (F / sword → ActivateCommand) reaches the script
+        // that calls `player.Engage(...)` + `sendSignal("playerActive")`,
+        // un-parking the combat-tutorial director. Generalizes the journal
+        // one-off above. (Garlemald-Server #28.)
+        if let Some(command_name) = Self::command_script_name(owner_actor_id) {
+            self.dispatch_command_script(
+                &handle,
+                owner_actor_id,
+                command_name,
+                event_name_for_cmd,
+                event_type_for_cmd,
+                lua_params_for_cmd,
+            )
+            .await;
         }
 
         tracing::debug!(
@@ -7265,43 +7594,450 @@ impl PacketProcessor {
             }
         };
 
-        if commands.is_empty() {
-            return;
-        }
+        Box::pin(self.apply_event_script_commands(handle, commands)).await;
+    }
 
-        // Translate event-flavoured commands (`RunEventFunction` /
-        // `EndEvent` / `KickEvent`) through the EventOutbox + dispatcher
-        // so cinematic packets reach the wire. Without this step the
-        // commands fall through `apply_runtime_lua_command`'s catch-all
-        // branch and are silently dropped (see `processor.rs:1684` log).
-        // Mirrors `apply_quest_on_notice` (`runtime/quest_apply.rs:2410-
-        // 2513`) and `fire_quest_event_hook` (`processor.rs:5912-5934`).
-        let event_session_snapshot = {
-            let c = handle.character.read().await;
-            c.event_session.clone()
-        };
-        let mut outbox = crate::event::outbox::EventOutbox::new();
-        crate::event::lua_bridge::translate_lua_commands_into_outbox(
-            &commands,
-            &event_session_snapshot,
-            &mut outbox,
-        );
-        for e in outbox.drain() {
-            Box::pin(dispatch_event_event(
-                &e,
-                &self.registry,
-                &self.world,
-                &self.db,
-                self.lua.as_ref(),
-            ))
-            .await;
-        }
-        crate::runtime::quest_apply::apply_runtime_lua_commands(
+    /// Apply a script's drained `LuaCommand`s. Event-flavoured commands
+    /// (`RunEventFunction` / `EndEvent` / `KickEvent` / …) are translated
+    /// through the `EventOutbox` + dispatcher so cinematic packets reach the
+    /// wire (without this they hit `apply_runtime_lua_command`'s catch-all and
+    /// are dropped); the rest go through the runtime; and any `SendSignal`
+    /// resumes the coroutines parked on `waitForSignal(name)` (e.g. the combat
+    /// tutorial director on "playerActive") and applies THEIR commands,
+    /// recursively. Shared by the content-director dispatch and the
+    /// command-static-actor dispatch. Mirrors `apply_quest_on_notice` +
+    /// `fire_quest_event_hook`. (Garlemald-Server #28.)
+    /// Delegates to the shared `quest_apply::apply_event_script_commands`
+    /// (also used by the ticker's per-owner coroutine drains). Order is
+    /// load-bearing on the wire: pmeteor sends `SendDataPacket(9)`
+    /// (startTutorialMode — a runtime/0x0133 command) BEFORE the
+    /// `processTtrBtl001` cinematic (RunEventFunction/0x0130), while later
+    /// it sends the tutorial-widget SendDataPackets AFTER their cinematic —
+    /// the shared drain interleaves per-command to preserve that.
+    async fn apply_event_script_commands(
+        &self,
+        handle: &ActorHandle,
+        commands: Vec<crate::lua::command::LuaCommand>,
+    ) {
+        crate::runtime::quest_apply::apply_event_script_commands(
+            handle,
             commands,
             &self.registry,
             &self.db,
             &self.world,
             self.lua.as_ref(),
+        )
+        .await;
+    }
+
+    /// Command static-actor ids that dispatch to a `commands/<Name>.lua`
+    /// script via `onEventStarted`. Decoded from `staticactors.bin`
+    /// (`… | 0xA0F00000`). ActivateCommand is the active/passive (draw/sheathe)
+    /// toggle the client sends on F / the sword icon — two ids for
+    /// activate/deactivate, both routed to the one script which branches on
+    /// `player.currentMainState`. (Garlemald-Server #28.)
+    const ACTIVATE_COMMAND_A: u32 = 0xA0F0_5209;
+    const ACTIVATE_COMMAND_B: u32 = 0xA0F0_520A;
+
+    /// SetTarget's `attackTarget` "no attack target" sentinel — the value the
+    /// 1.x client writes when the player has no locked combat target (pmeteor
+    /// `SetTargetPacket.attackTarget` "Usually 0xE0000000"). Same constant as
+    /// `actor_battle::NO_ENMITY_TARGET`. (Garlemald-Server #28.)
+    const SET_TARGET_NONE: u32 = 0xE000_0000;
+
+    fn command_script_name(owner_actor_id: u32) -> Option<&'static str> {
+        match owner_actor_id {
+            Self::ACTIVATE_COMMAND_A | Self::ACTIVATE_COMMAND_B => Some("ActivateCommand"),
+            _ => None,
+        }
+    }
+
+    /// Run `commands/<Name>.lua::onEventStarted` for a client command static
+    /// actor and apply its commands (incl. any `sendSignal`). Generalizes the
+    /// hardcoded journal command. (Garlemald-Server #28.)
+    async fn dispatch_command_script(
+        &self,
+        handle: &ActorHandle,
+        command_actor_id: u32,
+        command_name: &'static str,
+        event_name: String,
+        event_type: u8,
+        lua_params: Vec<common::luaparam::LuaParam>,
+    ) {
+        let Some(lua) = self.lua.as_ref() else {
+            return;
+        };
+        let script_path = lua.resolver().command(command_name);
+        if !script_path.exists() {
+            tracing::warn!(
+                command = command_name,
+                owner = command_actor_id,
+                script = %script_path.display(),
+                "command script not on disk — skipping dispatch",
+            );
+            return;
+        }
+        let snapshot = {
+            let c = handle.character.read().await;
+            build_player_snapshot_from_character(&c)
+        };
+        let lua_clone = lua.clone();
+        let script_path_clone = script_path.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            lua_clone.call_command_on_event_started(
+                &script_path_clone,
+                snapshot,
+                command_actor_id,
+                event_name,
+                event_type,
+                lua_params,
+            )
+        })
+        .await;
+        let partial = match result {
+            Ok(p) => p,
+            Err(join_err) => {
+                tracing::warn!(
+                    command = command_name,
+                    error = %join_err,
+                    "command onEventStarted dispatch panicked",
+                );
+                return;
+            }
+        };
+        if let Some(e) = partial.error {
+            tracing::warn!(
+                command = command_name,
+                error = %e,
+                "command onEventStarted errored; applying partial commands",
+            );
+        } else {
+            tracing::debug!(
+                command = command_name,
+                owner = command_actor_id,
+                commands = partial.commands.len(),
+                "command onEventStarted fired",
+            );
+        }
+        Box::pin(self.apply_event_script_commands(handle, partial.commands)).await;
+    }
+
+    /// One X01 error row — pmeteor `WeaponSkillState.errorResult` shape
+    /// (`CommandResult(owner.Id, textId, 0)` flushed via
+    /// `DoBattleAction(skill.id, 0, errorResult)`): animation 0, the
+    /// pressed command id, the player as the row target, and the error
+    /// text in `worldMasterTextId`. Self-only — the validation error is
+    /// the actor's own feedback line. (#28 S3.2.)
+    async fn send_command_error_result(
+        &self,
+        session_id: u32,
+        actor_id: u32,
+        command_id: u16,
+        text_id: u16,
+    ) {
+        let Some(client) = self.world.client(session_id).await else {
+            return;
+        };
+        let row = crate::packets::send::actor_battle::CommandResult {
+            target_id: actor_id,
+            worldmaster_text_id: text_id,
+            ..Default::default()
+        };
+        let mut pkt = crate::packets::send::actor_battle::build_command_result_x01(
+            actor_id, 0, command_id, &row,
+        );
+        pkt.set_target_id(session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+    }
+
+    /// End the event-session the press's `start_event` opened — exactly
+    /// one 0x0131 per IN 0x012D (retail shape). Routed through the
+    /// session + event dispatcher so the packet rides the standard
+    /// target-stamped send. (#28 S3.2.)
+    async fn end_command_event(&self, handle: &ActorHandle) {
+        let mut outbox = EventOutbox::new();
+        {
+            let mut c = handle.character.write().await;
+            c.event_session.end_event(handle.actor_id, &mut outbox);
+        }
+        for e in outbox.drain() {
+            dispatch_event_event(&e, &self.registry, &self.world, &self.db, self.lua.as_ref())
+                .await;
+        }
+    }
+
+    /// Inline execution of a hotbar skill press (#28 S3.2) — the Rust port
+    /// of pmeteor's 4-line command scripts (`AttackWeaponSkill.lua` /
+    /// `Ability.lua` / `AttackMagic.lua`) + `Player.CanUse`
+    /// (Player.cs:2809-2877), routed by the catalog's `commandType`
+    /// (2 → weaponskill, 3 → ability, 4 → spell) instead of shipping
+    /// staticactors.bin. Exactly one EndEvent answers every press;
+    /// validation failures additionally carry one X01 error row (or the
+    /// 32503 system line for the active-mode gate). Completion damage
+    /// flows through the existing ticker → `ResolveAction` →
+    /// `resolve_action` pipeline; S3.3 handles costs/recast there.
+    pub(crate) async fn dispatch_hotbar_command(
+        &self,
+        handle: &ActorHandle,
+        session_id: u32,
+        lua_params: &[common::luaparam::LuaParam],
+        command: crate::gamedata::BattleCommand,
+    ) {
+        let actor_id = handle.actor_id;
+
+        // Retail rides the real target in the type-6 Actor param — the
+        // Int32 slot pmeteor's script signature names `targetActor` is 0
+        // on the wire, which is why pmeteor falls through to
+        // `currentTarget` (Player.cs:2685-2701). Same fallback here.
+        let param_target = lua_params.iter().find_map(|p| match p {
+            common::luaparam::LuaParam::Actor(id) if *id != 0 => Some(*id),
+            _ => None,
+        });
+
+        let (main_state, my_x, my_y, my_z, mp, tp, current_target, can_change, recast_end) = {
+            let c = handle.character.read().await;
+            (
+                c.base.current_main_state,
+                c.base.position_x,
+                c.base.position_y,
+                c.base.position_z,
+                c.chara.mp,
+                c.chara.tp,
+                c.chara.current_target,
+                c.ai_container.can_change_state(),
+                c.chara
+                    .hotbar
+                    .iter()
+                    .find(|e| (e.command_id & 0xFFFF) as u16 == command.id)
+                    .map(|e| e.recast_time)
+                    .unwrap_or(0),
+            )
+        };
+
+        // Active-mode gate (commands/AttackWeaponSkill.lua:15-19):
+        // "You are not in active mode" as the WorldMaster system line.
+        if main_state != crate::actor::MAIN_STATE_ACTIVE {
+            if let Some(client) = self.world.client(session_id).await {
+                let mut pkt = crate::packets::send::misc::build_text_sheet_no_source_x28(
+                    crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                    crate::packets::send::misc::WORLD_MASTER_ACTOR_ID,
+                    32503,
+                    crate::packets::send::misc::MESSAGE_TYPE_SYSTEM,
+                );
+                pkt.set_target_id(session_id);
+                client.send_bytes(pkt.to_bytes()).await;
+            }
+            self.end_command_event(handle).await;
+            return;
+        }
+
+        // Target resolution + the pmeteor `IsValidTarget` null arm
+        // (32511 "Target does not exist"). A dead target takes the same
+        // line — the lvl-1 kit is enemy-single-target only.
+        let target_id = param_target.unwrap_or(current_target);
+        let target_handle = if target_id != 0 && target_id != crate::actor::INVALID_ACTORID {
+            self.registry.get(target_id).await
+        } else {
+            None
+        };
+        let target_state = match &target_handle {
+            Some(t) => {
+                let c = t.character.read().await;
+                c.is_alive()
+                    .then_some((c.base.position_x, c.base.position_y, c.base.position_z))
+            }
+            None => None,
+        };
+        let Some((t_x, t_y, t_z)) = target_state else {
+            self.send_command_error_result(session_id, actor_id, command.id, 32511)
+                .await;
+            self.end_command_event(handle).await;
+            return;
+        };
+
+        // pmeteor `Player.WeaponSkill/Ability/Cast`: a busy state stack
+        // (mid-cast) rejects with the same wait-a-moment line, then
+        // `Player.CanUse` runs the ordered checklist (Player.cs:2809-2877).
+        let now_unix = common::utils::unix_timestamp() as u32;
+        let dist_xz = ((t_x - my_x).powi(2) + (t_z - my_z).powi(2)).sqrt();
+        let half_height = command.range_height as f32 / 2.0;
+        let error_text = if !can_change || recast_end > now_unix {
+            Some(32535) // "Please wait a moment and try again."
+        } else if dist_xz > command.range {
+            Some(32539) // "The target is too far away."
+        } else if dist_xz < command.min_range {
+            Some(32538) // "The target is too close."
+        } else if t_y - my_y > half_height {
+            Some(32540) // "The target is too far above you."
+        } else if my_y - t_y > half_height {
+            Some(32541) // "The target is too far below you."
+        } else if command.mp_cost as i32 > mp as i32 {
+            Some(32545) // "You do not have enough MP."
+        } else if command.tp_cost as i32 > tp as i32 {
+            Some(32546) // "You do not have enough TP."
+        } else {
+            None
+        };
+        if let Some(text_id) = error_text {
+            self.send_command_error_result(session_id, actor_id, command.id, text_id)
+                .await;
+            self.end_command_event(handle).await;
+            return;
+        }
+
+        // Engage-if-not (command-script line: `if not IsEngaged() then
+        // Engage(target)`) + the skill state push. Shared battle clock —
+        // the ticker drives completion in this domain (#28 S0.2).
+        let now_ms = crate::runtime::clock::server_now_ms();
+        let pushed = {
+            let mut c = handle.character.write().await;
+            if !c.ai_container.is_engaged() {
+                let delay = c.get_attack_delay_ms();
+                c.ai_container.internal_engage(target_id, now_ms, delay);
+                // Hate seed — same rationale as `apply_actor_engage`:
+                // without it a controller-less engage has no most-hated
+                // entry for downstream reads. (#28.)
+                c.hate.update_hate(target_id, 1);
+            }
+            let bc = command.to_battle_command();
+            match command.command_type {
+                t if t == crate::battle::CommandType::WEAPON_SKILL.bits() as i16 => {
+                    c.ai_container.internal_weapon_skill(target_id, bc, now_ms)
+                }
+                t if t == crate::battle::CommandType::ABILITY.bits() as i16 => {
+                    c.ai_container.internal_ability(target_id, bc, now_ms)
+                }
+                t if t == crate::battle::CommandType::SPELL.bits() as i16 => {
+                    c.ai_container.internal_cast(target_id, bc, now_ms)
+                }
+                other => {
+                    tracing::debug!(
+                        player = actor_id,
+                        command = command.id,
+                        command_type = other,
+                        "hotbar press for unroutable commandType — dropped",
+                    );
+                    false
+                }
+            }
+        };
+        if !pushed {
+            // State-push raced (stack filled between the gate read and
+            // the lock) — same feedback pmeteor gives.
+            self.send_command_error_result(session_id, actor_id, command.id, 32535)
+                .await;
+        }
+        tracing::debug!(
+            player = actor_id,
+            command = command.id,
+            command_type = command.command_type,
+            target = format!("0x{target_id:08X}"),
+            pushed,
+            "hotbar command dispatched",
+        );
+
+        self.end_command_event(handle).await;
+    }
+
+    /// Apply a client `SetTarget` (0x00CD). Port of pmeteor
+    /// `PacketProcessor.cs:173`:
+    ///
+    /// ```text
+    /// actor.currentTarget       = packet.actorID      (body[0..4])
+    /// actor.isAutoAttackEnabled = packet.attackTarget != 0xE0000000  (body[4..8])
+    /// broadcast SetActorTargetAnimated(actorID)
+    /// ```
+    ///
+    /// Garlemald previously only logged this opcode, so the player never
+    /// acquired a target and never auto-attacked. Because
+    /// `SimpleContent30010.lua::onUpdate` gates ally engagement on
+    /// `player:IsEngaged() and player.target`, that left the entire combat
+    /// tutorial inert — allies never stood in, mobs were never struck, and so
+    /// (with the wolf-retaliation path) never fought back. Recording the
+    /// target + pushing the player's `AttackState` is the keystone that drives
+    /// the whole loop: player swings → wolf takes damage → wolf gains hate →
+    /// wolf retaliates. (Garlemald-Server #28.)
+    async fn apply_player_set_target(
+        &self,
+        session_id: u32,
+        selected_target: u32,
+        auto_attack: bool,
+    ) {
+        let Some(handle) = self.registry.by_session(session_id).await else {
+            return;
+        };
+        let actor_id = handle.actor_id;
+
+        {
+            let mut c = handle.character.write().await;
+
+            // Record the soft target so `player.target` resolves and
+            // `Character::is_engaged()` reads correctly. INVALID_ACTORID is the
+            // canonical "no target" marker (pmeteor `Actor.INVALID_ACTORID`).
+            let cleared = selected_target == 0 || selected_target == Self::SET_TARGET_NONE;
+            c.chara.current_target = if cleared {
+                crate::actor::INVALID_ACTORID
+            } else {
+                selected_target
+            };
+
+            let valid_combat_target = auto_attack
+                && !cleared
+                && selected_target != actor_id
+                && selected_target != crate::actor::INVALID_ACTORID;
+
+            if valid_combat_target {
+                // Shared battle-clock anchor — same fix as
+                // `apply_actor_engage` (#28 S0.2): epoch ms here armed
+                // the player's swing clock past the ticker's domain.
+                let now_ms = crate::runtime::clock::server_now_ms();
+                let delay = c.get_attack_delay_ms();
+                let cur = c
+                    .ai_container
+                    .current_state()
+                    .map(|s| s.target_actor_id)
+                    .filter(|id| *id != 0);
+                // Re-engage only when switching targets — re-engaging the same
+                // target restarts the swing clock (same gate as
+                // `apply_actor_engage` / pmeteor `if (IsEngaged) return`).
+                if cur != Some(selected_target) {
+                    c.ai_container.clear_states();
+                    let started = c
+                        .ai_container
+                        .internal_engage(selected_target, now_ms, delay);
+                    tracing::debug!(
+                        player = format!("0x{actor_id:08X}"),
+                        target = format!("0x{selected_target:08X}"),
+                        delay,
+                        started,
+                        "player auto-attack engage (0x00CD)",
+                    );
+                }
+            } else if !auto_attack {
+                // Auto-attack toggled off (attackTarget == 0xE0000000) — stop
+                // swinging but keep the soft target so the reticle stays.
+                c.ai_container.clear_states();
+            }
+        }
+
+        // Broadcast the target reticle so nearby clients (and our own, for the
+        // animated draw) render who the player is locked onto. pmeteor sends
+        // SetActorTargetAnimated here. `0` on a clear leaves the reticle empty.
+        let bytes =
+            crate::packets::send::actor::build_set_actor_target_animated(actor_id, selected_target)
+                .to_bytes();
+        crate::runtime::dispatcher::send_to_self_if_player(
+            &self.registry,
+            &self.world,
+            actor_id,
+            bytes.clone(),
+        )
+        .await;
+        crate::runtime::dispatcher::broadcast_to_neighbours(
+            &self.world,
+            &self.registry,
+            actor_id,
+            bytes,
         )
         .await;
     }
@@ -7457,6 +8193,38 @@ impl PacketProcessor {
         };
         let actor_id = handle.actor_id;
 
+        // Resume a parked director coroutine waiting on the cinematic's
+        // `_WAIT_EVENT` yield (a `callClientFunction(...)` in the director's
+        // `onEventStarted`). The 1.x client posts `0x012E EventUpdate` when the
+        // cinematic finishes; pmeteor resumes the coroutine here (`Player.
+        // UpdateEvent` → `LuaEngine.OnEventUpdate` → `coroutine.Resume`), which
+        // runs the director's continuation — its own `player:EndEvent()`,
+        // `kickEventContinue`, the tutorial widgets, and crucially the steps
+        // that hand movement + the active-mode/F command back to the player.
+        // garlemald previously only faked the EndEvent via the event-session
+        // echo below and NEVER resumed the coroutine (the referenced
+        // `dispatch_event_updated` never existed), so the SEQ_005 director
+        // parked forever after the first cinematic → softlock (can't move, F
+        // inert). When a coroutine IS resumed it emits its own EndEvent, so we
+        // skip the event-session echo to avoid a double EndEvent.
+        // (Garlemald-Server #28.)
+        let resumed = self
+            .lua
+            .as_ref()
+            .and_then(|lua| lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new()))
+            .filter(|cmds| !cmds.is_empty());
+        if let Some(cmds) = resumed {
+            tracing::debug!(
+                player = actor_id,
+                commands = cmds.len(),
+                "EventUpdate resumed parked director coroutine",
+            );
+            Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
+            return Ok(());
+        }
+
+        // No parked coroutine — fall back to the event-session echo (the prior
+        // behaviour, kept for non-director EventUpdates).
         let mut outbox = EventOutbox::new();
         {
             let chara = handle.character.read().await;
@@ -7558,18 +8326,47 @@ impl PacketProcessor {
                 cmd = %line,
                 "gm command from chat",
             );
-            if let Some(cmd) = &self.cmd {
-                match cmd.run(&line).await {
+            // The sender is the implicit target for commands whose
+            // trailing `<name>` arg is omitted — Meteor's command
+            // scripts receive the invoking session's player the same
+            // way (`onTrigger(player, ...)`).
+            let invoker = {
+                let c = handle.character.read().await;
+                c.base.display_name().to_string()
+            };
+            let feedback = if let Some(cmd) = &self.cmd {
+                match cmd.run_as(&line, Some(&invoker)).await {
                     Ok(response) if !response.is_empty() => {
                         tracing::info!(%response, "command result");
+                        Some((ChatKind::System, response))
                     }
-                    Ok(_) => {}
+                    Ok(_) => None,
                     Err(e) => {
                         tracing::warn!(error = %e, "gm command failed");
+                        Some((ChatKind::SystemError, format!("command failed: {e}")))
                     }
                 }
             } else {
                 tracing::warn!("gm command requested via chat but CommandProcessor is not wired",);
+                Some((
+                    ChatKind::SystemError,
+                    "GM commands are unavailable on this map-server".to_string(),
+                ))
+            };
+            // Echo the result into the sender's chat log so failures
+            // are visible in-game instead of only in the server log.
+            // Meteor does the same via `player:SendMessage(MESSAGE_TYPE_
+            // SYSTEM_ERROR, ...)` from each command script.
+            if let Some((kind, message)) = feedback {
+                let mut ob = SocialOutbox::new();
+                ob.push(SocialEvent::ChatSystemToPlayer {
+                    target_actor_id: handle.actor_id,
+                    kind,
+                    message,
+                });
+                for e in ob.drain() {
+                    dispatch_social_event(&e, &self.registry, &self.world, &self.db).await;
+                }
             }
             return Ok(());
         }
@@ -8100,6 +8897,19 @@ pub(crate) fn build_player_snapshot_from_character(
         })
         .collect();
     snapshot.completed_quests = c.quest_journal.iter_completed().collect();
+
+    // Overlay live combat state so Lua content scripts see real engagement.
+    // pmeteor's `Character.IsEngaged()` delegates to `aiContainer.IsEngaged()`
+    // (an active AttackState), and `player.target` reads `currentTarget`. The
+    // login snapshot hard-codes both to inert defaults; without this overlay
+    // `SimpleContent30010.lua::onUpdate`'s `player:IsEngaged() and
+    // player.target` gate is permanently false and the allies never engage.
+    // (Garlemald-Server #28.)
+    snapshot.is_engaged = c.ai_container.is_engaged();
+    snapshot.target_actor_id = match c.chara.current_target {
+        0 | crate::actor::INVALID_ACTORID => 0,
+        id => id,
+    };
     snapshot
 }
 

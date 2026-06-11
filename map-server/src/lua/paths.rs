@@ -84,6 +84,13 @@ impl PathResolver {
             .join(format!("commands/gm/{}.lua", cmd.to_lowercase()))
     }
 
+    /// A client command static actor's script: `commands/<Name>.lua`
+    /// (case-preserving, matching pmeteor `LuaEngine.FILEPATH_COMMANDS`).
+    /// Used to dispatch e.g. `ActivateCommand`. (Garlemald-Server #28.)
+    pub fn command(&self, name: &str) -> PathBuf {
+        self.root.join(format!("commands/{name}.lua"))
+    }
+
     pub fn battle_command(&self, folder: &str, command: &str) -> PathBuf {
         self.root.join(format!("commands/{folder}/{command}.lua"))
     }

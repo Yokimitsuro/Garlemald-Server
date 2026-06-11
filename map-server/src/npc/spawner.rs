@@ -91,9 +91,21 @@ impl SpawnContext<'_> {
         // Snapshot the seed list + an initial actor-number counter. We
         // hold the zone's write lock only for grid inserts so the spawn
         // call itself (which needs other locks) doesn't deadlock.
+        //
+        // Root + private-area seeds both spawn here. The root-only
+        // `z.spawn_locations` clone this used to take left every
+        // private-area seed unmaterialised — the SEQ_010 quest NPCs
+        // (Farrimond/Cecilia/Swethyna/Tkebbe/Lonsygg + blockers, zone 155
+        // 'PrivateAreaMasterPast' level 1) never existed, so the man0g0
+        // post-tutorial warp landed in an empty Gridania (zone-in scan:
+        // count=0) and every SEQ_010 SetENpc broadcast was skipped.
+        // `spawn_one` routes each seed's grid insert into the private
+        // area's own core, so cross-level phases (level 1 vs the Man0g1
+        // level-2 townsfolk) stay mutually invisible. (Garlemald #28.)
         let (seeds, mut next_number) = {
             let z = zone_arc.read().await;
-            let seeds: Vec<SpawnLocation> = z.spawn_locations.clone();
+            let seeds: Vec<SpawnLocation> =
+                z.all_spawn_locations().map(|(_, _, s)| s.clone()).collect();
             let counter = z.core.actor_count() as u32 + 1;
             (seeds, counter)
         };
@@ -183,28 +195,53 @@ async fn spawn_one(
         (id, npc.character, ActorKindTag::Npc, ActorKind::Npc)
     };
 
-    // 2. Push a spatial projection into the zone.
-    {
+    // 2. Push a spatial projection into the zone. Private-area seeds
+    //    land in their area's own core (pmeteor's per-Area actor pool —
+    //    a player in 'PrivateAreaMasterPast' level 1 must not see the
+    //    level-2 townsfolk standing on the same map); everything else
+    //    goes into the zone root. `routed_area` records where the actor
+    //    actually landed so the registry handle's `private_area` tag
+    //    matches the spatial truth (a seed naming a missing area falls
+    //    back to root and must be tagged root).
+    let routed_area: Option<(String, u32)> = {
         let mut zone = zone_arc.write().await;
         let mut ob = crate::zone::outbox::AreaOutbox::new();
-        zone.core.add_actor(
-            StoredActor {
-                actor_id,
-                kind: grid_kind,
-                position: Vector3::new(seed.x, seed.y, seed.z),
-                grid: (0, 0),
-                is_alive: true,
-            },
-            &mut ob,
-        );
-    }
+        let stored = StoredActor {
+            actor_id,
+            kind: grid_kind,
+            position: Vector3::new(seed.x, seed.y, seed.z),
+            grid: (0, 0),
+            is_alive: true,
+        };
+        if seed.is_in_private_area() {
+            match zone.get_private_area_mut(&seed.private_area_name, seed.private_area_level) {
+                Some(pa) => {
+                    pa.core.add_actor(stored, &mut ob);
+                    Some((seed.private_area_name.clone(), seed.private_area_level))
+                }
+                None => {
+                    tracing::warn!(
+                        unique_id = %seed.unique_id,
+                        area = %seed.private_area_name,
+                        level = seed.private_area_level,
+                        "spawn seed names a missing private area; falling back to zone root",
+                    );
+                    zone.core.add_actor(stored, &mut ob);
+                    None
+                }
+            }
+        } else {
+            zone.core.add_actor(stored, &mut ob);
+            None
+        }
+    };
 
     // 3. Register the live Character in the ActorRegistry.
-    ctx.registry
-        .insert(ActorHandle::new(
-            actor_id, kind_tag, zone_id, /* session */ 0, character,
-        ))
-        .await;
+    let mut handle = ActorHandle::new(actor_id, kind_tag, zone_id, /* session */ 0, character);
+    if let Some((name, level)) = routed_area {
+        handle = handle.with_private_area(name, level);
+    }
+    ctx.registry.insert(handle).await;
     Some(actor_id)
 }
 

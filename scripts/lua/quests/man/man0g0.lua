@@ -166,22 +166,23 @@ end
 
 function seq000_onTalk(player, quest, npc, classId)
     local data = quest:GetData();
-    local emit_end_event = true;
     if (classId == YDA) then
         if (not data:GetFlag(FLAG_SEQ000_MINITUT0)) then -- If Talk tutorial
             callClientFunction(player, "delegateEvent", player, quest, "processTtrNomal003");
             data:SetFlag(FLAG_SEQ000_MINITUT0); -- Disable Yda's PushEvent and set up Papalymo
         elseif (data:GetFlag(FLAG_SEQ000_MINITUT1)) then -- If Talked to after Papalymo
             doContentArea(player, quest, npc); -- Set up Combat Tutorial
-            -- doContentArea fires KickEvent + DoZoneChangeContent. The
-            -- client will end talkDefault itself on the kick (and sends
-            -- IN 0x0131 to confirm). Pmeteor's reference capture
+            -- The talkDefault EndEvent below lands AFTER the content-warp
+            -- burst (the command drain is sequential), which matches
+            -- pmeteor: its capture shows OUT 0x0131 EndEvent("talkDefault")
+            -- near the end of the warp burst
             -- (captures/pmeteor-quest/20260426-160210-gridania-manual3/
-            -- map-packets.log line 31803) shows IN 0x0131 from client
-            -- with NO server reply — server-side OUT 0x0131 here on
-            -- top of the kick is redundant + confuses the client's
-            -- event state machine when it lands BEFORE the kick.
-            emit_end_event = false;
+            -- map-packets.log line 33544). An earlier revision suppressed
+            -- this EndEvent based on capture line 31803, which is actually
+            -- pmeteor's build-time DebugPrint of its own OUTBOUND EndEvent,
+            -- not an unanswered client 0x0131 — leaving the talk event
+            -- open is a byte-stream divergence from the working reference
+            -- and leaks a stale movement-lock count. (Garlemald-Server #28.)
         else
             callClientFunction(player, "delegateEvent", player, quest, "processEvent000_3");
         end
@@ -194,9 +195,7 @@ function seq000_onTalk(player, quest, npc, classId)
         end
     end
 
-    if emit_end_event then
-        player:EndEvent();
-    end
+    player:EndEvent();
 end
 
 function seq010_onTalk(player, quest, npc, classId)
