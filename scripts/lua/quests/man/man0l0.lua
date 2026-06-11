@@ -64,17 +64,27 @@ function onFinish(player, quest)
 end
 
 function onStateChange(player, quest, sequence)
-	if (sequence == SEQ_000) then		
+	if (sequence == SEQ_000) then
 		-- Setup states incase we loaded in.
 		local data = quest:GetData();
-		
-		local rostnsthalFlag = data:GetFlag(FLAG_SEQ000_MINITUT1) and QFLAG_NONE or QFLAG_TALK;
-		local vixenFlag = data:GetFlag(FLAG_SEQ000_MINITUT2) and QFLAG_NONE or QFLAG_TALK;
-		local babyfaceFlag = data:GetFlag(FLAG_SEQ000_MINITUT3) and QFLAG_NONE or QFLAG_TALK;
+
+		-- Retail beat order (Loremonger transcript + the client-side
+		-- Man0l0 tutorial chain): Rostnsthal first-talk (MINITUT0) →
+		-- journal widget (client-side, see seq000_onTalk) → Voluptuous
+		-- Vixen (MINITUT2) + Babyfaced Adventurer (MINITUT3) in either
+		-- order → Rostnsthal again for the sirens line
+		-- (processTtrMini001, MINITUT1) → exit door once all four
+		-- flags are set. Only the NPC(s) the player is currently
+		-- directed to carry a TALK marker, mirroring man0g0's
+		-- mutually-exclusive gating. (Garlemald-Server #25, defect 3 —
+		-- upstream lit Rostnsthal/Vixen/Babyfaced all at once.)
+		local rostnsthalFlag = ((not data:GetFlag(FLAG_SEQ000_MINITUT0)) or (data:GetFlag(FLAG_SEQ000_MINITUT2) and data:GetFlag(FLAG_SEQ000_MINITUT3) and (not data:GetFlag(FLAG_SEQ000_MINITUT1)))) and QFLAG_TALK or QFLAG_OFF;
+		local vixenFlag = (data:GetFlag(FLAG_SEQ000_MINITUT0) and (not data:GetFlag(FLAG_SEQ000_MINITUT2))) and QFLAG_TALK or QFLAG_OFF;
+		local babyfaceFlag = (data:GetFlag(FLAG_SEQ000_MINITUT0) and (not data:GetFlag(FLAG_SEQ000_MINITUT3))) and QFLAG_TALK or QFLAG_OFF;
 		local rostnsthalCanPush = not data:GetFlag(FLAG_SEQ000_MINITUT0);
 		local exitCanPush = data:GetFlags() == 0xF;
-		local exitFlag = data:GetFlags() == 0xF and QFLAG_PUSH or QFLAG_NONE;		
-		
+		local exitFlag = data:GetFlags() == 0xF and QFLAG_PUSH or QFLAG_OFF;
+
 		quest:SetENpc(WELLTRAVELED_MERCHANT);
 		quest:SetENpc(TIPSY_ADVENTURER);
 		quest:SetENpc(CULTIVATED_TENDER);
@@ -91,7 +101,6 @@ function onStateChange(player, quest, sequence)
 		quest:SetENpc(GRINNING_ADVENTURER);
 		quest:SetENpc(ROSTNSTHAL, rostnsthalFlag, true, rostnsthalCanPush);
 		quest:SetENpc(EXIT_TRIGGER, exitFlag, false, exitCanPush);
-		print(tostring(exitCanPush));
 	elseif (sequence == SEQ_005) then
 	elseif (sequence == SEQ_010) then		
 		quest:SetENpc(HOB, QFLAG_TALK);
@@ -103,7 +112,7 @@ function onStateChange(player, quest, sequence)
 		quest:SetENpc(WELLTRAVELED_MERCHANT);
 		quest:SetENpc(VOLUPTUOUS_VIXEN);
 		quest:SetENpc(LANKY_TRAVELER);
-		quest:SetENpc(PRIVAREA_PAST_EXIT, QFLAG_NONE, false, true);
+		quest:SetENpc(PRIVAREA_PAST_EXIT, QFLAG_OFF, false, true);
 	end
 end
 
@@ -199,9 +208,17 @@ function seq000_onTalk(player, quest, npc, classId)
 		callClientFunction(player, "delegateEvent", player, quest, "processEvent000_17");
 	elseif (classId == ROSTNSTHAL) then
 		-- Handle the talk tutorial after the push one.
+		--
+		-- The "look at your journal" tutorial beat (Garlemald-Server
+		-- #25, defect 2) needs no server call of its own: the client's
+		-- Man0l0.processTtrNomal003 ends with the talk-success toast
+		-- (9020), a 3s wait, then the journal tutorial widget — it
+		-- rides the tail of this first-talk event, exactly as in the
+		-- Project Meteor reference playthrough. Do not add a synthetic
+		-- processTtr* call for it.
 		if (not data:GetFlag(FLAG_SEQ000_MINITUT0)) then
 			callClientFunction(player, "delegateEvent", player, quest, "processTtrNomal003");
-			data:SetFlag(FLAG_SEQ000_MINITUT0);		
+			data:SetFlag(FLAG_SEQ000_MINITUT0);
 		else
 			callClientFunction(player, "delegateEvent", player, quest, "processTtrMini001");
 			if (not data:GetFlag(FLAG_SEQ000_MINITUT1)) then
@@ -245,12 +262,29 @@ end
 
 function getJournalMapMarkerList(player, quest)
 	local sequence = quest:getSequence();
-	
+	local data = quest:GetData();
+	local possibleMarkers = {};
+
+	-- Mirrors the onStateChange QFLAG gating above: only the NPC(s)
+	-- the player is currently directed to appear on the journal map.
 	if (sequence == SEQ_000) then
-		return MRKR_ROSTNSTHAL, MRKR_BABYFACED_ADVENTURER, MRKR_VOLUPTUOUS_VIXEN;
+		if ((not data:GetFlag(FLAG_SEQ000_MINITUT0)) or (data:GetFlag(FLAG_SEQ000_MINITUT2) and data:GetFlag(FLAG_SEQ000_MINITUT3) and (not data:GetFlag(FLAG_SEQ000_MINITUT1)))) then
+			table.insert(possibleMarkers, MRKR_ROSTNSTHAL);
+		end
+		if (data:GetFlag(FLAG_SEQ000_MINITUT0) and (not data:GetFlag(FLAG_SEQ000_MINITUT2))) then
+			table.insert(possibleMarkers, MRKR_VOLUPTUOUS_VIXEN);
+		end
+		if (data:GetFlag(FLAG_SEQ000_MINITUT0) and (not data:GetFlag(FLAG_SEQ000_MINITUT3))) then
+			table.insert(possibleMarkers, MRKR_BABYFACED_ADVENTURER);
+		end
+		if (data:GetFlags() == 0xF) then
+			table.insert(possibleMarkers, MRKR_TRIGGER_DOOR);
+		end
 	elseif (sequence == SEQ_010) then
-		return MRKR_HOB;
+		table.insert(possibleMarkers, MRKR_HOB);
 	end
+
+	return unpack(possibleMarkers);
 end
 
 function doExitDoor(player, quest, npc)

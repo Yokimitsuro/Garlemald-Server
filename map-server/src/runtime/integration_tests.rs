@@ -1971,6 +1971,133 @@ async fn ported_man0l0_onstart_emits_start_sequence_zero() {
 }
 
 #[tokio::test]
+async fn ported_man0l0_seq000_marker_gating_follows_retail_order() {
+    // Garlemald-Server #25 (defect 3): at SEQ_000 start only Rostnsthal
+    // may carry a TALK marker; the Voluptuous Vixen / Babyfaced
+    // Adventurer light up only once the first Rostnsthal talk
+    // (MINITUT0) has directed the player to them; Rostnsthal re-lights
+    // for the sirens talk only after both passenger talks (MINITUT2 +
+    // MINITUT3); the exit door's push trigger arms only at flags 0xF.
+    use crate::lua::command::{CommandQueue, LuaCommand};
+    use crate::lua::userdata::{LuaQuestHandle, PlayerSnapshot};
+    use crate::lua::{LuaEngine, QuestHookArg, QuestStateSnapshot};
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("scripts/lua");
+    let man0l0 = script_root.join("quests/man/man0l0.lua");
+    if !man0l0.exists() {
+        return; // trimmed artifact; skip
+    }
+    let engine = LuaEngine::new(&script_root);
+
+    const ROSTNSTHAL: u32 = 1_001_652;
+    const VIXEN: u32 = 1_000_447;
+    const BABYFACE: u32 = 1_000_442;
+    const EXIT_TRIGGER: u32 = 1_090_025;
+    const QFLAG_OFF: u8 = 0;
+    const QFLAG_TALK: u8 = 2;
+    const QFLAG_PUSH: u8 = 3;
+
+    let run = |hook: &str, flags: u32| {
+        let snapshot = PlayerSnapshot {
+            actor_id: 1,
+            active_quests: vec![110_001],
+            active_quest_states: vec![QuestStateSnapshot {
+                quest_id: 110_001,
+                sequence: 0,
+                flags,
+                counters: [0; 3],
+                npc_ls_from: 0,
+                npc_ls_msg_step: 0,
+            }],
+            ..Default::default()
+        };
+        let handle = LuaQuestHandle {
+            player_id: 1,
+            quest_id: 110_001,
+            has_quest: true,
+            sequence: 0,
+            flags,
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+            queue: CommandQueue::new(),
+        };
+        let args = if hook == "onStateChange" {
+            vec![QuestHookArg::Int(0)]
+        } else {
+            Vec::new()
+        };
+        let result = engine.call_quest_hook(&man0l0, hook, snapshot, handle, args);
+        assert!(
+            result.error.is_none(),
+            "man0l0:{hook}(flags={flags:#x}) errored: {:?}",
+            result.error
+        );
+        result.commands
+    };
+
+    let enpc = |commands: &[LuaCommand], class: u32| -> (u8, bool) {
+        commands
+            .iter()
+            .find_map(|c| match c {
+                LuaCommand::QuestSetEnpc {
+                    actor_class_id,
+                    quest_flag_type,
+                    is_push_enabled,
+                    ..
+                } if *actor_class_id == class => Some((*quest_flag_type, *is_push_enabled)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no QuestSetEnpc for actor class {class}"))
+    };
+
+    // Fresh start: only Rostnsthal lit, with his proximity push armed.
+    let cmds = run("onStateChange", 0x0);
+    assert_eq!(enpc(&cmds, ROSTNSTHAL), (QFLAG_TALK, true));
+    assert_eq!(enpc(&cmds, VIXEN).0, QFLAG_OFF);
+    assert_eq!(enpc(&cmds, BABYFACE).0, QFLAG_OFF);
+    assert_eq!(enpc(&cmds, EXIT_TRIGGER), (QFLAG_OFF, false));
+
+    // After the first Rostnsthal talk (MINITUT0): the player is sent to
+    // the two passengers; Rostnsthal goes dark and loses his push.
+    let cmds = run("onStateChange", 0x1);
+    assert_eq!(enpc(&cmds, ROSTNSTHAL), (QFLAG_OFF, false));
+    assert_eq!(enpc(&cmds, VIXEN).0, QFLAG_TALK);
+    assert_eq!(enpc(&cmds, BABYFACE).0, QFLAG_TALK);
+    assert_eq!(enpc(&cmds, EXIT_TRIGGER), (QFLAG_OFF, false));
+
+    // One passenger down (Vixen, MINITUT2): only Babyfaced stays lit.
+    let cmds = run("onStateChange", 0x5);
+    assert_eq!(enpc(&cmds, ROSTNSTHAL).0, QFLAG_OFF);
+    assert_eq!(enpc(&cmds, VIXEN).0, QFLAG_OFF);
+    assert_eq!(enpc(&cmds, BABYFACE).0, QFLAG_TALK);
+
+    // Both passengers done (MINITUT0+2+3): Rostnsthal re-lights for the
+    // sirens talk; the door is still gated.
+    let cmds = run("onStateChange", 0xD);
+    assert_eq!(enpc(&cmds, ROSTNSTHAL), (QFLAG_TALK, false));
+    assert_eq!(enpc(&cmds, VIXEN).0, QFLAG_OFF);
+    assert_eq!(enpc(&cmds, BABYFACE).0, QFLAG_OFF);
+    assert_eq!(enpc(&cmds, EXIT_TRIGGER), (QFLAG_OFF, false));
+
+    // All four beats done: everyone dark, exit door push armed.
+    let cmds = run("onStateChange", 0xF);
+    assert_eq!(enpc(&cmds, ROSTNSTHAL), (QFLAG_OFF, false));
+    assert_eq!(enpc(&cmds, EXIT_TRIGGER), (QFLAG_PUSH, true));
+
+    // The journal map-marker hook mirrors the same gating and must not
+    // error at any flag state (this also exercises the `unpack` 5.1
+    // compatibility shim in global.lua, since the engine's Lua 5.4 has
+    // no global `unpack`).
+    for flags in [0x0u32, 0x1, 0x5, 0xD, 0xF] {
+        run("getJournalMapMarkerList", flags);
+    }
+}
+
+#[tokio::test]
 async fn set_quest_complete_flips_bitstream_both_directions() {
     use crate::runtime::quest_apply::apply_set_quest_complete;
 

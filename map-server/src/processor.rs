@@ -653,14 +653,25 @@ impl PacketProcessor {
             // C# `WorldManager.DoZoneIn` ends with
             // `LuaEngine.CallLuaFunction(player, playerArea, "onZoneIn", true)`
             // — fired AFTER `SendZoneInPackets`, `SendInstanceUpdate`, and
-            // `LockUpdates(false)`. For the tutorial zone `ocn0Battle02`
-            // that hook re-kicks the opening director with
-            // `player:KickEvent(player:GetDirector(), "noticeEvent")`
-            // (no varargs). The packet from the first KickEvent inside
-            // the zone-in bundle is apparently not enough on its own —
-            // the client also needs this second KickEvent that arrives
-            // *after* it has finished ingesting the bundle. Missing this
-            // call is what leaves "Now Loading" on screen indefinitely.
+            // `LockUpdates(false)`. No shipped zone.lua currently defines
+            // an `onZoneIn` (the resolver's not-present branch below is
+            // the normal path), but the hook is kept for content parity
+            // with the C# pipeline.
+            //
+            // CAUTION (Garlemald-Server #25): do NOT re-add a
+            // `KickEvent(..., "noticeEvent")` to a zone.lua onZoneIn. The
+            // legacy `ocn0Battle02` zone.lua did exactly that, on the
+            // belief that the bundle kick alone left "Now Loading" up —
+            // a diagnosis that predates the director_actor_id +2 and
+            // playerWork.questScenario fixes which made the bundle kick
+            // land. With both kicks in place the Limsa client answered
+            // with TWO EventStarts, the second parked onNotice coroutine
+            // replaced the first, only one EndEvent went out, and the
+            // never-closed first event left the client input-locked (the
+            // SEQ_000 WASD softlock). Upstream's `quest_system` branch
+            // deleted that zone.lua too (pmeteor 26fd79be); the single
+            // bundle kick from player.lua onBeginLogin is sufficient,
+            // as Gridania/Ul'dah always demonstrated.
             let zone_name = match self.world.zone(zone).await {
                 Some(z) => z.read().await.core.zone_name.clone(),
                 None => String::new(),
