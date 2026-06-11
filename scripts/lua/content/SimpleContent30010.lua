@@ -6,6 +6,14 @@ require ("modifiers")
 require ("ally")
 
 function onCreate(starterPlayer, contentArea, director)
+	-- Reset the engagement latch: the engine caches ONE VM per script
+	-- path for the whole server process, so the top-level
+	-- `battleStarted = false` below runs only once — a second run of
+	-- this tutorial (new character, or re-entry after a disconnect)
+	-- would otherwise inherit battleStarted=true and let the allies
+	-- attack before processTtrBtl002's targeting tutorial returns.
+	-- (Found during the Limsa #25 port review.)
+	battleStarted = false;
 	--papalymo = contentArea:SpawnActor(2290005, "papalymo", 365.89, 4.0943, -706.72, -0.718);
 	--yda = contentArea:SpawnActor(2290006, "yda", 365.266, 4.122, -700.73, 1.5659);	
 
@@ -64,9 +72,10 @@ function onDestroy()
 
 end
 
--- #28 S2.5 — everyone fights once the player commits. Per-script VM
--- global: persists across onUpdate calls (each content area gets its
--- own VM, so the latch is naturally per-instance).
+-- #28 S2.5 — everyone fights once the player commits. Script-VM
+-- global: persists across onUpdate calls. The VM is process-cached
+-- per script path (NOT per content area), so onCreate re-arms it for
+-- each fresh run.
 battleStarted = false;
 
 function onUpdate(tick, area)

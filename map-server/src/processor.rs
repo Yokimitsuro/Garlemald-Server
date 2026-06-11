@@ -653,14 +653,25 @@ impl PacketProcessor {
             // C# `WorldManager.DoZoneIn` ends with
             // `LuaEngine.CallLuaFunction(player, playerArea, "onZoneIn", true)`
             // — fired AFTER `SendZoneInPackets`, `SendInstanceUpdate`, and
-            // `LockUpdates(false)`. For the tutorial zone `ocn0Battle02`
-            // that hook re-kicks the opening director with
-            // `player:KickEvent(player:GetDirector(), "noticeEvent")`
-            // (no varargs). The packet from the first KickEvent inside
-            // the zone-in bundle is apparently not enough on its own —
-            // the client also needs this second KickEvent that arrives
-            // *after* it has finished ingesting the bundle. Missing this
-            // call is what leaves "Now Loading" on screen indefinitely.
+            // `LockUpdates(false)`. No shipped zone.lua currently defines
+            // an `onZoneIn` (the resolver's not-present branch below is
+            // the normal path), but the hook is kept for content parity
+            // with the C# pipeline.
+            //
+            // CAUTION (Garlemald-Server #25): do NOT re-add a
+            // `KickEvent(..., "noticeEvent")` to a zone.lua onZoneIn. The
+            // legacy `ocn0Battle02` zone.lua did exactly that, on the
+            // belief that the bundle kick alone left "Now Loading" up —
+            // a diagnosis that predates the director_actor_id +2 and
+            // playerWork.questScenario fixes which made the bundle kick
+            // land. With both kicks in place the Limsa client answered
+            // with TWO EventStarts, the second parked onNotice coroutine
+            // replaced the first, only one EndEvent went out, and the
+            // never-closed first event left the client input-locked (the
+            // SEQ_000 WASD softlock). Upstream's `quest_system` branch
+            // deleted that zone.lua too (pmeteor 26fd79be); the single
+            // bundle kick from player.lua onBeginLogin is sufficient,
+            // as Gridania/Ul'dah always demonstrated.
             let zone_name = match self.world.zone(zone).await {
                 Some(z) => z.read().await.core.zone_name.clone(),
                 None => String::new(),
@@ -3281,9 +3292,7 @@ impl PacketProcessor {
                 //    the wire as 0x0130 / 0x0131. So the cinematic
                 //    body finally lands in the post-warp packet
                 //    stream.
-                if let Some(resumed) =
-                    lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
-                {
+                if let Some(resumed) = lua.fire_player_event_and_drain(player_id, &[]) {
                     let resumed_count = resumed.len();
                     if !resumed.is_empty() {
                         crate::runtime::quest_apply::apply_runtime_lua_commands(
@@ -7514,7 +7523,7 @@ impl PacketProcessor {
         // from the client's cinematic completion should resume *that*
         // coroutine, not start a fresh dispatch. Pmeteor's
         // `mSleepingOnPlayerEvent` check is the same gate.
-        let resumed = lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new());
+        let resumed = lua.fire_player_event_and_drain(actor_id, &[]);
         let commands = match resumed {
             Some(cmds) if !cmds.is_empty() => {
                 tracing::debug!(
@@ -8211,7 +8220,7 @@ impl PacketProcessor {
         let resumed = self
             .lua
             .as_ref()
-            .and_then(|lua| lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new()))
+            .and_then(|lua| lua.fire_player_event_and_drain(actor_id, &pkt.lua_params))
             .filter(|cmds| !cmds.is_empty());
         if let Some(cmds) = resumed {
             tracing::debug!(
@@ -8219,7 +8228,57 @@ impl PacketProcessor {
                 commands = cmds.len(),
                 "EventUpdate resumed parked director coroutine",
             );
-            Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
+            // A resumed QUEST-hook continuation can carry login-scoped
+            // command bursts the shared event-script drain silently drops:
+            //
+            // 1. The content-warp burst (CreateContentArea /
+            //    StartDirectorMain / SetLoginDirector / DoZoneChangeContent)
+            //    — man0l0's doExitDoor parks on the NewRectAsk RPC and emits
+            //    the whole burst when this EventUpdate resumes it. Only
+            //    `apply_login_lua_command` creates the content area, and its
+            //    KickEvent CAPTURE (emitted at the END of the content
+            //    zone-in bundle, after the director's spawn packet) is the
+            //    proven ordering; the shared drain's immediate KickEvent
+            //    dispatch would race the director spawn and the client would
+            //    silently drop the kick (decomp: KickClientOrderEventReceiver
+            //    drops kicks for unspawned owners).
+            //
+            // 2. The quest-handoff burst (CompleteQuest / AddQuest from
+            //    `player:ReplaceQuest`) — man0l0's Hob talk parks on the
+            //    processEvent020_9 choice RPC and hands off to Man0l1 on
+            //    resume. The runtime drain's AddQuest arm fires the new
+            //    quest's `onStart` with world=None, which LOGS AND DROPS the
+            //    hook's commands (Man0l1's StartSequence + the inn-warp
+            //    processEvent010 RPC never reached the client — the
+            //    black-screen-at-Hob softlock). The processor's
+            //    apply_add_quest drains `onStart` through
+            //    apply_login_lua_command, bridging the RPC to the wire and
+            //    parking the onStart coroutine for the next EventUpdate.
+            //
+            // Gridania never hits either case because its equivalents come
+            // out of hook FIRST slices (drained by fire_quest_event_hook via
+            // apply_login_lua_command); the Limsa opener is the first to
+            // emit them from resumed continuations (it parks on choice RPCs
+            // first). Director-coroutine continuations (the #28 mid-fight
+            // flows) never emit these commands and keep the shared drain,
+            // whose direct KickEvent dispatch `kickEventContinue` relies on.
+            // (Garlemald-Server #25.)
+            let is_login_scoped_burst = cmds.iter().any(|c| {
+                matches!(
+                    c,
+                    crate::lua::command::LuaCommand::CreateContentArea { .. }
+                        | crate::lua::command::LuaCommand::DoZoneChangeContent { .. }
+                        | crate::lua::command::LuaCommand::AddQuest { .. }
+                        | crate::lua::command::LuaCommand::CompleteQuest { .. }
+                )
+            });
+            if is_login_scoped_burst {
+                for cmd in cmds {
+                    Box::pin(self.apply_login_lua_command(&handle, cmd)).await;
+                }
+            } else {
+                Box::pin(self.apply_event_script_commands(&handle, cmds)).await;
+            }
             return Ok(());
         }
 

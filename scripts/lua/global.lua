@@ -4,6 +4,13 @@ Globals referenced in all of the lua scripts
 
 --]]
 
+-- Lua 5.1 compatibility: the upstream Meteor scripts target Lua 5.1,
+-- where `unpack` is a global; the vendored Lua 5.4 only provides
+-- `table.unpack`. 13 quest scripts (man0g0/man0l0/man0u0's
+-- getJournalMapMarkerList, etc.) plus CraftCommand.lua call the 5.1
+-- global; all of them require("global") before doing so.
+unpack = unpack or table.unpack;
+
 -- ACTOR STATES
 
 ACTORSTATE_PASSIVE = 0;
