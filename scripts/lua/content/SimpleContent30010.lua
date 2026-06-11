@@ -26,16 +26,17 @@ function onCreate(starterPlayer, contentArea, director)
     mob1:ChangeState(2);
     mob2:ChangeState(2);
     mob3:ChangeState(2);
-	-- Pmeteor's SimpleContent30010.lua does NOT add NPCs to the player's
-	-- party (only to the content director group via director:AddMember
-	-- below). Garlemald's variant previously called
-	-- `starterPlayer.currentParty:AddMember(papalymo.actorId)` +
-	-- `starterPlayer.currentParty:AddMember(yda.actorId)`, which fired
-	-- TWO extra OUT 0x017F GroupHeader/Begin/X08/End party trios pre-
-	-- kick (visible in the seq005-no-prewarp-spawns capture at lines
-	-- 6905..6953 + 6959..7007). Pmeteor's wire trace shows ZERO 0x017F
-	-- broadcasts in the SEQ_005 warp window — only the single 0x0183
-	-- content trio.
+	-- Party-add the allies (MeteorReborn SimpleContent30010.lua:17-18)
+	-- so the HUD roster renders Yda/Papalymo HP bars — the 1.x party
+	-- list reads the real party group (10001), and the content-group
+	-- 30006 roster alone never lit the bars in any live run (#28 issue:
+	-- "Yda and Papalymo's health should show in my Roster"). The
+	-- quest_system_mac variant omits these lines, but its tutorial also
+	-- never shows ally bars; MeteorReborn (Decimus's rescript) is the
+	-- canonical reference. ContentFinished clears the transient party
+	-- roster at teardown, so the party is solo again entering Gridania.
+	starterPlayer.currentParty:AddMember(papalymo.actorId);
+	starterPlayer.currentParty:AddMember(yda.actorId);
 	starterPlayer:SetMod(modifiersGlobal.MinimumHpLock, 1);
 	-- Allies are unkillable for the tutorial too (Modifier::MinimumHpLock
 	-- floor-1 clamp, actor/chara.rs): a dead Yda/Papalymo would otherwise

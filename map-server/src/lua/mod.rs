@@ -1023,6 +1023,26 @@ impl LuaEngine {
         PartialLuaCallResult { commands, error }
     }
 
+    /// Re-point the VM's queue-capturing globals (`GetWorldManager`,
+    /// `GetStaticActor`, …) at a parked coroutine's OWN queue before
+    /// resuming it. `load_script` installs a fresh queue on every call
+    /// into a cached VM, so any call that interleaves between a park and
+    /// its resume leaves the globals pushing into a queue nobody drains
+    /// — live proof: Man0g1's `onStart` parked on the opening cutscene,
+    /// `onStateChange` re-pointed the VM, and the resumed slice's
+    /// `GetWorldManager():DoZoneChange(...)` vanished while the
+    /// userdata-held `player:EndEvent()` (bound to the parked queue)
+    /// arrived — the endless post-Canopy "Now Loading". (#28.)
+    fn repoint_globals_for_resume(&self, parked: &ParkedCoroutine) {
+        if let Err(e) = install_globals(&parked.lua, parked.queue.clone(), self.catalogs.clone()) {
+            tracing::warn!(
+                owner = parked.owner_player_id,
+                error = %e,
+                "repoint_globals_for_resume failed — global-pushed commands may be lost",
+            );
+        }
+    }
+
     /// Drive the scheduler forward: resume any parked coroutine whose time
     /// has come. Callers invoke this once per game tick.
     ///
@@ -1049,6 +1069,7 @@ impl LuaEngine {
         for parked in due {
             let queue = parked.queue.clone();
             let owner = parked.owner_player_id;
+            self.repoint_globals_for_resume(&parked);
             let resume = parked.thread.resume::<MultiValue>(());
             // Drain whatever the resumed slice pushed into the
             // script's command queue — the directive classification
@@ -1109,6 +1130,7 @@ impl LuaEngine {
         let mut all_commands = Vec::new();
         for parked in due {
             let queue = parked.queue.clone();
+            self.repoint_globals_for_resume(&parked);
             let resume = parked.thread.resume::<MultiValue>(());
             all_commands.extend(CommandQueue::drain(&queue));
             match resume {
@@ -1175,6 +1197,7 @@ impl LuaEngine {
                 }
             })
         })?;
+        self.repoint_globals_for_resume(&parked);
         let resume_result = parked.thread.resume::<MultiValue>(args);
         let commands = CommandQueue::drain(&parked.queue);
         match resume_result {

@@ -77,6 +77,12 @@ pub const INN_REST_BONUS_CAP: i32 = 100;
 /// playtest value (Meteor's default is 60s).
 pub const BNPC_DEFAULT_RESPAWN_SECS: u32 = 30;
 
+/// Corpse linger time for one-shot (respawn-disabled) BattleNpcs — the
+/// SEQ_005 tutorial wolves. Long enough for the collapse animation +
+/// a beat, short enough that the field clears while the player is
+/// still nearby. pmeteor's DeathState despawn timer is 10s.
+pub const CORPSE_DESPAWN_SECS: u32 = 10;
+
 /// Per-actor death-state tick decision. Returned from the read-lock
 /// scan inside `tick_zone` so the follow-up write lock + dispatcher
 /// call happens after the read lock is released.
@@ -88,6 +94,9 @@ enum DeathTickAction {
     /// BattleNpc whose respawn timer has elapsed — snap back to
     /// spawn position + revive.
     Respawn,
+    /// One-shot (respawn-disabled) BattleNpc whose corpse-linger timer
+    /// elapsed — broadcast RemoveActor + drop from registry/grid.
+    Despawn,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -404,7 +413,21 @@ impl GameTicker {
             // scope, gated on `can_change_state()` — a Magic state on
             // top suppresses the step (pmeteor's HasMoved cast-interrupt
             // rule, satisfied without implementing interrupts).
-            let movement = {
+            //
+            // Corpses don't think and don't walk: a DEAD actor's
+            // controller could still hold a MoveTo from its final tick
+            // (live SEQ_005: a killed wolf glided away in its death
+            // pose) — skip the whole AI/movement pass while dead. The
+            // death-state housekeeping below owns dead actors.
+            let is_dead_actor = {
+                let chara = handle.character.read().await;
+                chara.base.current_main_state == crate::actor::MAIN_STATE_DEAD
+            };
+            let movement = if is_dead_actor {
+                let mut chara = handle.character.write().await;
+                chara.ai_container.pending_movement = None;
+                None
+            } else {
                 let zone_read = zone.read().await;
                 let mut chara = handle.character.write().await;
                 chara
@@ -524,6 +547,21 @@ impl GameTicker {
                                 .saturating_add(BNPC_DEFAULT_RESPAWN_SECS)
                     {
                         DeathTickAction::Respawn
+                    } else if !matches!(handle.kind, ActorKindTag::Player)
+                        && chara.chara.respawn_disabled
+                        && chara.chara.time_of_death_utc != 0
+                        && common::utils::unix_timestamp() as u32
+                            >= chara
+                                .chara
+                                .time_of_death_utc
+                                .saturating_add(CORPSE_DESPAWN_SECS)
+                    {
+                        // One-shot (respawn-disabled) BNpcs — the SEQ_005
+                        // tutorial wolves — fade their corpse instead of
+                        // respawning (pmeteor DeathState: despawn timer
+                        // after the collapse). Registry removal inside
+                        // the applier is the once-only latch. (#28.)
+                        DeathTickAction::Despawn
                     } else {
                         DeathTickAction::None
                     }
@@ -531,6 +569,15 @@ impl GameTicker {
             };
             match action {
                 DeathTickAction::None => {}
+                DeathTickAction::Despawn => {
+                    crate::runtime::quest_apply::apply_despawn_actor(
+                        zone_id,
+                        handle.actor_id,
+                        &self.registry,
+                        &self.world,
+                    )
+                    .await;
+                }
                 DeathTickAction::AutoRevive | DeathTickAction::Respawn => {
                     // For respawn, also snap back to the spawn
                     // position before reviving — matches Meteor's
@@ -1156,7 +1203,8 @@ mod tests {
     }
 
     /// #28 S0.5(b) — `respawn_disabled` corpses stay dead past
-    /// `BNPC_DEFAULT_RESPAWN_SECS`; without the flag the same corpse
+    /// `BNPC_DEFAULT_RESPAWN_SECS` (and despawn entirely once the
+    /// corpse-linger window elapses); without the flag the same corpse
     /// respawns. Also asserts the S0.2 domain choice: the death-tick
     /// compares wall-clock `unix_timestamp()` against the wall-clock
     /// `time_of_death_utc` apply_die stamps — never the ticker's
@@ -1166,7 +1214,11 @@ mod tests {
         let (ticker, _zone) = setup_one_zone_one_actor().await;
         let died_at = common::utils::unix_timestamp() as u32 - (BNPC_DEFAULT_RESPAWN_SECS + 1);
 
-        // Respawn-disabled corpse: still dead after the window.
+        // Respawn-disabled corpse: stays dead through the respawn
+        // window, then DESPAWNS once the corpse-linger window elapses
+        // (BNPC_DEFAULT_RESPAWN_SECS+1 > CORPSE_DESPAWN_SECS) — the
+        // registry entry is gone, never revived. (#28: tutorial wolves
+        // must fade after defeat.)
         {
             let handle = ticker.registry.get(1).await.unwrap();
             let mut c = handle.character.write().await;
@@ -1176,14 +1228,29 @@ mod tests {
             c.chara.respawn_disabled = true;
         }
         ticker.tick_once(0).await;
+        assert!(
+            ticker.registry.get(1).await.is_none(),
+            "respawn-disabled corpse must despawn after the linger window",
+        );
+
+        // Re-insert the same corpse shape for the respawn-path half.
         {
-            let handle = ticker.registry.get(1).await.unwrap();
-            let c = handle.character.read().await;
-            assert_eq!(
-                c.base.current_main_state,
-                crate::actor::MAIN_STATE_DEAD,
-                "respawn-disabled corpse must stay dead",
-            );
+            let mut c = crate::actor::Character::new(1);
+            c.base.current_main_state = crate::actor::MAIN_STATE_DEAD;
+            c.chara.hp = 0;
+            c.chara.max_hp = 100;
+            c.chara.time_of_death_utc = died_at;
+            c.chara.respawn_disabled = true;
+            ticker
+                .registry
+                .insert(crate::runtime::actor_registry::ActorHandle::new(
+                    1,
+                    crate::runtime::actor_registry::ActorKindTag::BattleNpc,
+                    100,
+                    0,
+                    c,
+                ))
+                .await;
         }
 
         // Same corpse with the flag cleared: the elapsed wall-clock

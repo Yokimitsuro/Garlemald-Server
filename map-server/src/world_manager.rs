@@ -619,14 +619,26 @@ fn push_npc_spawn(
 
     // BattleNpc `/npcWork/hate` tail is load-bearing — omitting it
     // for monster-path actors Wine-hard-crashes on zone-in (confirmed
-    // 2026-04-21). Hate type by archetype: real BattleNpcs and allies
-    // ship 1 (passive nameplate, matching the /_init value this tail
-    // used to contradict with a 0); the engage-time flip to 3 (claimed)
-    // and back rides the battle-event dispatcher. Populace-pipeline
-    // monsters keep the legacy 0 (no battle fields for the judge). See
-    // `build_npc_hate_type_packet` for the judge contract. (#28.)
+    // 2026-04-21). Hate type by archetype, pmeteor parity:
+    //   * hostile BattleNpc → 3 (ENGAGED_PARTY). pmeteor stomps 3
+    //     unconditionally at spawn (BattleNpc.cs:160) and its tutorial
+    //     renders mob HP gauges on this exact client. The wiki notes the
+    //     hateType evaluation is NOT retroactive — the judge reads it
+    //     when the nameplate is first built, so an engage-time flip
+    //     alone never lit the gauge (live 2026-06-11 run). The
+    //     2026-04-21 "hateType=3 crashes the judge" incident predated
+    //     the solo-party 0x017C group registration the judge's
+    //     `getPlayerParty():_getOccupancyGroup()` deref needs; that
+    //     trio ships in every zone-in bundle now.
+    //   * Ally → 1 (friendly passive).
+    //   * populace-pipeline monsters keep the legacy 0.
+    // See `build_npc_hate_type_packet` for the judge contract. (#28.)
     if is_monster || is_real_battle_npc {
-        let hate_type = if is_real_battle_npc { 1 } else { 0 };
+        let hate_type = match battle_kind {
+            Some(ActorKindTag::BattleNpc) => 3,
+            Some(ActorKindTag::Ally) => 1,
+            _ => 0,
+        };
         subpackets.push(tx::actor::build_npc_hate_type_packet(actor_id, hate_type));
     }
 }

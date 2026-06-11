@@ -90,22 +90,24 @@ function onEventStarted(player, actor, triggerName)
 	player:ChangeMusic(7);
 	player:ChangeState(0);                          -- sheathe → State trio (0x134+0x13C+0x139) flushes
 
+	-- Reopen the event context BEFORE delegating: the post-fight
+	-- noticeEvent ended after Btl002, so a bare delegate ships with
+	-- owner=0 and the client echo-drops it instantly (live 03:37:40Z:
+	-- 020_1 round-tripped in the same second, no cutscene, no item
+	-- dialog). The kick parks until the client EventStarts the
+	-- noticeEvent (owner=director), and the delegate then runs INSIDE
+	-- that open event — the exact working Btl001/Btl002 pattern.
+	-- (Garlemald-Server #28, issues 3/5.)
+	kickEventContinue(player, actor, "noticeEvent", "noticeEvent");
 	-- Fade-out + MAN0G020 + MAN0G030 + the client-side item dialog
 	-- (openPublicInformDialogWidget + worldMaster:notify(25117, 11000088
 	-- "Treant Vine") — decoded from the shipped Man0g0.lpb) + town mask;
 	-- ends with startFadeInCutSceneAfterWarp → EXPECTS the DoZoneChange
-	-- right after.
+	-- right after. The delegate parks until the WHOLE chain completes
+	-- client-side (Btl001 parity: its round trip is ~30s).
 	callClientFunction(player, "delegateEvent", player, man0g0Quest, "processEvent020_1");
-	-- Synchronization barrier (MeteorReborn :87): park on a fresh
-	-- noticeEvent kick that the client only answers AFTER its cinematic +
-	-- item-dialog chain completes. Without it, the live runs tore the
-	-- whole sequence down ~130ms after the delegate ack — the cutscenes
-	-- and the "You have obtained an item" beat never displayed before the
-	-- warp wiped the stage. (Garlemald-Server #28, issues 3/5.)
-	kickEventContinue(player, actor, "noticeEvent", "noticeEvent");
 	man0g0Quest:StartSequence(10);
 	player:EndEvent();
-	wait(2);                                        -- startFadeInCutSceneAfterWarp settle
 	player:GetZone():ContentFinished();             -- S1.3 binding + teardown applier
 	GetWorldManager():DoZoneChange(player, 155, "PrivateAreaMasterPast", 1, 15, 175.38, -1.21, -1156.51, -2.1);   -- S1.2 arm
 end

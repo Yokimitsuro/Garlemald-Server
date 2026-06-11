@@ -2573,9 +2573,14 @@ impl UserData for LuaPlayer {
                 let old_id = resolve(&old_q);
                 let new_id = resolve(&new_q);
                 if old_id != 0 {
+                    // pmeteor `Player.ReplaceQuest` COMPLETES the outgoing
+                    // quest (`oldQuestInstance.OnComplete()` + the
+                    // completed-quests journal bit + "<Quest> complete!"
+                    // toast) — abandoning it showed the player a quest
+                    // ABANDONED flow at the man0g0 → Man0g1 handoff.
                     push(
                         &this.queue,
-                        LuaCommand::AbandonQuest {
+                        LuaCommand::CompleteQuest {
                             player_id: this.snapshot.actor_id,
                             quest_id: old_id,
                         },

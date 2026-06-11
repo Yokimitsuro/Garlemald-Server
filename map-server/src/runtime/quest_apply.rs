@@ -1029,7 +1029,7 @@ async fn apply_send_data_packet(
 /// `zone:DespawnActor(actor_id)` — port of C# `Zone::DespawnActor`.
 /// Broadcasts `0x00CB RemoveActor` to nearby players and removes the
 /// actor from the registry. Used by cinematics and content cleanup.
-async fn apply_despawn_actor(
+pub(crate) async fn apply_despawn_actor(
     _zone_id: u32,
     actor_id: u32,
     registry: &ActorRegistry,
