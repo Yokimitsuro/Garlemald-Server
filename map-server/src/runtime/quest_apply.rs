@@ -4230,7 +4230,19 @@ pub async fn check_quest_proximity_pushes(
                 let dx = pos.0 - c.base.position_x;
                 let dz = pos.2 - c.base.position_z;
                 let dist_sq = dx * dx + dz * dz;
-                if dist_sq > trigger_radius_sq {
+                // Per-class circle radius from the parsed event
+                // conditions — the client arms its pushDefault circle
+                // with this exact value (the Carline Canopy exit is
+                // r=6.0), so a flat 3.0 server gate rejects pushes the
+                // client legitimately fired from 3-6y out. (#28, req 4.)
+                let class_radius_sq = c
+                    .base
+                    .event_conditions
+                    .push_circle
+                    .iter()
+                    .map(|pc| pc.radius * pc.radius)
+                    .fold(trigger_radius_sq, f32::max);
+                if dist_sq > class_radius_sq {
                     continue;
                 }
                 crate::lua::LuaNpcSpec {
@@ -4410,7 +4422,15 @@ pub async fn kick_quest_proximity_pushes(
                 let dx = pos.0 - c.base.position_x;
                 let dz = pos.2 - c.base.position_z;
                 let dist_sq = dx * dx + dz * dz;
-                if dist_sq > trigger_radius_sq {
+                // Per-class circle radius (see check_quest_proximity_pushes).
+                let class_radius_sq = c
+                    .base
+                    .event_conditions
+                    .push_circle
+                    .iter()
+                    .map(|pc| pc.radius * pc.radius)
+                    .fold(trigger_radius_sq, f32::max);
+                if dist_sq > class_radius_sq {
                     continue;
                 }
                 c.base.actor_id

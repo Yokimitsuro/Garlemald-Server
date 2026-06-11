@@ -43,16 +43,34 @@ function onEventStarted(player, actor, triggerName)
 		player:EndEvent();
 
 		-- ==== THE FIGHT ====  (free-running: S2 AI + S3 skills)
+		-- Milestone-gated tooltip chain (MeteorReborn QuestDirector
+		-- Man0g001.lua DoW branch, Decimus's rescript — the canonical
+		-- retail sequence). Signal sources are Rust-side
+		-- (`fire_content_signal`): "playerAttack" per player swing,
+		-- "tpOver1000" per accrual at/above 1000, "weaponskillUsed" on a
+		-- player weaponskill resolution. The old shape skipped straight
+		-- to battleComplete and dumped 9055+9065 together at the kill
+		-- gate — the user-visible "tooltips stop after Engaging" bug.
+		waitForSignal("playerAttack");
+		closeTutorialWidget(player);
+		showTutorialSuccessWidget(player, 9055);    -- "Well done! You have successfully executed a battle action."
+		openTutorialWidget(player, CONTROLLER_KEYBOARD, TUTORIAL_TP);
+		waitForSignal("tpOver1000");
+		player:SetMod(modifiersGlobal.MinimumTpLock, 1000);  -- can't dribble below the WS cost mid-lesson
+		closeTutorialWidget(player);
+		openTutorialWidget(player, CONTROLLER_KEYBOARD, TUTORIAL_WEAPONSKILLS);
+		waitForSignal("weaponskillUsed");
+		player:SetMod(modifiersGlobal.MinimumTpLock, 0);
+		closeTutorialWidget(player);
+		showTutorialSuccessWidget(player, 9065);    -- "Well done! You executed a weaponskill."
+
 		waitForSignal("battleComplete");            -- S4.1 fires when all 3 wolves are dead
 		-- Render-settle beat: the gate fires in the same call stack as the
-		-- third wolf's death broadcast, so without this the success widgets
-		-- land in the SAME drain/second as the death packets (live log
-		-- 12:18:19Z — widgets over still-standing wolves). Retail shows the
-		-- death animation plus a beat before the overlay. (#28.)
+		-- third wolf's death broadcast, so without this the defeat dialog
+		-- lands in the SAME drain/second as the death packets. Retail
+		-- shows the death animation plus a beat before the overlay. (#28.)
 		wait(3);
 		closeTutorialWidget(player);
-		showTutorialSuccessWidget(player, 9055);
-		showTutorialSuccessWidget(player, 9065);
 	elseif player:IsDiscipleOfMagic() then
 		callClientFunction(player, "delegateEvent", player, man0g0Quest, "processTtrBtlMagic001");
 		player:EndEvent();
@@ -72,14 +90,24 @@ function onEventStarted(player, actor, triggerName)
 	player:ChangeMusic(7);
 	player:ChangeState(0);                          -- sheathe → State trio (0x134+0x13C+0x139) flushes
 
-	-- Fade-out + MAN0G020 + MAN0G030 + town mask (f,f,f,t,t,3); ends with
-	-- startFadeInCutSceneAfterWarp → EXPECTS the DoZoneChange right after.
+	-- Fade-out + MAN0G020 + MAN0G030 + the client-side item dialog
+	-- (openPublicInformDialogWidget + worldMaster:notify(25117, 11000088
+	-- "Treant Vine") — decoded from the shipped Man0g0.lpb) + town mask;
+	-- ends with startFadeInCutSceneAfterWarp → EXPECTS the DoZoneChange
+	-- right after.
 	callClientFunction(player, "delegateEvent", player, man0g0Quest, "processEvent020_1");
+	-- Synchronization barrier (MeteorReborn :87): park on a fresh
+	-- noticeEvent kick that the client only answers AFTER its cinematic +
+	-- item-dialog chain completes. Without it, the live runs tore the
+	-- whole sequence down ~130ms after the delegate ack — the cutscenes
+	-- and the "You have obtained an item" beat never displayed before the
+	-- warp wiped the stage. (Garlemald-Server #28, issues 3/5.)
+	kickEventContinue(player, actor, "noticeEvent", "noticeEvent");
 	man0g0Quest:StartSequence(10);
 	player:EndEvent();
+	wait(2);                                        -- startFadeInCutSceneAfterWarp settle
 	player:GetZone():ContentFinished();             -- S1.3 binding + teardown applier
 	GetWorldManager():DoZoneChange(player, 155, "PrivateAreaMasterPast", 1, 15, 175.38, -1.21, -1156.51, -2.1);   -- S1.2 arm
-	player:EndEvent();
 end
 
 function onUpdate(deltaTime, area)

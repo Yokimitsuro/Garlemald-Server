@@ -1023,21 +1023,27 @@ pub fn build_npc_property_init(
 /// client routes it through its hate-state update path instead of the
 /// boot-property path.
 ///
-/// Sends `HATE_TYPE_NONE (0)` for passive monsters. Meteor's C# also
-/// *computes* 0 for passive NPCs (no engagement, no party), but then
-/// unconditionally overrides to `3` (HATE_TYPE_ENGAGED_PARTY) on
-/// `BattleNpc.cs:160` — a dev-time debug leftover. Honouring that
-/// hardcode made the 1.23b client's `DepictionJudge:judgeNameplate()`
-/// try to resolve the monster's `_getOccupancyGroup()` (which is only
-/// populated for claimed mobs engaged by a party); with the group nil
-/// the nameplate judge hit "attempt to compare number with nil" and
-/// tunneled 3 `Client Script ERROR` EventStarts back — surfacing in the
-/// client as three "An error has occurred" popups on zone-in. Sending 0
-/// routes the judge through the passive-nameplate branch, which doesn't
-/// dereference party state.
-pub fn build_npc_hate_type_packet(actor_id: u32) -> SubPacket {
+/// `hate_type` values (Meteor `NpcWork.cs` + the client's
+/// `DepictionJudge:judgeNameplate()` branches):
+///   0 = HATE_TYPE_NONE — passive nameplate, NO HP gauge.
+///   1 = passive default (populace) — friendly nameplate, no gauge.
+///   2 = HATE_TYPE_ENGAGED — aggro nameplate WITH the HP gauge; does
+///       not dereference party state.
+///   3 = HATE_TYPE_ENGAGED_PARTY — claimed-by-party colour, but the
+///       judge then resolves `getPlayerParty():_getOccupancyGroup()`,
+///       which is only populated by a 0x0187 Set Occupancy Group claim.
+///       Meteor hardcodes 3 unconditionally (`BattleNpc.cs:160`);
+///       honouring that without the 0x0187 made the judge hit "attempt
+///       to compare number with nil" → three "An error has occurred"
+///       popups on zone-in (observed 2026-04-21). Do not send 3 until
+///       the occupancy claim is wired.
+///
+/// The SEQ_005 live runs proved 0 also suppresses the enemy HP gauge
+/// entirely (wolves un-damageable-looking) — combat-capable hostiles
+/// want 2. (Garlemald-Server #28.)
+pub fn build_npc_hate_type_packet(actor_id: u32, hate_type: u8) -> SubPacket {
     let mut b = ActorPropertyPacketBuilder::new(actor_id, "npcWork/hate");
-    b.add_byte("npcWork.hateType", 0);
+    b.add_byte("npcWork.hateType", hate_type);
     let mut packets = b.done();
     packets.remove(0)
 }

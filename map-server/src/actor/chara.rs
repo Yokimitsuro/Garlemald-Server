@@ -117,7 +117,13 @@ impl Character {
     }
 
     pub fn add_tp(&mut self, delta: i32) {
-        let new_tp = (self.chara.tp as i32 + delta).clamp(0, MAX_TP as i32);
+        // `MinimumTpLock` floors the pool (pmeteor `Character.AddTP`:
+        // `addTp.Clamp((int)GetMod(Modifier.MinimumTpLock), 3000)`).
+        // The SEQ_005 tutorial sets it to 1000 between the TP tooltip
+        // and the weaponskill firing so the player can't dribble back
+        // below the WS cost mid-lesson.
+        let floor = (self.chara.mods.get(Modifier::MinimumTpLock) as i32).clamp(0, MAX_TP as i32);
+        let new_tp = (self.chara.tp as i32 + delta).clamp(floor, MAX_TP as i32);
         self.chara.tp = new_tp as u16;
     }
 

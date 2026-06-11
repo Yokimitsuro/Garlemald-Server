@@ -568,6 +568,22 @@ impl AIContainer {
                 }
             }
             ControllerDecision::ChangeTarget { target_actor_id } => {
+                // Write the retarget into the live state stack. Without
+                // this, `do_combat_tick`'s `most_hated != current_target`
+                // check (which sits AHEAD of the caster Cast gate)
+                // re-fired every tick forever — live SEQ_005 run: Papalymo
+                // emitted 569 ChangeTargets in one fight, spammed ~10
+                // identical 0x0195s/s, and never reached his Cast gate
+                // after the first hate divergence. (Garlemald-Server #28.)
+                if let Some(new_target) = target_actor_id {
+                    for s in self
+                        .states
+                        .iter_mut()
+                        .filter(|s| s.kind == BattleStateKind::Attack)
+                    {
+                        s.target_actor_id = new_target;
+                    }
+                }
                 outbox.push(BattleEvent::TargetChange {
                     owner_actor_id: owner_id,
                     new_target_actor_id: target_actor_id,

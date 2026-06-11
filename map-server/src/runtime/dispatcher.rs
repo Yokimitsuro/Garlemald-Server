@@ -208,6 +208,23 @@ pub async fn dispatch_battle_event(
                 zone,
             )
             .await;
+            // Hostile claim flip: `npcWork.hateType = 3` (ENGAGED_PARTY)
+            // turns on the overhead + target-HUD HP gauge and the
+            // claimed nameplate colour. pmeteor ships 3 unconditionally
+            // from spawn (BattleNpc.cs:160) and the judge tolerates the
+            // absent occupancy group as long as the solo-party 0x017C
+            // group is registered (it is, since the nameplate-crash fix).
+            // Allies/players skip — friendly nameplates stay passive.
+            let is_hostile_bnpc = matches!(
+                registry.get(*owner_actor_id).await.map(|h| h.kind),
+                Some(crate::runtime::actor_registry::ActorKindTag::BattleNpc)
+            );
+            if is_hostile_bnpc {
+                let sub = tx::actor::build_npc_hate_type_packet(*owner_actor_id, 3);
+                send_to_self_if_player(registry, world, *owner_actor_id, sub.to_bytes()).await;
+                broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
+                    .await;
+            }
         }
         BattleEvent::Disengage { owner_actor_id } => {
             tracing::debug!(owner = owner_actor_id, kind = ?event_tag(event), "battle event");
@@ -229,6 +246,15 @@ pub async fn dispatch_battle_event(
                 zone,
             )
             .await;
+            // Claim release — hateType back to passive 1 (gauge off).
+            if matches!(
+                registry.get(*owner_actor_id).await.map(|h| h.kind),
+                Some(crate::runtime::actor_registry::ActorKindTag::BattleNpc)
+            ) {
+                let sub = tx::actor::build_npc_hate_type_packet(*owner_actor_id, 1);
+                broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
+                    .await;
+            }
             // 0x00DE ResetHead — stop the mob's head from continuing
             // to track the player's last position. Captured retail
             // pairs this with the gem clear at disengage. Project
@@ -567,6 +593,24 @@ async fn resolve_auto_attack(
     } else {
         0
     };
+    // Tutorial milestone signals (pmeteor parity): "playerAttack" fires
+    // at the end of every player swing (hit or miss — Player.OnAttack);
+    // "tpOver1000" whenever an accrual leaves the player at/above 1000
+    // (Character.AddTP). Both no-op without an active content script.
+    if attacker_handle.is_player() {
+        fire_content_signal(attacker_actor_id, "playerAttack", registry, world, lua, db).await;
+        if attacker_tp_after >= 1000 {
+            fire_content_signal(attacker_actor_id, "tpOver1000", registry, world, lua, db).await;
+        }
+    }
+    // Defender-side accrual can also cross the threshold (the player
+    // taking wolf hits banks TP too — pmeteor OnDamageTaken → AddTP).
+    if defender_handle.is_player() {
+        let tp = defender_handle.character.read().await.chara.tp;
+        if tp >= 1000 {
+            fire_content_signal(defender_actor_id, "tpOver1000", registry, world, lua, db).await;
+        }
+    }
     // Combat-resolution log — before this line existed, the entire
     // damage pipeline was wire-only (zero log vocabulary for swings /
     // damage / TP), which is why the live SEQ_005 failures took a
@@ -844,6 +888,20 @@ async fn resolve_action(
             defender_hp = format!("{def_hp}/{def_max}"),
             "battle: action resolved",
         );
+    }
+
+    // Tutorial milestone signal: "weaponskillUsed" fires when a player's
+    // weaponskill resolves (pmeteor `WeaponSkillState.OnComplete`).
+    if attacker_handle.is_player() && command.command_type == CommandType::WEAPON_SKILL {
+        fire_content_signal(
+            attacker_actor_id,
+            "weaponskillUsed",
+            registry,
+            world,
+            lua,
+            db,
+        )
+        .await;
     }
 
     broadcast_results(
@@ -1882,6 +1940,51 @@ pub(crate) async fn die_if_defender_fell(
 /// the caller-side death-transition guards keep this single-fire per
 /// death; signal scoping per player is deferred (single-player server —
 /// `"battleComplete:" .. actorId` is the trivial multi-session upgrade).
+/// Fire a named scheduler signal through the event bridge for a player
+/// who owns an active content script — the tutorial-milestone twin of
+/// `check_content_battle_complete`'s battleComplete dispatch. pmeteor's
+/// emitters: `Player.OnAttack` → "playerAttack" (every swing),
+/// `Character.AddTP` → "tpOver1000" (every accrual past 1000),
+/// `WeaponSkillState.OnComplete` → "weaponskillUsed". Repeat fires with
+/// nothing parked are logged no-ops (waitForSignal de-registers), and
+/// the active-content gate keeps open-world combat off the scheduler.
+/// (Garlemald-Server #28, tutorial tooltip chain.)
+pub(crate) async fn fire_content_signal(
+    player_actor_id: u32,
+    signal: &str,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    lua: Option<&Arc<crate::lua::LuaEngine>>,
+    db: Option<&Arc<crate::database::Database>>,
+) {
+    let (Some(lua), Some(db)) = (lua, db) else {
+        return;
+    };
+    let Some(handle) = registry.get(player_actor_id).await else {
+        return;
+    };
+    if !handle.is_player() || handle.session_id == 0 {
+        return;
+    }
+    let Some(session) = world.session(handle.session_id).await else {
+        return;
+    };
+    if session.active_content_script.is_none() {
+        return;
+    }
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        vec![crate::lua::command::LuaCommand::SendSignal {
+            name: signal.into(),
+        }],
+        registry,
+        db,
+        world,
+        Some(lua),
+    )
+    .await;
+}
+
 pub(crate) async fn check_content_battle_complete(
     dead_actor_id: u32,
     registry: &ActorRegistry,

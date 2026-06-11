@@ -13571,8 +13571,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     .await;
 
     // Stage F — Btl002 returns (EventUpdate): EndEvent, then the
-    // director parks on the kill gate's signal. The fight is
-    // free-running from here.
+    // director parks on the milestone-tooltip chain's first signal.
     let cmds = lua
         .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
         .expect("parked on Btl002");
@@ -13588,9 +13587,54 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     assert_eq!(
         lua.scheduler().lock().unwrap().pending_signal_count(),
         1,
-        "director parked on battleComplete during the fight",
+        "director parked on playerAttack during the fight",
     );
     let _ = parse_all_subpackets(&mut rx);
+
+    // Stage F2 — the milestone tooltip chain (#28 issue 3, MeteorReborn
+    // parity): playerAttack → 9055 success + TP widget; tpOver1000 →
+    // MinimumTpLock + weaponskill widget; weaponskillUsed → 9065
+    // success. Each signal resumes the director through the same bridge
+    // the production emitters in resolve_auto_attack / resolve_action
+    // use, and re-parks it on the next gate.
+    for (signal, expect_widgets) in [
+        ("playerAttack", 3usize), // closeTutorialWidget + 9055 + open TP
+        ("tpOver1000", 2),        // closeTutorialWidget + open WS
+        ("weaponskillUsed", 2),   // closeTutorialWidget + 9065
+    ] {
+        crate::runtime::dispatcher::fire_content_signal(
+            player_id,
+            signal,
+            &registry,
+            &world,
+            Some(&lua),
+            Some(&db),
+        )
+        .await;
+        let subs = parse_all_subpackets(&mut rx);
+        let widget_count = subs
+            .iter()
+            .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA)
+            .count();
+        assert_eq!(
+            widget_count, expect_widgets,
+            "tooltip drain mismatch after signal {signal}",
+        );
+        assert_eq!(
+            lua.scheduler().lock().unwrap().pending_signal_count(),
+            1,
+            "director must re-park on the next gate after {signal}",
+        );
+    }
+    // The TP floor armed at tpOver1000 must release at weaponskillUsed.
+    {
+        let c = handle.character.read().await;
+        assert_eq!(
+            c.chara.mods.get(crate::actor::Modifier::MinimumTpLock),
+            0.0,
+            "MinimumTpLock released after the weaponskill milestone",
+        );
+    }
 
     // Stage G — the fight: three wolves die on the production death
     // path. The third death fires battleComplete in the death-path call
@@ -13674,12 +13718,15 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
         .filter(|s| s.game_message.opcode == crate::packets::opcodes::OP_GENERIC_DATA)
         .count();
     assert_eq!(
-        widget_count, 4,
-        "closeTutorialWidget + 9055 + 9065 successes + attention toast",
+        widget_count, 2,
+        "closeTutorialWidget + attention toast (successes moved into the milestone chain)",
     );
 
-    // Stage H — wait(2) elapses: ChangeMusic, ChangeState(0) trio, and
-    // processEvent020_1 drain in order; parked on the cutscene.
+    // Stage H — wait(2) elapses: ChangeMusic, ChangeState(0) trio,
+    // processEvent020_1, then the kickEventContinue barrier — the
+    // director parks on _WAIT_EVENT until the client answers the
+    // delegate (and later the kick) so the cinematic + item-dialog
+    // chain can't be torn down mid-display. (#28 issues 3/5.)
     tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
     let batches = lua.tick();
     assert_eq!(batches.len(), 1, "post-wait(2) drain; got {batches:?}");
@@ -13709,31 +13756,51 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
          got music={music} state={state} x00={x00} x01={x01} run_fn={run_fn}",
     );
 
-    // Stage I — processEvent020_1 returns (EventUpdate): the director's
-    // final batch in command order, then the teardown + warp effects.
+    // Stage I — processEvent020_1 returns (EventUpdate): the director
+    // emits the barrier kick and re-parks on _WAIT_EVENT.
     let cmds = lua
         .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
         .expect("parked on processEvent020_1");
+    crate::runtime::quest_apply::apply_event_script_commands(
+        &handle,
+        cmds,
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    let subs_kick = parse_all_subpackets(&mut rx);
+    assert!(
+        subs_kick
+            .iter()
+            .any(|s| s.game_message.opcode == crate::packets::opcodes::OP_KICK_EVENT),
+        "barrier kick must reach the wire after the cutscene returns",
+    );
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_event_count(),
+        1,
+        "director parked on the post-cutscene barrier kick",
+    );
+
+    // Stage I2 — the client answers the barrier kick (cinematic + item
+    // dialog complete): StartSequence(10) + EndEvent drain, then the
+    // director parks on the pre-warp wait(2).
+    let cmds = lua
+        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .expect("parked on the barrier kick");
     let kind_order: Vec<&'static str> = cmds
         .iter()
         .filter_map(|c| match c {
             LuaCommand::QuestStartSequence { sequence: 10, .. } => Some("start_sequence_10"),
             LuaCommand::EndEvent { .. } => Some("end_event"),
-            LuaCommand::ContentFinished { .. } => Some("content_finished"),
-            LuaCommand::DoZoneChange { zone_id: 155, .. } => Some("do_zone_change_155"),
             _ => None,
         })
         .collect();
     assert_eq!(
         kind_order,
-        vec![
-            "start_sequence_10",
-            "end_event",
-            "content_finished",
-            "do_zone_change_155",
-            "end_event",
-        ],
-        "the director tail must drain in plan order; got {cmds:?}",
+        vec!["start_sequence_10", "end_event"],
+        "post-barrier drain must StartSequence then EndEvent; got {cmds:?}",
     );
     crate::runtime::quest_apply::apply_event_script_commands(
         &handle,
@@ -13744,18 +13811,59 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
         Some(&lua),
     )
     .await;
+    assert_eq!(
+        lua.scheduler().lock().unwrap().pending_time_count(),
+        1,
+        "parked on the pre-warp wait(2)",
+    );
+    let subs_end = parse_all_subpackets(&mut rx);
+    assert!(
+        subs_end
+            .iter()
+            .any(|s| s.game_message.opcode == crate::packets::opcodes::OP_END_EVENT),
+        "EndEvent must precede the teardown stage",
+    );
 
-    // Wire order: EndEvent → teardown RemoveActors → warp wipe.
+    // Stage I3 — wait(2) elapses: ContentFinished teardown + the warp.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let batches = lua.tick();
+    assert_eq!(batches.len(), 1, "pre-warp drain; got {batches:?}");
+    for (owner, cmds) in batches {
+        assert_eq!(owner, player_id);
+        let kind_order: Vec<&'static str> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                LuaCommand::ContentFinished { .. } => Some("content_finished"),
+                LuaCommand::DoZoneChange { zone_id: 155, .. } => Some("do_zone_change_155"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kind_order,
+            vec!["content_finished", "do_zone_change_155"],
+            "teardown must precede the warp; got {cmds:?}",
+        );
+        crate::runtime::quest_apply::apply_event_script_commands(
+            &handle,
+            cmds,
+            &registry,
+            &db,
+            &world,
+            Some(&lua),
+        )
+        .await;
+    }
+
+    // Wire order within the teardown stage: despawns → warp wipe.
     let subs = parse_all_subpackets(&mut rx);
     let first_idx = |op: u16| subs.iter().position(|s| s.game_message.opcode == op);
-    let end_event = first_idx(crate::packets::opcodes::OP_END_EVENT).expect("EndEvent");
     let remove = first_idx(crate::packets::opcodes::OP_REMOVE_ACTOR).expect("teardown despawn");
     let wipe = first_idx(crate::packets::opcodes::OP_DELETE_ALL_ACTORS).expect("warp wipe");
     let e2 = first_idx(crate::packets::opcodes::OP_0XE2_PACKET).expect("0x00E2");
     assert!(
-        end_event < remove && remove < wipe && wipe < e2,
-        "order must be EndEvent → ContentFinished despawns → DoZoneChange wipe; \
-         got end={end_event} remove={remove} wipe={wipe} e2={e2}",
+        remove < wipe && wipe < e2,
+        "order must be ContentFinished despawns → DoZoneChange wipe; \
+         got remove={remove} wipe={wipe} e2={e2}",
     );
     for s in &subs {
         assert_ne!(
