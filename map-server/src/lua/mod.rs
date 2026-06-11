@@ -1167,8 +1167,9 @@ impl LuaEngine {
     }
 
     /// Notify the scheduler that `player_id` just received an event update.
-    pub fn fire_player_event(&self, player_id: u32, args: MultiValue) -> bool {
-        self.fire_player_event_and_drain(player_id, args).is_some()
+    pub fn fire_player_event(&self, player_id: u32, params: &[common::luaparam::LuaParam]) -> bool {
+        self.fire_player_event_and_drain(player_id, params)
+            .is_some()
     }
 
     /// Like [`Self::fire_player_event`] but returns the commands the
@@ -1176,6 +1177,19 @@ impl LuaEngine {
     /// the coroutine if it yielded again on a known directive. `None`
     /// means no coroutine was waiting; otherwise the (possibly empty)
     /// command list is returned.
+    ///
+    /// `params` is the wire-format LuaParams tail of the client's
+    /// `0x012E EventUpdate`. It becomes the resume values of the parked
+    /// `coroutine.yield("_WAIT_EVENT", ...)` — i.e. the RETURN VALUES of
+    /// the script's `callClientFunction(...)`. pmeteor does the same in
+    /// `LuaEngine.OnEventUpdate` (`coroutine.Resume(LuaUtils.
+    /// CreateLuaParamObjectList(args))`). Dropping them breaks every
+    /// script that reads a client choice — e.g. man0l0's exit door
+    /// (`processEventNewRectAsk` → `choice == 1`) silently took the
+    /// "no" branch because `choice` resumed as nil (Garlemald-Server
+    /// issue 25 follow-up). Conversion happens HERE, after the take,
+    /// because mlua Values must be created from the parked coroutine's
+    /// own VM (one VM per script path).
     ///
     /// Falls back to `player_id=0` if no coroutine is parked under the
     /// specific id — `coroutine.yield("_WAIT_EVENT", player)` from
@@ -1186,7 +1200,7 @@ impl LuaEngine {
     pub fn fire_player_event_and_drain(
         &self,
         player_id: u32,
-        args: MultiValue,
+        params: &[common::luaparam::LuaParam],
     ) -> Option<Vec<LuaCommand>> {
         let parked = self.scheduler.lock().ok().and_then(|mut s| {
             s.take_event(player_id).or_else(|| {
@@ -1198,6 +1212,21 @@ impl LuaEngine {
             })
         })?;
         self.repoint_globals_for_resume(&parked);
+        let mut args = MultiValue::new();
+        for p in params {
+            match lua_param_to_value(&parked.lua, p.clone()) {
+                Ok(v) => args.push_back(v),
+                Err(e) => {
+                    tracing::warn!(
+                        player = player_id,
+                        error = %e,
+                        param = ?p,
+                        "fire_player_event: lua_param conversion failed — resuming with nil"
+                    );
+                    args.push_back(Value::Nil);
+                }
+            }
+        }
         let resume_result = parked.thread.resume::<MultiValue>(args);
         let commands = CommandQueue::drain(&parked.queue);
         match resume_result {
@@ -2987,7 +3016,7 @@ mod tests {
         // Client finishes the cinematic -> EventUpdate resume. The
         // coroutine emits EndEvent then parks on the signal.
         let cmds = engine
-            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .fire_player_event_and_drain(42, &[])
             .expect("a coroutine should be parked on the player event");
         assert!(
             cmds.iter()
@@ -3030,7 +3059,7 @@ mod tests {
         // Client replies to the kick -> next resume runs
         // processTtrBtl002's RunEventFunction.
         let cmds = engine
-            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .fire_player_event_and_drain(42, &[])
             .expect("parked on the kick reply");
         assert!(
             cmds.iter()
@@ -3099,7 +3128,7 @@ mod tests {
 
         // Cinematic done.
         let cmds = engine
-            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .fire_player_event_and_drain(42, &[])
             .expect("parked on cinematic");
         assert!(
             cmds.iter()
@@ -3146,7 +3175,7 @@ mod tests {
         // processTtrBtl002's RunEventFunction, parked on the targeting
         // tutorial's return.
         let cmds = engine
-            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .fire_player_event_and_drain(42, &[])
             .expect("parked on the kick reply");
         assert!(
             cmds.iter()
@@ -3160,7 +3189,7 @@ mod tests {
         // free-running from here (full sequence covered end-to-end by
         // `s4_2_real_director_full_sequence_kill_gate_to_warp`).
         let cmds = engine
-            .fire_player_event_and_drain(42, mlua::MultiValue::new())
+            .fire_player_event_and_drain(42, &[])
             .expect("parked on Btl002");
         assert!(
             cmds.iter()

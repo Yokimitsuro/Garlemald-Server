@@ -918,8 +918,11 @@ async fn dispatch_event_updated_drain(
         return;
     };
     // Resume any parked `_WAIT_EVENT` coroutine; collect the commands
-    // it queued before yielding/returning.
-    let after = lua.fire_player_event_and_drain(player_actor_id, mlua::MultiValue::new());
+    // it queued before yielding/returning. The lua params are the
+    // client's `callClientFunction` return values (e.g. a dialog
+    // choice) — thread them through so the resumed coroutine sees
+    // them, matching `handle_event_update`'s primary resume path.
+    let after = lua.fire_player_event_and_drain(player_actor_id, lua_params);
     let Some(after) = after else {
         tracing::debug!(
             player = player_actor_id,
@@ -985,9 +988,9 @@ fn dispatch_event_updated(
         return;
     };
     // Resume any coroutine parked on `_WAIT_EVENT` for this player.
-    // The lua params carry the client's response; we feed them through
-    // as a MultiValue so the sleeping coroutine can inspect them.
-    let fired = lua.fire_player_event(player_actor_id, MultiValue::new());
+    // The lua params carry the client's response; thread them through
+    // so the sleeping coroutine's `callClientFunction` returns them.
+    let fired = lua.fire_player_event(player_actor_id, lua_params);
     tracing::debug!(
         player = player_actor_id,
         trigger = trigger_actor_id,

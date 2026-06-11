@@ -2098,6 +2098,131 @@ async fn ported_man0l0_seq000_marker_gating_follows_retail_order() {
 }
 
 #[tokio::test]
+async fn ported_man0l0_exit_door_yes_choice_advances_to_seq005() {
+    // Garlemald-Server #25 follow-up: answering "yes" at the exit-door
+    // `processEventNewRectAsk` dialog must take the `choice == 1`
+    // branch of `doExitDoor` (storm cutscene → StartSequence(SEQ_005)
+    // → content-area warp). The client returns the choice in the
+    // `0x012E EventUpdate` LuaParams tail (`[Int32(1)]` on the wire);
+    // `handle_event_update` must thread those params into the parked
+    // coroutine's resume — dropping them makes `callClientFunction`
+    // return nil and the door silently takes the "no" branch.
+    use crate::lua::command::{CommandQueue, LuaCommand};
+    use crate::lua::userdata::{LuaQuestHandle, PlayerSnapshot};
+    use crate::lua::{LuaEngine, LuaNpcSpec, QuestHookArg, QuestStateSnapshot};
+    use common::luaparam::LuaParam;
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("scripts/lua");
+    let man0l0 = script_root.join("quests/man/man0l0.lua");
+    if !man0l0.exists() {
+        return; // trimmed artifact; skip
+    }
+    let engine = LuaEngine::new(&script_root);
+
+    // Unique id so the shared scheduler can't collide with other tests.
+    const PLAYER_ID: u32 = 0x0250_4242;
+    const EXIT_TRIGGER: u32 = 1_090_025;
+
+    let make_player = || PlayerSnapshot {
+        actor_id: PLAYER_ID,
+        zone_id: 193,
+        active_quests: vec![110_001],
+        active_quest_states: vec![QuestStateSnapshot {
+            quest_id: 110_001,
+            sequence: 0,
+            flags: 0xF, // all four mini-tutorial beats done — door armed
+            counters: [0; 3],
+            npc_ls_from: 0,
+            npc_ls_msg_step: 0,
+        }],
+        ..Default::default()
+    };
+    let quest_handle = LuaQuestHandle {
+        player_id: PLAYER_ID,
+        quest_id: 110_001,
+        has_quest: true,
+        sequence: 0,
+        flags: 0xF,
+        counters: [0; 3],
+        npc_ls_from: 0,
+        npc_ls_msg_step: 0,
+        queue: CommandQueue::new(),
+    };
+    let door = QuestHookArg::Npc(LuaNpcSpec {
+        actor_id: 0x4608_0010,
+        name: "exit_door".to_string(),
+        class_name: "PopulaceStandard".to_string(),
+        class_path: "/Chara/Npc/Populace/PopulaceStandard".to_string(),
+        unique_id: "exit_door".to_string(),
+        zone_id: 193,
+        zone_name: "ocn0Battle02".to_string(),
+        state: 0,
+        pos: (0.0, 10.0, -18.0),
+        rotation: 0.0,
+        actor_class_id: EXIT_TRIGGER,
+        quest_graphic: 3,
+    });
+
+    let run_event_names = |cmds: &[LuaCommand]| -> Vec<String> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                LuaCommand::RunEventFunction { args, .. } => args.iter().find_map(|a| match a {
+                    crate::lua::command::LuaCommandArg::String(s) => Some(s.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            })
+            .collect()
+    };
+
+    // Stage A — door push: doExitDoor parks on the NewRectAsk dialog.
+    let result = engine.call_quest_hook(&man0l0, "onPush", make_player(), quest_handle, vec![door]);
+    assert!(result.error.is_none(), "onPush errored: {:?}", result.error);
+    assert!(
+        run_event_names(&result.commands)
+            .iter()
+            .any(|n| n == "processEventNewRectAsk"),
+        "door push must fire processEventNewRectAsk; got {:?}",
+        result.commands,
+    );
+
+    // Stage B — the client answers "yes": EventUpdate LuaParams [Int32(1)]
+    // resume the parked coroutine; the script must proceed to the storm
+    // cutscene (processEvent000_2), not the silent "no" EndEvent.
+    let cmds = engine
+        .fire_player_event_and_drain(PLAYER_ID, &[LuaParam::Int32(1)])
+        .expect("doExitDoor must be parked on the NewRectAsk reply");
+    assert!(
+        run_event_names(&cmds)
+            .iter()
+            .any(|n| n == "processEvent000_2"),
+        "choice=1 must advance to processEvent000_2; got {:?}",
+        cmds,
+    );
+
+    // Stage C — the cutscene RPC returns: EndEvent + StartSequence(5) +
+    // the content-area setup drain.
+    let cmds = engine
+        .fire_player_event_and_drain(PLAYER_ID, &[])
+        .expect("doExitDoor must be parked on the processEvent000_2 reply");
+    assert!(
+        cmds.iter().any(|c| matches!(
+            c,
+            LuaCommand::QuestStartSequence {
+                sequence: 5,
+                quest_id: 110_001,
+                ..
+            }
+        )),
+        "yes-branch must start SEQ_005; got {:?}",
+        cmds,
+    );
+}
+
+#[tokio::test]
 async fn set_quest_complete_flips_bitstream_both_directions() {
     use crate::runtime::quest_apply::apply_set_quest_complete;
 
@@ -13625,7 +13750,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     // Stage B — cinematic done (EventUpdate): EndEvent, parked on the
     // F-press signal.
     let cmds = lua
-        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .fire_player_event_and_drain(player_id, &[])
         .expect("parked on the cinematic");
     crate::runtime::quest_apply::apply_event_script_commands(
         &handle,
@@ -13680,7 +13805,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
 
     // Stage E — client answers the kick (EventStart): processTtrBtl002.
     let cmds = lua
-        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .fire_player_event_and_drain(player_id, &[])
         .expect("parked on the kick reply");
     assert!(
         cmds.iter()
@@ -13700,7 +13825,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     // Stage F — Btl002 returns (EventUpdate): EndEvent, then the
     // director parks on the milestone-tooltip chain's first signal.
     let cmds = lua
-        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .fire_player_event_and_drain(player_id, &[])
         .expect("parked on Btl002");
     crate::runtime::quest_apply::apply_event_script_commands(
         &handle,
@@ -13889,7 +14014,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     // the director re-parks until the client finishes the cinematic +
     // item-dialog chain.
     let cmds = lua
-        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .fire_player_event_and_drain(player_id, &[])
         .expect("parked on the reopen kick");
     assert!(
         cmds.iter()
@@ -13917,7 +14042,7 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
     // plan order and the warp fires immediately (the client sits in
     // startFadeInCutSceneAfterWarp expecting it).
     let cmds = lua
-        .fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+        .fire_player_event_and_drain(player_id, &[])
         .expect("parked on processEvent020_1");
     let kind_order: Vec<&'static str> = cmds
         .iter()

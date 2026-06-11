@@ -3292,9 +3292,7 @@ impl PacketProcessor {
                 //    the wire as 0x0130 / 0x0131. So the cinematic
                 //    body finally lands in the post-warp packet
                 //    stream.
-                if let Some(resumed) =
-                    lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
-                {
+                if let Some(resumed) = lua.fire_player_event_and_drain(player_id, &[]) {
                     let resumed_count = resumed.len();
                     if !resumed.is_empty() {
                         crate::runtime::quest_apply::apply_runtime_lua_commands(
@@ -7525,7 +7523,7 @@ impl PacketProcessor {
         // from the client's cinematic completion should resume *that*
         // coroutine, not start a fresh dispatch. Pmeteor's
         // `mSleepingOnPlayerEvent` check is the same gate.
-        let resumed = lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new());
+        let resumed = lua.fire_player_event_and_drain(actor_id, &[]);
         let commands = match resumed {
             Some(cmds) if !cmds.is_empty() => {
                 tracing::debug!(
@@ -8222,7 +8220,7 @@ impl PacketProcessor {
         let resumed = self
             .lua
             .as_ref()
-            .and_then(|lua| lua.fire_player_event_and_drain(actor_id, mlua::MultiValue::new()))
+            .and_then(|lua| lua.fire_player_event_and_drain(actor_id, &pkt.lua_params))
             .filter(|cmds| !cmds.is_empty());
         if let Some(cmds) = resumed {
             tracing::debug!(

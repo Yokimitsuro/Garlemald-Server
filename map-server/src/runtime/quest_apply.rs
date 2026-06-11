@@ -4661,7 +4661,7 @@ async fn fire_quest_npc_hook_via_command(
 
     // Auto-resume parked `_WAIT_EVENT` coroutine.
     let player_id = handle.actor_id;
-    if let Some(after) = lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+    if let Some(after) = lua.fire_player_event_and_drain(player_id, &[])
         && !after.is_empty()
     {
         let session_after = {
@@ -4850,7 +4850,7 @@ pub async fn fire_quest_on_talk_via_command(
     // it, `player:EndEvent()` after `callClientFunction` never runs and
     // the client stays in event-locked state.
     let player_id = handle.actor_id;
-    if let Some(after) = lua.fire_player_event_and_drain(player_id, mlua::MultiValue::new())
+    if let Some(after) = lua.fire_player_event_and_drain(player_id, &[])
         && !after.is_empty()
     {
         let session_after = {
