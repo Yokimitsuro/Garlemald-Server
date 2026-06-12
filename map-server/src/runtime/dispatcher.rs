@@ -224,6 +224,19 @@ pub async fn dispatch_battle_event(
                 send_to_self_if_player(registry, world, *owner_actor_id, sub.to_bytes()).await;
                 broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
                     .await;
+                // 0x0187 SetOccupancyGroup — retail pairs the hateType
+                // flip with a claim (clear → claim double, per
+                // `combat_skills.pcapng` records #1/#2): the client's
+                // `DepictionJudge` resolves
+                // `getPlayerParty():_getOccupancyGroup()` to fill the
+                // overhead/target HP gauge, and that group is ONLY
+                // populated by this packet — hateType=3 alone leaves
+                // the mob's gauge empty (#26 live run, the goobbue).
+                // v1 scope: content-area fights (the client knows the
+                // mob's group from the content trio); field mobs skip
+                // until MonsterParty group sync exists.
+                emit_occupancy_claim(*owner_actor_id, *target_actor_id, registry, world, true)
+                    .await;
             }
         }
         BattleEvent::Disengage { owner_actor_id } => {
@@ -254,6 +267,8 @@ pub async fn dispatch_battle_event(
                 let sub = tx::actor::build_npc_hate_type_packet(*owner_actor_id, 1);
                 broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
                     .await;
+                // 0x0187 claim release (player_group_id = 0).
+                emit_occupancy_claim(*owner_actor_id, 0, registry, world, false).await;
             }
             // 0x00DE ResetHead — stop the mob's head from continuing
             // to track the player's last position. Captured retail
@@ -2439,6 +2454,75 @@ pub async fn apply_home_point_revive(
         y: spawn.y,
         z: spawn.z,
     }
+}
+
+/// 0x0187 SetOccupancyGroup claim lifecycle for content-area mobs.
+/// `claim = true` emits the retail clear→claim double against the
+/// engaged player's solo-party group; `claim = false` emits a single
+/// clear. The claiming player resolves from `target_actor_id` when
+/// it's a Player; otherwise (the mob engaged an ally first) from the
+/// session with an active content script. Field mobs (no content
+/// session) emit nothing — the client doesn't know their group yet.
+async fn emit_occupancy_claim(
+    mob_actor_id: u32,
+    target_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    claim: bool,
+) {
+    // Resolve the claiming player.
+    let player = match registry.get(target_actor_id).await {
+        Some(h) if matches!(h.kind, crate::runtime::actor_registry::ActorKindTag::Player) => {
+            Some(h)
+        }
+        _ => {
+            let mut found = None;
+            for s in world.all_sessions().await {
+                if s.active_content_script.is_some()
+                    && let Some(h) = registry.by_session(s.id).await
+                {
+                    found = Some(h);
+                    break;
+                }
+            }
+            found
+        }
+    };
+    let Some(player) = player else {
+        return;
+    };
+    let Some(session) = world.session(player.session_id).await else {
+        return;
+    };
+    if session.active_content_script.is_none() {
+        return;
+    }
+    let Some(client) = world.client(player.session_id).await else {
+        return;
+    };
+    // Content group id is the fixed 0x3000…|1 counter the content trio
+    // registers (see `apply_do_zone_change_content`); the solo-party
+    // group id matches the 0x017C registration from the zone-in bundle.
+    const CONTENT_GROUP_ID: u64 = 0x3000_0000_0000_0001;
+    const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
+    let player_group = PARTY_SOLO_SELF_FLAG | player.actor_id as u64;
+    let emissions: &[u64] = if claim { &[0, player_group] } else { &[0] };
+    for &player_group_id in emissions {
+        let mut sub = crate::packets::send::groups::build_set_occupancy_group(
+            mob_actor_id,
+            CONTENT_GROUP_ID,
+            crate::packets::send::groups::SET_OCCUPANCY_GROUP_TYPE_SIMPLE_CONTENT,
+            player_group_id,
+        );
+        sub.set_target_id(player.session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+    tracing::debug!(
+        mob = format!("0x{mob_actor_id:08X}"),
+        player = player.actor_id,
+        claim,
+        "SetOccupancyGroup emitted",
+    );
 }
 
 /// The zone broadcaster excludes the source actor, so Players who die or

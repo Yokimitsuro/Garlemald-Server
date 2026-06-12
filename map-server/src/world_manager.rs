@@ -2052,7 +2052,32 @@ impl WorldManager {
                 is_online: true,
                 name: actor_name.clone(),
             };
-            let members = [self_member];
+            let mut members = vec![self_member];
+            // Transient tutorial party (the content scripts'
+            // `currentParty:AddMember(...)` allies). Without this, the
+            // content warp's zone-in replay re-registered the SOLO
+            // roster and wiped the ally HP bars the PartyAddMember trio
+            // had just lit — #26 live run: 3-member trio at
+            // 00:07:00.7, zone-in replay right after, party UI stayed
+            // solo. Names resolve from the live registry; despawned
+            // members drop out naturally.
+            for &mid in &session.transient_party_members {
+                let Some(h) = registry.get(mid).await else {
+                    continue;
+                };
+                let name = {
+                    let c = h.character.read().await;
+                    c.base.display_name().to_string()
+                };
+                members.push(tx::groups::GroupMember {
+                    actor_id: mid,
+                    localized_name: -1,
+                    unknown2: 0,
+                    flag1: false,
+                    is_online: true,
+                    name,
+                });
+            }
             let mut offset = 0usize;
             let group_pkts = vec![
                 tx::groups::build_group_header(
