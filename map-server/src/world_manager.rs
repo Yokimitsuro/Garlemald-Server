@@ -594,11 +594,26 @@ fn push_npc_spawn(
         battle_kind,
         Some(ActorKindTag::BattleNpc) | Some(ActorKindTag::Ally)
     );
-    let property_flags = if is_monster {
+    let mut property_flags = if is_monster {
         character.chara.property_flags & !(1u32 << 2)
     } else {
         character.chara.property_flags
     };
+    // Content-spawned battle actors (allies AND the content mob) get
+    // `charaWork.property[3] = 1` forced on. The decompiled
+    // `DepictionJudge:judgeNameplate` gates the content-member scroll
+    // icon (246) on `myContent:isMember(actor) AND
+    // actor:isPropertyEnabled(3)`, and the targeting slot 4 on the
+    // same bit — and the retail tutorial reference shows the scroll +
+    // HP bar on every content actor's nameplate. The pmeteor-inherited
+    // class data ships propertyFlags=23 (bit 3 OFF) for the tutorial
+    // NPCs while players carry it ON, which matched exactly which
+    // nameplates rendered decorated in the #26 live run (player: icon
+    // + bar; NPCs: bare). Scoped to the real-battle pipeline so field
+    // populace keeps its data-driven flags.
+    if is_real_battle_npc {
+        property_flags |= 1u32 << 3;
+    }
     let hp = character.chara.hp.max(0) as u16;
     let hp_max = character.chara.max_hp.max(0) as u16;
     let mp = character.chara.mp.max(0) as u16;

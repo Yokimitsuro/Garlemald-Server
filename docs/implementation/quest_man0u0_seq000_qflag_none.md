@@ -294,6 +294,25 @@ Per the retail reference screenshot, ally party rows render
 The nameplate HP-bar question (bars under content actors' names) may
 ride the same content-member state; retest will tell.
 
+## Round 9 — nameplate scroll + HP bar: `charaWork.property[3]` on content NPCs
+
+Live screenshot after Round 8: the party panel now renders
+(Niellefresne/Thancred rows with `???/???`, matching retail), both
+instance-entry chat lines show, and the PLAYER's own nameplate carries
+the content-member scroll icon + HP bar — but the three content NPCs'
+nameplates stay bare. The decomp explains the split:
+`DepictionJudge:judgeNameplate` gates the content-member icon (246)
+and the targeting slot on `actor:isPropertyEnabled(3)`, and our
+pmeteor-inherited class data ships `propertyFlags = 23` (bit 3 OFF)
+for 2203301/2290003/2290004 while players carry it ON — exactly which
+nameplates rendered decorated. (Meteor itself likely never showed
+these bars; from here the reference is the client decomp + the retail
+screenshot, not Meteor.)
+
+Fix: the spawn-bundle property init forces `property[3] = 1` for
+real-battle-pipeline actors (BattleNpc + Ally kinds — content spawns),
+leaving field populace data-driven.
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).
