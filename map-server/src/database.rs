@@ -597,6 +597,15 @@ impl Database {
                 // LEFT JOIN the MapObj layout-binding side table — Meteor
                 // `WorldManager.cs:341` does the same join so doors/gates
                 // carry their background-geometry ids into the spawn.
+                //
+                // actorClassId != 0: a class-less spawn row is a
+                // guaranteed client crash — the 1.23b client resolves
+                // every spawned actor's Lua class script on spawn
+                // (luaGameEngineRequire → LuaClass_resolveOrRegister →
+                // LpbLoader), gets null for class 0, and dies on a
+                // null-object getter at ffxivgame.exe+0x8EDD44 (five
+                // identical minidumps from the #26 SEQ_010 warp; the
+                // seed's 'mumpish_miqote' row shipped with class 0).
                 let mut stmt = c.prepare(
                     r"SELECT sl.actorClassId, sl.uniqueId, sl.zoneId,
                              sl.privateAreaName, sl.privateAreaLevel,
@@ -604,7 +613,8 @@ impl Database {
                              sl.actorState, sl.animationId,
                              mo.layoutId, mo.instanceId
                       FROM server_spawn_locations sl
-                      LEFT JOIN server_eventnpc_mapobj mo ON mo.id = sl.id",
+                      LEFT JOIN server_eventnpc_mapobj mo ON mo.id = sl.id
+                      WHERE sl.actorClassId != 0",
                 )?;
                 let rows: Vec<crate::zone::SpawnLocation> = stmt
                     .query_map([], |r| {

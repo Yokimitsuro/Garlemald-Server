@@ -1863,8 +1863,16 @@ INSERT OR IGNORE INTO "server_spawn_locations" ("id", "actorClassId", "uniqueId"
     ('941', '1000840', 'rururaji', '175', 'PrivateAreaMasterPast', '3', '-13.509', '196', '86.927', '-1.521', '0', '1017', null);
 INSERT OR IGNORE INTO "server_spawn_locations" ("id", "actorClassId", "uniqueId", "zoneId", "privateAreaName", "privateAreaLevel", "positionX", "positionY", "positionZ", "rotation", "actorState", "animationId", "customDisplayName") VALUES
     ('942', '1001112', 'long-legged_lady', '175', 'PrivateAreaMasterPast', '3', '4.308', '196', '116.764', '-1.226', '0', '0', null);
-INSERT OR IGNORE INTO "server_spawn_locations" ("id", "actorClassId", "uniqueId", "zoneId", "privateAreaName", "privateAreaLevel", "positionX", "positionY", "positionZ", "rotation", "actorState", "animationId", "customDisplayName") VALUES
-    ('943', '0', 'mumpish_miqote', '175', 'PrivateAreaMasterPast', '3', '-15.126', '196', '107.116', '1.308', '0', '0', null);
+-- Row 943 (mumpish_miqote) removed: it shipped with actorClassId = 0
+-- (no class), and a class-0 spawn in the SEQ_010 strip bundle is a
+-- guaranteed client crash — the 1.23b Lua engine resolves the actor's
+-- class script on spawn (luaGameEngineRequire → LuaClass_resolve →
+-- LpbLoader), gets null for class 0, and a null-object getter at
+-- ffxivgame.exe+0x8EDD44 takes the access violation (five identical
+-- minidumps, #26 post-tutorial warp). Upstream quest_system already
+-- marks the NPC dead: "MUMPISH_MIQOTE = 1000992; -- Unused on this
+-- client version" (man0u0.lua:44). The spawner also skips class-0
+-- rows defensively now.
 INSERT OR IGNORE INTO "server_spawn_locations" ("id", "actorClassId", "uniqueId", "zoneId", "privateAreaName", "privateAreaLevel", "positionX", "positionY", "positionZ", "rotation", "actorState", "animationId", "customDisplayName") VALUES
     ('944', '1000401', 'keen-eyed_merchant', '175', 'PrivateAreaMasterPast', '3', '-27.845', '196', '85.814', '1.511', '0', '0', null);
 INSERT OR IGNORE INTO "server_spawn_locations" ("id", "actorClassId", "uniqueId", "zoneId", "privateAreaName", "privateAreaLevel", "positionX", "positionY", "positionZ", "rotation", "actorState", "animationId", "customDisplayName") VALUES

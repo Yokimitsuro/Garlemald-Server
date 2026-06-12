@@ -313,6 +313,41 @@ Fix: the spawn-bundle property init forces `property[3] = 1` for
 real-battle-pipeline actors (BattleNpc + Ally kinds — content spawns),
 leaving field populace data-driven.
 
+## Round 10 — THE crash: a class-0 spawn row, found via minidump
+
+The post-tutorial crash survived every packet-level fix because it was
+never about the burst. Windows Error Reporting had the answer all
+along: five crashes across every build variation, ALL at the same
+faulting offset `ffxivgame.exe+0x8EDD44` (0xC0000005), with minidumps
+in `%LOCALAPPDATA%\CrashDumps`.
+
+Dump forensics (capstone over the research repo's `.bytes` export +
+stack walk against its symbol TSV):
+
+- The faulting EIP is a two-instruction getter: `mov eax,[esp+4];
+  mov eax,[eax+0x54]` — null object passed to a field accessor.
+- The crashed thread's stack walks through `lua_luaGameEngineLoad/
+  Require` → `LuaClass_resolveOrRegisterClassByName` →
+  `LpbLoader_resolveAndFetch` → the getter: the client was resolving a
+  spawned actor's Lua CLASS SCRIPT and the lookup returned null.
+- The zone-175 `PrivateAreaMasterPast` lvl-3 spawn set (the 15-NPC
+  fatal bundle) contains seed row 943: `mumpish_miqote` with
+  **actorClassId = 0** — no class, classPath NULL. Upstream
+  quest_system already knew the NPC is dead data: "MUMPISH_MIQOTE =
+  1000992; -- Unused on this client version" (man0u0.lua:44).
+
+So every SEQ_005→SEQ_010 warp shipped a class-0 actor spawn, and the
+client died resolving its class — instantly or a few seconds in,
+depending on load timing. The Round-6/7 packet-ordering work was
+chasing burst composition around a constant crash site (the rounds'
+pmeteor-parity outcomes stand on their own merits).
+
+Fix: seed row removed + the spawn-location loader filters
+`actorClassId != 0` (covers existing DBs, which only seed on first
+boot). Diagnostic recipe recorded: Event Viewer Application log 1000 →
+`%LOCALAPPDATA%\CrashDumps\*.dmp` → python `minidump` + capstone over
+`E:\meteor-reborn-research\ffxivgame.exe.bytes` + the symbol TSV.
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).
