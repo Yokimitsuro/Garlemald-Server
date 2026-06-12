@@ -208,36 +208,12 @@ pub async fn dispatch_battle_event(
                 zone,
             )
             .await;
-            // Hostile claim flip: `npcWork.hateType = 3` (ENGAGED_PARTY)
-            // turns on the overhead + target-HUD HP gauge and the
-            // claimed nameplate colour. pmeteor ships 3 unconditionally
-            // from spawn (BattleNpc.cs:160) and the judge tolerates the
-            // absent occupancy group as long as the solo-party 0x017C
-            // group is registered (it is, since the nameplate-crash fix).
-            // Allies/players skip — friendly nameplates stay passive.
-            let is_hostile_bnpc = matches!(
-                registry.get(*owner_actor_id).await.map(|h| h.kind),
-                Some(crate::runtime::actor_registry::ActorKindTag::BattleNpc)
-            );
-            if is_hostile_bnpc {
-                let sub = tx::actor::build_npc_hate_type_packet(*owner_actor_id, 3);
-                send_to_self_if_player(registry, world, *owner_actor_id, sub.to_bytes()).await;
-                broadcast_around_actor(world, registry, zone, *owner_actor_id, sub.to_bytes())
-                    .await;
-                // 0x0187 SetOccupancyGroup — retail pairs the hateType
-                // flip with a claim (clear → claim double, per
-                // `combat_skills.pcapng` records #1/#2): the client's
-                // `DepictionJudge` resolves
-                // `getPlayerParty():_getOccupancyGroup()` to fill the
-                // overhead/target HP gauge, and that group is ONLY
-                // populated by this packet — hateType=3 alone leaves
-                // the mob's gauge empty (#26 live run, the goobbue).
-                // v1 scope: content-area fights (the client knows the
-                // mob's group from the content trio); field mobs skip
-                // until MonsterParty group sync exists.
-                emit_occupancy_claim(*owner_actor_id, *target_actor_id, registry, world, true)
-                    .await;
-            }
+            // Hostile claim flip — `npcWork.hateType = 3` + the 0x0187
+            // occupancy claim (shared helper; the script-driven engage
+            // path in `quest_apply::apply_actor_engage` needs the same
+            // flip and the tutorial fight only ever runs through THAT
+            // path — see the helper's doc).
+            emit_hostile_claim_flip(*owner_actor_id, *target_actor_id, registry, world, zone).await;
         }
         BattleEvent::Disengage { owner_actor_id } => {
             tracing::debug!(owner = owner_actor_id, kind = ?event_tag(event), "battle event");
@@ -2456,6 +2432,45 @@ pub async fn apply_home_point_revive(
     }
 }
 
+/// Hostile-claim flip at engage time: `npcWork.hateType = 3`
+/// (ENGAGED_PARTY) + the 0x0187 occupancy claim. hateType=3 turns on
+/// the claimed nameplate colour, and the client's `DepictionJudge`
+/// then resolves `getPlayerParty():_getOccupancyGroup()` to fill the
+/// overhead/target HP gauge — that group is ONLY populated by the
+/// 0x0187 (clear → claim double, per `combat_skills.pcapng` records
+/// #1/#2), so hateType=3 alone leaves the gauge empty (#26 live run,
+/// the goobbue). Non-hostiles skip — friendly nameplates stay passive.
+///
+/// Shared by BOTH engage paths: the battle-AI `BattleEvent::Engage`
+/// arm AND `quest_apply::apply_actor_engage`. Script-driven engages
+/// (`allyGlobal.EngageTarget`, the content driver's mob engage) bypass
+/// the event bus entirely — the tutorial goobbue engages via
+/// LuaCommand, which is why its gauge never lit while this flip lived
+/// only on the AI arm (#26 retest 2026-06-12: zero `BattleEvent`
+/// engages in the whole fight, three `ActorEngage applied`).
+pub(crate) async fn emit_hostile_claim_flip(
+    owner_actor_id: u32,
+    target_actor_id: u32,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+    zone: &Arc<RwLock<Zone>>,
+) {
+    let is_hostile_bnpc = matches!(
+        registry.get(owner_actor_id).await.map(|h| h.kind),
+        Some(crate::runtime::actor_registry::ActorKindTag::BattleNpc)
+    );
+    if !is_hostile_bnpc {
+        return;
+    }
+    let sub = tx::actor::build_npc_hate_type_packet(owner_actor_id, 3);
+    send_to_self_if_player(registry, world, owner_actor_id, sub.to_bytes()).await;
+    broadcast_around_actor(world, registry, zone, owner_actor_id, sub.to_bytes()).await;
+    // v1 scope: content-area fights only (the client knows the mob's
+    // group from the content trio); field mobs no-op inside
+    // `emit_occupancy_claim` until MonsterParty group sync exists.
+    emit_occupancy_claim(owner_actor_id, target_actor_id, registry, world, true).await;
+}
+
 /// 0x0187 SetOccupancyGroup claim lifecycle for content-area mobs.
 /// `claim = true` emits the retail clear→claim double against the
 /// engaged player's solo-party group; `claim = false` emits a single
@@ -2508,10 +2523,15 @@ async fn emit_occupancy_claim(
     let player_group = PARTY_SOLO_SELF_FLAG | player.actor_id as u64;
     let emissions: &[u64] = if claim { &[0, player_group] } else { &[0] };
     for &player_group_id in emissions {
+        // group_type rides with `monster_group_id` and must match the
+        // type the content trio's GroupHeader registered client-side
+        // (24B = 30006) — the first cut sent 30012, the 64B type the
+        // Ifrit capture's clone groups happened to use, which leaves
+        // the claim unresolvable against the tutorial's group.
         let mut sub = crate::packets::send::groups::build_set_occupancy_group(
             mob_actor_id,
             CONTENT_GROUP_ID,
-            crate::packets::send::groups::SET_OCCUPANCY_GROUP_TYPE_SIMPLE_CONTENT,
+            crate::packets::send::groups::GROUP_TYPE_SIMPLE_CONTENT_24B,
             player_group_id,
         );
         sub.set_target_id(player.session_id);

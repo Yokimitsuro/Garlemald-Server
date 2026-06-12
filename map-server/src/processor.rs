@@ -3027,7 +3027,8 @@ impl PacketProcessor {
                 // (Group.cs:44) — the wrong type — and the 1.x client
                 // dispatched the group through the guildleve path instead of
                 // the content path.
-                const GROUP_TYPE_CONTENT_GROUP: u32 = 30006;
+                const GROUP_TYPE_CONTENT_GROUP: u32 =
+                    crate::packets::send::groups::GROUP_TYPE_SIMPLE_CONTENT_24B;
                 let mut offset = 0usize;
                 let pre_warp_subs = vec![
                     // SetActorProperty(charaWork.currentContentGroup =

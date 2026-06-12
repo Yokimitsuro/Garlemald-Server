@@ -686,6 +686,19 @@ async fn apply_actor_engage(
             &zone_arc,
         )
         .await;
+        // ... and the hostile-claim flip (hateType=3 + the 0x0187
+        // occupancy claim). The #26 tutorial goobbue engages through
+        // THIS path — the content driver's LuaCommand, never the
+        // BattleEvent bus — so without the flip here its HP gauge
+        // never lights. No-ops for allies (non-hostile kinds).
+        crate::runtime::dispatcher::emit_hostile_claim_flip(
+            actor_id,
+            target_actor_id,
+            registry,
+            world,
+            &zone_arc,
+        )
+        .await;
     }
 }
 
@@ -790,6 +803,74 @@ async fn apply_director_add_member(
     );
 }
 
+/// Emit the party GroupHeader / GroupMembersBegin / X08 / End trio for
+/// the leader's (transient) party to the leader's own client. Shared by
+/// `apply_party_add_member` (roster grows mid-content) and
+/// `apply_content_finished` (roster shrinks back to solo BEFORE the
+/// ally despawns — see the teardown-ordering note there). Mirrors the
+/// solo-party block in `world_manager.rs::send_zone_in_bundle`:
+/// group_index = SOLO_FLAG | leader_actor_id, GROUP_TYPE_PARTY=0x2711.
+async fn emit_party_trio(
+    leader_actor_id: u32,
+    session_id: u32,
+    zone_id: u32,
+    members: &[crate::packets::send::groups::GroupMember],
+    world: &WorldManager,
+) {
+    const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
+    const GROUP_TYPE_PARTY: u32 = 0x2711;
+    let group_index: u64 = PARTY_SOLO_SELF_FLAG | (leader_actor_id as u64);
+    let location_code = zone_id as u64;
+    let sequence_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    let mut offset = 0usize;
+    let pkts = vec![
+        crate::packets::send::groups::build_group_header(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            group_index,
+            GROUP_TYPE_PARTY,
+            -1,
+            "",
+            members.len() as u32,
+        ),
+        crate::packets::send::groups::build_group_members_begin(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            group_index,
+            members.len() as u32,
+        ),
+        crate::packets::send::groups::build_group_members_x08(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            members,
+            &mut offset,
+        ),
+        crate::packets::send::groups::build_group_members_end(
+            leader_actor_id,
+            location_code,
+            sequence_id,
+            group_index,
+        ),
+    ];
+    let Some(client) = world.client(session_id).await else {
+        tracing::debug!(
+            session = session_id,
+            "party trio emit skipped — client gone",
+        );
+        return;
+    };
+    for mut sub in pkts {
+        sub.set_target_id(session_id);
+        client.send_bytes(sub.to_bytes()).await;
+    }
+}
+
 /// `currentParty:AddMember(actor)` — appends `member_actor_id` to the
 /// leader's transient party roster (`session.transient_party_members`)
 /// and re-emits the GroupHeader / GroupMembersBegin / X08 / End trio to
@@ -867,63 +948,14 @@ async fn apply_party_add_member(
         });
     }
 
-    // Emit the trio. Mirrors the solo-party block in
-    // `world_manager.rs::send_zone_in_bundle` (lines ~1885-1942):
-    // group_index = SOLO_FLAG | leader_actor_id, GROUP_TYPE_PARTY=0x2711.
-    const PARTY_SOLO_SELF_FLAG: u64 = 0x8000_0000_0000_0000;
-    const GROUP_TYPE_PARTY: u32 = 0x2711;
-    let group_index: u64 = PARTY_SOLO_SELF_FLAG | (leader_actor_id as u64);
-    let location_code = leader_handle.zone_id as u64;
-    let sequence_id = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or_default();
-
-    let mut offset = 0usize;
-    let pkts = vec![
-        crate::packets::send::groups::build_group_header(
-            leader_actor_id,
-            location_code,
-            sequence_id,
-            group_index,
-            GROUP_TYPE_PARTY,
-            -1,
-            "",
-            members.len() as u32,
-        ),
-        crate::packets::send::groups::build_group_members_begin(
-            leader_actor_id,
-            location_code,
-            sequence_id,
-            group_index,
-            members.len() as u32,
-        ),
-        crate::packets::send::groups::build_group_members_x08(
-            leader_actor_id,
-            location_code,
-            sequence_id,
-            &members,
-            &mut offset,
-        ),
-        crate::packets::send::groups::build_group_members_end(
-            leader_actor_id,
-            location_code,
-            sequence_id,
-            group_index,
-        ),
-    ];
-
-    let Some(client) = world.client(session_id).await else {
-        tracing::debug!(
-            session = session_id,
-            "PartyAddMember: roster updated but client gone — wire emit skipped",
-        );
-        return;
-    };
-    for mut sub in pkts {
-        sub.set_target_id(session_id);
-        client.send_bytes(sub.to_bytes()).await;
-    }
+    emit_party_trio(
+        leader_actor_id,
+        session_id,
+        leader_handle.zone_id,
+        &members,
+        world,
+    )
+    .await;
 
     tracing::debug!(
         leader = format!("0x{leader_actor_id:08X}"),
@@ -1447,6 +1479,45 @@ pub(crate) async fn apply_content_finished(
     };
     let director_id = active.director_actor_id;
 
+    // Player handle resolved early — the party shrink below and the
+    // MinimumHpLock teardown (step 5) both need it.
+    let player_handle = registry.by_session(session_id).await;
+
+    // 2a. Party shrink back to solo FIRST, while the ally actors still
+    //     exist client-side. The despawns below, the warp's
+    //     DeleteAllActors and the next zone-in's solo party trio all
+    //     land in one client burst; when the first post-fight roster
+    //     arrived AFTER the deletes, the client's member diff ran
+    //     against actors it had already destroyed and the client
+    //     closed instantly at the SEQ_005→SEQ_010 warp (#26 retest
+    //     2026-06-12 — this 1.x client hard-crashes on group-packet
+    //     edge cases, cf. the "empty X08" note in `world_manager`).
+    //     Shrinking here makes the zone-in trio a 1→1 no-op.
+    if !snap.transient_party_members.is_empty()
+        && let Some(player) = player_handle.as_ref()
+    {
+        let name = {
+            let c = player.character.read().await;
+            c.base.display_name().to_string()
+        };
+        let self_member = crate::packets::send::groups::GroupMember {
+            actor_id: player.actor_id,
+            localized_name: -1,
+            unknown2: 0,
+            flag1: false,
+            is_online: true,
+            name,
+        };
+        emit_party_trio(
+            player.actor_id,
+            session_id,
+            player.zone_id,
+            &[self_member],
+            world,
+        )
+        .await;
+    }
+
     // 2. Despawn set: roster content-NPCs (never the player or the
     //    director) + the spawn appliers' recorded ids, deduped.
     let mut despawn: Vec<u32> = Vec::new();
@@ -1475,11 +1546,22 @@ pub(crate) async fn apply_content_finished(
     // 3 + 4. Roster + content-script clears.
     snap.transient_director_members.remove(&director_id);
     snap.transient_party_members.clear();
+    // pmeteor parity: the content director dies with its content area
+    // (`PrivateAreaContent.CheckDestroy` → `DeleteContentArea` once the
+    // player leaves) — the client never sees it again after the warp.
+    // `CreateDirector` parked it in `session.login_director` so the
+    // content warp's bundle could spawn it; left set, the NEXT zone-in
+    // (the SEQ_010 city warp) re-emits a QuestDirector spawn whose
+    // content group no longer exists, and the client-side director
+    // script initialises against a torn-down context.
+    if snap.login_director.as_ref().map(|d| d.actor_id) == Some(director_id) {
+        snap.login_director = None;
+    }
     snap.active_content_script = None;
     world.upsert_session(snap).await;
 
     // 5. Player teardown — MinimumHpLock off.
-    let player_id = match registry.by_session(session_id).await {
+    let player_id = match player_handle {
         Some(player) => {
             {
                 let mut c = player.character.write().await;

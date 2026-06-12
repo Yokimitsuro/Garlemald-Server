@@ -761,6 +761,14 @@ pub const SET_OCCUPANCY_GROUP_TYPE_MONSTER_PARTY: u32 = 10002;
 /// groups in 1.x).
 pub const SET_OCCUPANCY_GROUP_TYPE_SIMPLE_CONTENT: u32 = 30012;
 
+/// `ContentGroup_SimpleContentGroup24B` (C# Group.cs:49) — the group
+/// type the SEQ_005 tutorial content trio registers in its 0x017C
+/// GroupHeader (capture-verified vs the pmeteor Gridania reference,
+/// bytes [0x50..0x53] = 30006). The 0x0187 claim's `group_type` rides
+/// with `monster_group_id` and must carry the SAME type the client
+/// stored for that group, so both emission sites share this constant.
+pub const GROUP_TYPE_SIMPLE_CONTENT_24B: u32 = 30006;
+
 /// `unknown` field — wiki and retail captures agree this is always
 /// `0xFFFFFFFF`.
 pub const SET_OCCUPANCY_GROUP_UNKNOWN_CONST: u32 = 0xFFFF_FFFF;

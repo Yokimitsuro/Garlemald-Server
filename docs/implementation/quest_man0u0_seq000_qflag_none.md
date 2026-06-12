@@ -170,6 +170,53 @@ Branch rebased onto develop v0.1.5 (PR #35 + the Limsa #25 routing
 fixes — resumed-burst login-applier routing, EventUpdate LuaParams
 threading — all of which this flow rides).
 
+## Round 6 — instant crash at the SEQ_010 warp + dead-path HUD fixes
+
+Retest of the Round-5 HUD work (f923b28): ally names went blue (the
+zone-in roster fix landed) but the party list stayed empty, the goobbue
+gauge stayed empty, and the client now closed INSTANTLY at the
+post-battle warp (previously ~4 s after arriving in zone 175). Log
+forensics (`map.log`, the session ran without packet capture):
+
+1. **Enemy gauge — the claim sat on a dead path.** The whole tutorial
+   fight engages via `quest_apply::apply_actor_engage` (the content
+   driver's `ActorEngage` LuaCommands + the player's 0x00CD) — zero
+   `BattleEvent::Engage` dispatches in the entire session, so the
+   hateType=3 + 0x0187 emission added in f923b28 never fired. Extracted
+   `dispatcher::emit_hostile_claim_flip` and called it from BOTH engage
+   paths. Also fixed the claim's `group_type`: 30012 was the Ifrit
+   capture's 64B clone-group type; the tutorial trio registers
+   `SimpleContentGroup24B` = 30006, and the claim must carry the type
+   the client stored for `monster_group_id` (shared constant
+   `GROUP_TYPE_SIMPLE_CONTENT_24B` now used by trio + claim).
+
+2. **Instant crash — party shrink against deleted actors.** New fatal
+   burst at 06:50:36: EndEvent → RemoveActor ×3 → DeleteAllActors →
+   zone-in bundle whose solo party trio shrinks the roster 3→1. This
+   session was the FIRST in which the 3-member tutorial party survived
+   to the teardown (the f923b28 roster fix), so the client's group
+   member-diff ran against ally actors it had already destroyed —
+   uncharted territory for this client (pmeteor never party-adds NPCs)
+   and consistent with its known hard-crash on group-packet edge cases
+   (the "empty X08" note). `apply_content_finished` now emits the solo
+   trio BEFORE the despawns, while the allies still exist client-side,
+   making the zone-in trio a 1→1 no-op.
+
+3. **Ghost QuestDirector followed the player to the city.** The
+   zone-175 bundle logged `login director spawn packets appended …
+   QuestDirectorMan0u001` — `CreateDirector` parks the content director
+   in `session.login_director` and ContentFinished never cleared it, so
+   every later zone-in re-spawned a director whose content group is
+   gone. pmeteor deletes the director with the content area
+   (`PrivateAreaContent.CheckDestroy`). Cleared at teardown.
+
+Party-list rows for the allies remain unconfirmed — the 0x0187 claim
+(now actually firing) is the best remaining candidate, since the
+decompiled `getPlayerParty()` chain is what the client dereferences for
+content-party state. Next retest MUST run with packet capture
+(`scripts/run-all.sh` exports `GARLEMALD_PACKET_LOG_DIR` by default;
+the 06:46 session ran without it).
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).
