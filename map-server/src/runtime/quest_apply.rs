@@ -3891,6 +3891,7 @@ pub(crate) async fn apply_send_game_message(
 
 /// Used by the `LC::WarpToPosition` arm above — quest `onPush` bounce
 /// paths (`DoPlayerMoveInZone`) ride this.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_warp_to_position_runtime(
     actor_id: u32,
     x: f32,
