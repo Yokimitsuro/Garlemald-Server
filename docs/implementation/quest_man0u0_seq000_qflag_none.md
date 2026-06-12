@@ -217,6 +217,45 @@ content-party state. Next retest MUST run with packet capture
 (`scripts/run-all.sh` exports `GARLEMALD_PACKET_LOG_DIR` by default;
 the 06:46 session ran without it).
 
+## Round 7 — the teardown disarm WAS the instant crash; stopper dropped
+
+Retest of Round 6 (91605e1) WITH packet capture: the pre-despawn party
+shrink and the director clear both verified on the wire (solo trio at
+08:07:42.579 BEFORE the removes; zero director packets in the zone-175
+bundle) — and the client still closed instantly (zero IN packets after
+the burst). With those two eliminated, the one byte-level delta common
+to BOTH instant-death bursts (06:50:36.94x and 08:07:42.57x) versus the
+run that survived the load is the Round-5.5 disarm itself: the
+SetEventStatus disables (`0x0136` ×1 per ally + ×3 for the arena
+stopper) landing in the same burst as the EndEvent + RemoveActors.
+pmeteor's `Npc.Despawn` never emits disables.
+
+Fix, both halves pmeteor/twin-faithful:
+
+- `apply_despawn_actor` reverted to RemoveActor-only (the parity note
+  documents the two captured instant-crashes).
+- `SimpleContent30079.lua` no longer spawns the 1090385 arena stopper —
+  the ONLY circle-bearing prop in the content area, i.e. the source of
+  the original +4s ghost-"exit" crash the disarm was trying to fix.
+  Limsa's SimpleContent30002 (the upstream-tested twin) ships no
+  stopper; the engagement latch + arena geometry contain the fight.
+  (Gridania's 30010 still spawns 1090384 and on develop has no disarm —
+  it likely has the same latent +4s ghost crash after its battle;
+  flagged for upstream, out of #26's scope.)
+
+Also confirmed this round from the capture + retail reference shot:
+
+- The 0x0187 claim DID fire at engage (08:06:49, type 30006) — and the
+  goobbue gauge still didn't render, so the claim alone is not the
+  gauge/party-list activator. The retail screenshot shows ally rows
+  with `???/???` HP — the party widget renders rows from membership
+  alone, no HP values needed — and nameplate HP bars under ALL content
+  actors pre-engage, alongside "You have entered an instance. / You
+  are now bound by duty." chat lines. We already emit 34108 ("entered
+  an instance"); the "bound by duty" content-bind state is the missing
+  activator candidate — next probe is the 1.23b client decomp
+  (party-widget / DepictionJudge activation conditions).
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).
