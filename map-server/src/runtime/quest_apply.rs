@@ -869,6 +869,20 @@ async fn emit_party_trio(
         sub.set_target_id(session_id);
         client.send_bytes(sub.to_bytes()).await;
     }
+    // Repaint trigger: pair the trio with the partyGroupWork `/_init`
+    // work sync, like pmeteor's party flows (SendGroupPackets +
+    // SendInitWorkValues, World Party.cs). The decompiled
+    // `PartyGroupBaseClass:_onUpdateWork` repaints the desktop party
+    // panel only on the `_init` work event — the trio alone updates
+    // the group object silently, which is why the tutorial allies
+    // showed party-coloured names but no party-list rows (#26).
+    let mut init = crate::packets::send::groups::build_synch_group_work_values_party_init(
+        leader_actor_id,
+        group_index,
+        leader_actor_id,
+    );
+    init.set_target_id(session_id);
+    client.send_bytes(init.to_bytes()).await;
 }
 
 /// `currentParty:AddMember(actor)` — appends `member_actor_id` to the

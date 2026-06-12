@@ -7217,6 +7217,34 @@ impl PacketProcessor {
                 // gating below.
                 let high = (group_id >> 32) as u32;
                 if event_name == "/_init" {
+                    // Player-party group (0x8000…|leader_actor_id):
+                    // reply with the partyGroupWork `/_init` work sync.
+                    // pmeteor's WORLD server answers this one
+                    // (Party.SendInitWorkValues — the map-side
+                    // SendGroupInit only knows content/trade groups),
+                    // and the decompiled PartyGroupBaseClass repaints
+                    // the desktop party panel ONLY on this `_init`
+                    // work event — the member trio alone never does.
+                    // Without the reply the tutorial allies join the
+                    // roster (blue names) but the party list stays
+                    // empty (#26).
+                    if (high & 0xF000_0000) == 0x8000_0000 {
+                        let leader_actor_id = (group_id & 0xFFFF_FFFF) as u32;
+                        let mut sub =
+                            crate::packets::send::groups::build_synch_group_work_values_party_init(
+                                source,
+                                group_id,
+                                leader_actor_id,
+                            );
+                        sub.set_target_id(source);
+                        client.send_bytes(sub.to_bytes()).await;
+                        tracing::info!(
+                            source = source,
+                            group_id = format!("0x{:016X}", group_id),
+                            leader = format!("0x{:08X}", leader_actor_id),
+                            "RX 0x0133 → emitted partyGroupWork /_init reply",
+                        );
+                    }
                     let director_actor_id: Option<u32> = if high == 0 {
                         // Legacy format: low u32 IS the director id
                         Some((group_id & 0xFFFF_FFFF) as u32)

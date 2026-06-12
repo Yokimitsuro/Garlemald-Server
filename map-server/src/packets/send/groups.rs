@@ -554,6 +554,59 @@ pub fn build_synch_group_work_values_content_init(
     SubPacket::new(OP_SYNCH_GROUP_WORK_VALUES, source_actor_id, data)
 }
 
+/// 0x017A SynchGroupWorkValuesPacket — player-party `/_init` reply.
+///
+/// Mirrors pmeteor's WORLD-side `Party.SendInitWorkValues` (World
+/// Server/DataObjects/Group/Party.cs:245):
+/// ```csharp
+/// SynchGroupWorkValuesPacket groupWork = new SynchGroupWorkValuesPacket(groupIndex);
+/// groupWork.addProperty(this, "partyGroupWork._globalTemp.owner");
+/// groupWork.setTarget("/_init");
+/// ```
+/// where the owner field is `(leaderCharaId << 32) | 0xB36F92`
+/// (Party.cs:41 — the low magic is constant across leader changes).
+///
+/// Load-bearing for the party PANEL: the decompiled
+/// `PartyGroupBaseClass:_onUpdateWork` refreshes the desktop widget
+/// (`desktopWidget:processUpdateGroupInformation`) ONLY on
+/// `sub == "_init"` or a `leader` tag sync — the 0x017C/D/F/E member
+/// trio alone never repaints it. That is exactly the #26 symptom:
+/// ally names render party-coloured (DepictionJudge reads membership
+/// straight from the group object) while the party list stays empty
+/// (no `/_init` work event ever arrives for the 0x8000… group).
+pub fn build_synch_group_work_values_party_init(
+    source_actor_id: u32,
+    group_id: u64,
+    leader_actor_id: u32,
+) -> SubPacket {
+    /// Low-word constant pmeteor packs beside the leader id
+    /// (Party.cs:41). Purpose unknown; ships verbatim.
+    const PARTY_OWNER_LOW_MAGIC: u64 = 0xB3_6F92;
+    let mut data = body(0xB0);
+    let mut c = Cursor::new(&mut data[..]);
+    c.write_u64::<LittleEndian>(group_id).unwrap();
+    let mut running: u8 = 0;
+    c.set_position(9);
+    // Long property: partyGroupWork._globalTemp.owner. Same
+    // type=long(8) encoding rationale as the content-init builder
+    // above (addProperty dispatches u64 fields through addLong).
+    c.write_u8(8).unwrap();
+    c.write_u32::<LittleEndian>(common::utils::murmur_hash2(
+        "partyGroupWork._globalTemp.owner",
+        0,
+    ))
+    .unwrap();
+    c.write_u64::<LittleEndian>(((leader_actor_id as u64) << 32) | PARTY_OWNER_LOW_MAGIC)
+        .unwrap();
+    running += 13;
+    let target = b"/_init";
+    c.write_u8(0x82u8 + target.len() as u8).unwrap();
+    c.write_all(target).unwrap();
+    running += 1 + target.len() as u8;
+    data[8] = running;
+    SubPacket::new(OP_SYNCH_GROUP_WORK_VALUES, source_actor_id, data)
+}
+
 // ---------------------------------------------------------------------------
 // 0x018D PartyMapMarkerUpdate — party-member icon overlay on the world map.
 //

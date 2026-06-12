@@ -256,6 +256,44 @@ Also confirmed this round from the capture + retail reference shot:
   activator candidate — next probe is the 1.23b client decomp
   (party-widget / DepictionJudge activation conditions).
 
+## Round 8 — the party panel's missing repaint trigger (research-repo find)
+
+`E:\meteor-reborn-research` (the 1.23b client decomp corpus) settled
+the party-list question:
+
+- `docs/re/lua/finding_party_group_system.md` — the decompiled
+  `PartyGroupBaseClass:_onUpdateWork` repaints the desktop party panel
+  (`desktopWidget:processUpdateGroupInformation`) ONLY on a
+  `partyGroupWork` work-sync with `sub == "_init"` (or a `leader` tag
+  sync). The 0x017C/D/F/E member trio updates the group object
+  silently — membership-derived rendering (party-coloured nameplates)
+  works, the panel never repaints. Exactly the live symptom.
+- pmeteor confirms the missing packet: the WORLD server's
+  `Party.SendInitWorkValues` (World/DataObjects/Group/Party.cs:245)
+  answers the party group's `/_init` with a 0x017A carrying
+  `partyGroupWork._globalTemp.owner = (leader << 32) | 0xB36F92`.
+  Our map server answered `/_init` only for content groups; the
+  0x8000… party echo (logged at every character's first zone-in) got
+  no reply.
+
+Fix: `build_synch_group_work_values_party_init` (long-typed owner
+property, `/_init` target — same encoding rationale as the content
+variant), emitted from (a) the 0x0133 `/_init` reply for 0x8000…
+groups, (b) `emit_party_trio`'s tail (PartyAddMember + the teardown
+shrink), (c) the zone-in solo-party block (covers the content-warp
+replay where no fresh 0x0133 fires).
+
+Also this round: rebased onto upstream develop v0.1.6 — upstream
+merged PR #57 early (through 5f3e6a7, which still contains the
+Round-7-reverted disarm) and duplicated our clippy allow (0c9ba32),
+so the branch now carries only the three post-merge commits + this.
+
+Per the retail reference screenshot, ally party rows render
+`???/???` HP — membership alone drives the rows, no HP values needed
+— so this repaint trigger is the whole missing piece for the panel.
+The nameplate HP-bar question (bars under content actors' names) may
+ride the same content-member state; retest will tell.
+
 ## Next test with client
 
 1. Boot, create an Ul'dah character (Man0u0 active, SEQ_000).

@@ -2116,6 +2116,24 @@ impl WorldManager {
                 client.send_bytes(sub.to_bytes()).await;
             }
 
+            // partyGroupWork `/_init` work sync — the party-panel
+            // repaint trigger (decompiled PartyGroupBaseClass only
+            // repaints on the `_init` work event, never on the trio
+            // alone). pmeteor's WORLD server pairs this with the
+            // group packets (Party.SendInitWorkValues); the client
+            // also re-requests it via 0x0133 group-created, which the
+            // processor answers — this in-bundle copy covers zone-ins
+            // where the client-side group already exists and no fresh
+            // 0x0133 fires (e.g. the content warp replay that first
+            // carries the tutorial allies, #26).
+            let mut init = tx::groups::build_synch_group_work_values_party_init(
+                actor_id,
+                group_index,
+                actor_id,
+            );
+            init.set_target_id(session_id);
+            client.send_bytes(init.to_bytes()).await;
+
             // 0x018D PartyMapMarkerUpdate — the "where is each party
             // member on the world map" overlay. Retail emits this on
             // a periodic interval (see wiki note); for now we send a
