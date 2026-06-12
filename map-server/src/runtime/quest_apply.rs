@@ -1078,6 +1078,37 @@ pub(crate) async fn apply_despawn_actor(
     let Some(zone_arc) = world.zone(zone).await else {
         return;
     };
+    // Disarm the actor's event-condition triggers BEFORE the remove.
+    // The 1.23b client does NOT clear armed push circles when an actor
+    // is deleted — live-confirmed in the Ul'dah opener teardown (#26):
+    // the arena fence's outwards "exit" circle (radius 40) survived the
+    // stopper's RemoveActor, fired against the ghost when the SEQ_010
+    // warp repositioned the player >40y away, and the orphan event
+    // exchange (client EventStart vs our EndEvent echoes, mid
+    // zone-change) hard-crashed the client ~3 s into the warp.
+    let conditions = {
+        let c = handle.character.read().await;
+        c.base.event_conditions.clone()
+    };
+    if !conditions.is_empty() {
+        for sub in crate::packets::send::build_actor_event_status_packets(
+            actor_id,
+            &conditions,
+            false,
+            false,
+            Some(false),
+            false,
+        ) {
+            crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                &zone_arc,
+                actor_id,
+                sub.to_bytes(),
+            )
+            .await;
+        }
+    }
     let sub = crate::packets::send::actor::build_remove_actor(actor_id);
     let recipients = crate::runtime::broadcast::broadcast_around_actor(
         world,
