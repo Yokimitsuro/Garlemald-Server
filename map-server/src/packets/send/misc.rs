@@ -144,6 +144,30 @@ pub fn build_game_message_with_actors(
     SubPacket::new(opcode, source_actor_id, body)
 }
 
+/// 0x0157 GameMessage "with actor ×1", param-less tier — the exact
+/// Meteor `GameMessagePacket.BuildPacket(sourceActorId, actorId,
+/// textOwnerActorId, textId, log)` shape (PACKET_SIZE 0x30 → 0x10
+/// body): `u32 actorId` + `u32 textOwnerActorId` + `u16 textId` +
+/// `u16 log`. Used by `player:SendGameMessage(...)` — e.g. the opening
+/// stoppers' 34109 "off limits" caution line. The client resolves
+/// `textId` against `textOwnerActorId`'s text sheet (WorldMaster for
+/// system lines).
+pub fn build_game_message_actor1(
+    source_actor_id: u32,
+    actor_id: u32,
+    text_owner_actor_id: u32,
+    text_id: u16,
+    log: u8,
+) -> SubPacket {
+    let mut data = body(0x30);
+    let mut c = Cursor::new(&mut data[..]);
+    c.write_u32::<LittleEndian>(actor_id).unwrap();
+    c.write_u32::<LittleEndian>(text_owner_actor_id).unwrap();
+    c.write_u16::<LittleEndian>(text_id).unwrap();
+    c.write_u16::<LittleEndian>(log as u16).unwrap();
+    SubPacket::new(OP_GAME_MESSAGE_ACTOR1, source_actor_id, data)
+}
+
 // ---------------------------------------------------------------------------
 // 0x0166-0x016A "Text Sheet Message (No Source Actor)" family — system
 // messages routed through a static sender (WorldMaster, gamedata id, etc.)

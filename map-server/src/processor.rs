@@ -1445,6 +1445,20 @@ impl PacketProcessor {
                     "SendMessage captured (login-hook sys message; packet emit deferred)"
                 );
             }
+            LC::SendGameMessage {
+                actor_id,
+                text_id,
+                log_type,
+            } => {
+                crate::runtime::quest_apply::apply_send_game_message(
+                    actor_id,
+                    text_id,
+                    log_type,
+                    &self.registry,
+                    &self.world,
+                )
+                .await;
+            }
             LC::SetHomePoint {
                 player_id,
                 homepoint,

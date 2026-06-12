@@ -36,6 +36,10 @@ pub struct SpawnLocation {
     pub rotation: f32,
     pub state: u16,
     pub animation_id: u32,
+    /// MapObj background-geometry binding (`server_eventnpc_mapobj`,
+    /// LEFT JOINed by the spawn loader). 0/0 for regular NPCs.
+    pub mapobj_layout_id: u32,
+    pub mapobj_instance_id: u32,
 }
 
 impl SpawnLocation {
@@ -65,7 +69,16 @@ impl SpawnLocation {
             rotation,
             state,
             animation_id,
+            mapobj_layout_id: 0,
+            mapobj_instance_id: 0,
         }
+    }
+
+    /// Chainable setter for the MapObj layout binding.
+    pub fn with_mapobj(mut self, layout_id: u32, instance_id: u32) -> Self {
+        self.mapobj_layout_id = layout_id;
+        self.mapobj_instance_id = instance_id;
+        self
     }
 
     /// Convenience — does this spawn live inside a private area?
