@@ -2158,32 +2158,38 @@ impl UserData for LuaPlayer {
         // LuaCommand that the game loop translates into a real packet
         // send later; a few are pure snapshot getters.
 
-        methods.add_method(
-            "SendGameMessage",
-            |_,
-             this,
-             (_sender_actor, text_id, log_type, _rest): (
-                Value,
-                u32,
-                Option<u8>,
-                mlua::MultiValue,
-            )| {
-                // Matches the C# signature `SendGameMessage(worldmaster,
-                // textId, logType, params…)`. We flatten the dynamic
-                // params into the chat text field so scripts still see
-                // their message reach the client.
-                push(
-                    &this.queue,
-                    LuaCommand::SendMessage {
-                        actor_id: this.snapshot.actor_id,
-                        message_type: log_type.unwrap_or(0x20),
-                        sender: String::new(),
-                        text: format!("text:{text_id}"),
-                    },
-                );
-                Ok(())
-            },
-        );
+        methods.add_method("SendGameMessage", |_, this, args: mlua::MultiValue| {
+            // Meteor `Player.SendGameMessage` has two overloads the
+            // scripts actually use:
+            //   (textIdOwner, textId, log, …)              — 3+ args
+            //   (sourceActor, textIdOwner, textId, log, …) — 4+ args
+            //     (the OpeningStoper* "caution" handlers pass the
+            //      player first)
+            // The previous binding hard-typed the 3-arg shape, so a
+            // 4-arg call failed the u32 conversion and the whole hook
+            // died before its EndEvent — the Ul'dah stopper's caution
+            // line never reached the client (issue #26 retest). Sniff
+            // the first integer arg as textId, the next as logType,
+            // and skip the leading actor userdata args.
+            let mut ints = args.iter().filter_map(|v| match v {
+                Value::Integer(i) => Some(*i),
+                Value::Number(n) => Some(*n as i64),
+                _ => None,
+            });
+            let Some(text_id) = ints.next() else {
+                return Ok(());
+            };
+            let log_type = ints.next().map(|v| v.clamp(0, 255) as u8).unwrap_or(0x20);
+            push(
+                &this.queue,
+                LuaCommand::SendGameMessage {
+                    actor_id: this.snapshot.actor_id,
+                    text_id: text_id.max(0) as u32,
+                    log_type,
+                },
+            );
+            Ok(())
+        });
         methods.add_method("SendDataPacket", |_, this, varargs: mlua::MultiValue| {
             // Port of C# `Player::SendDataPacket` (0x0133 GenericData).
             // Marshal the FULL variadic arg list generically (not just a

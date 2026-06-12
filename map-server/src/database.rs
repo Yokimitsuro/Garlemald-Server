@@ -594,12 +594,17 @@ impl Database {
         let rows = self
             .conn
             .call_db(|c| {
+                // LEFT JOIN the MapObj layout-binding side table — Meteor
+                // `WorldManager.cs:341` does the same join so doors/gates
+                // carry their background-geometry ids into the spawn.
                 let mut stmt = c.prepare(
-                    r"SELECT actorClassId, uniqueId, zoneId,
-                             privateAreaName, privateAreaLevel,
-                             positionX, positionY, positionZ, rotation,
-                             actorState, animationId
-                      FROM server_spawn_locations",
+                    r"SELECT sl.actorClassId, sl.uniqueId, sl.zoneId,
+                             sl.privateAreaName, sl.privateAreaLevel,
+                             sl.positionX, sl.positionY, sl.positionZ, sl.rotation,
+                             sl.actorState, sl.animationId,
+                             mo.layoutId, mo.instanceId
+                      FROM server_spawn_locations sl
+                      LEFT JOIN server_eventnpc_mapobj mo ON mo.id = sl.id",
                 )?;
                 let rows: Vec<crate::zone::SpawnLocation> = stmt
                     .query_map([], |r| {
@@ -615,6 +620,8 @@ impl Database {
                             rotation: r.get::<_, f32>(8).unwrap_or_default(),
                             state: r.get::<_, u16>(9).unwrap_or_default(),
                             animation_id: r.get::<_, u32>(10).unwrap_or_default(),
+                            mapobj_layout_id: r.get::<_, u32>(11).unwrap_or_default(),
+                            mapobj_instance_id: r.get::<_, u32>(12).unwrap_or_default(),
                         })
                     })?
                     .collect::<rusqlite::Result<_>>()?;

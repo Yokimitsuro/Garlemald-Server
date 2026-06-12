@@ -203,6 +203,38 @@ pub async fn apply_runtime_lua_command(
             apply_set_quest_complete(player_id, quest_id, flag, registry, db).await;
             true
         }
+        // `GetWorldManager():DoPlayerMoveInZone(...)` / `WarpToPosition`
+        // from a quest/NPC hook. The login pipeline handles this command
+        // in `PacketProcessor::apply_login_lua_command`, but the quest
+        // drain (chat-resume `apply_event_script_commands` → here) had
+        // NO arm — so man0u0's `onPush(EXIT_TRIGGER)` bounce and the
+        // OpeningStoper "exit" bounce played their dialogue and then
+        // silently dropped the move, letting the player walk out of the
+        // Ul'dah opening zone (issue #26 retest).
+        LC::WarpToPosition {
+            actor_id,
+            x,
+            y,
+            z,
+            rotation,
+            spawn_type,
+        } => {
+            apply_warp_to_position_runtime(
+                actor_id, x, y, z, rotation, spawn_type, registry, world,
+            )
+            .await;
+            true
+        }
+        // `player:SendGameMessage(...)` from a quest/NPC hook — e.g. the
+        // opening stoppers' "caution" circle (text 34109 "off limits").
+        LC::SendGameMessage {
+            actor_id,
+            text_id,
+            log_type,
+        } => {
+            apply_send_game_message(actor_id, text_id, log_type, registry, world).await;
+            true
+        }
         LC::AddExp {
             actor_id,
             class_id,
@@ -1046,6 +1078,37 @@ pub(crate) async fn apply_despawn_actor(
     let Some(zone_arc) = world.zone(zone).await else {
         return;
     };
+    // Disarm the actor's event-condition triggers BEFORE the remove.
+    // The 1.23b client does NOT clear armed push circles when an actor
+    // is deleted — live-confirmed in the Ul'dah opener teardown (#26):
+    // the arena fence's outwards "exit" circle (radius 40) survived the
+    // stopper's RemoveActor, fired against the ghost when the SEQ_010
+    // warp repositioned the player >40y away, and the orphan event
+    // exchange (client EventStart vs our EndEvent echoes, mid
+    // zone-change) hard-crashed the client ~3 s into the warp.
+    let conditions = {
+        let c = handle.character.read().await;
+        c.base.event_conditions.clone()
+    };
+    if !conditions.is_empty() {
+        for sub in crate::packets::send::build_actor_event_status_packets(
+            actor_id,
+            &conditions,
+            false,
+            false,
+            Some(false),
+            false,
+        ) {
+            crate::runtime::broadcast::broadcast_around_actor(
+                world,
+                registry,
+                &zone_arc,
+                actor_id,
+                sub.to_bytes(),
+            )
+            .await;
+        }
+    }
     let sub = crate::packets::send::actor::build_remove_actor(actor_id);
     let recipients = crate::runtime::broadcast::broadcast_around_actor(
         world,
@@ -2273,22 +2336,31 @@ pub async fn apply_quest_update_enpcs(
         broadcast_quest_enpc_clear(player_id, enpc, registry, world).await;
     }
 
-    // Force-rebroadcast every ENPC currently active for this quest.
+    // Re-broadcast the quest GRAPHIC (head marker) of every ENPC
+    // currently active for this quest — but NOT the SetEventStatus
+    // overrides.
     //
-    // Why: `apply_quest_set_enpc` only emits a broadcast when `add_enpc`
-    // returns `New` or `Updated` — i.e. when the new flags differ from the
-    // previous sequence's. After a cinematic noticeEvent ack, re-running
-    // `onStateChange` typically computes the *same* flags as zone-in
-    // (e.g. man0g0 SEQ_000 with MINITUT0/MINITUT1 still false), so every
-    // SetEnpc returns `Unchanged` and no packets go out. The 1.x client
-    // appears to drop quest-graphic state across cinematic playback,
-    // though, so without a fresh broadcast Yda's `!` icon never reappears
-    // and the player thinks no NPC is interactable.
+    // Why the graphic: `apply_quest_set_enpc` only emits a broadcast
+    // when `add_enpc` returns `New` or `Updated`. After a cinematic
+    // noticeEvent ack, re-running `onStateChange` typically computes
+    // the *same* flags as zone-in (e.g. man0g0 SEQ_000 with
+    // MINITUT0/MINITUT1 still false), so every SetEnpc returns
+    // `Unchanged` and no packets go out — yet the 1.x client drops
+    // quest-graphic state across cinematic playback, so without a
+    // fresh graphic Yda's `!` icon never reappears.
     //
-    // Pmeteor's `QuestState.UpdateState()` re-emits unconditionally, so
-    // matching that here produces the same wire-level behaviour. The
-    // duplicate packet at zone-in (when no cinematic has played yet) is
-    // a tiny cost.
+    // Why NOT the statuses: pmeteor's `QuestState.AddENpc` is silent
+    // for unchanged entries — quest SetEventStatus overrides only go
+    // out for new/changed registrations, and entries dropped from the
+    // sequence get RESET to the actor's own per-condition defaults
+    // (`UpdateQuestNpcInInstance(enpc, clearInstance=true)` →
+    // `GetSetEventStatusPackets()` with `pushEnabled = null`).
+    // Re-emitting the overrides here permanently re-disabled the
+    // Ul'dah opening stopper's own "exit"/"caution" push circles —
+    // man0u0 registers it with `isPushEnabled=false` every sequence,
+    // so each UpdateENPCs run re-killed the conditions the spawn
+    // bundle's defaults had armed, and the player could walk straight
+    // out of the Merchant Strip (issue #26 retest).
     let active: Vec<QuestEnpc> = {
         let c = handle.character.read().await;
         c.quest_journal
@@ -2297,7 +2369,7 @@ pub async fn apply_quest_update_enpcs(
             .unwrap_or_default()
     };
     for enpc in active {
-        broadcast_quest_enpc_update(player_id, enpc, registry, world).await;
+        broadcast_quest_enpc_graphic(player_id, enpc, registry, world).await;
     }
 }
 
@@ -3771,6 +3843,169 @@ pub(crate) async fn broadcast_quest_enpc_update(
         sub.set_target_id(player_id);
         client.send_bytes(sub.to_bytes()).await;
     }
+    let mut graphic =
+        crate::packets::send::build_set_actor_quest_graphic(npc_actor_id, enpc.quest_flag_type);
+    graphic.set_target_id(player_id);
+    client.send_bytes(graphic.to_bytes()).await;
+}
+
+/// Same-zone teleport for the quest-drain pipeline. Mirrors
+/// `PacketProcessor::apply_warp_to_position` (the login-pipeline arm,
+/// live-verified by the SEQ_005 content warp): mutate the pose, refresh
+/// the session destination, emit a target-stamped `SetActorPosition`.
+/// `player:SendGameMessage(...)` — emit the localized text-sheet line
+/// (Meteor `GameMessagePacket` 0x157 "with actor ×1", WorldMaster as
+/// the text owner) to the player's client, target-stamped for the
+/// world relay. Mirrors `Player.SendGameMessage(sourceActor,
+/// textIdOwner, textId, log)`.
+pub(crate) async fn apply_send_game_message(
+    actor_id: u32,
+    text_id: u32,
+    log_type: u8,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        return;
+    };
+    let session_id = handle.session_id;
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    let mut sub = crate::packets::send::build_game_message_actor1(
+        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        actor_id,
+        crate::packets::send::WORLD_MASTER_ACTOR_ID,
+        text_id.min(u16::MAX as u32) as u16,
+        log_type,
+    );
+    sub.set_target_id(session_id);
+    client.send_bytes(sub.to_bytes()).await;
+    tracing::debug!(
+        actor = actor_id,
+        text_id,
+        log = format!("0x{log_type:02X}"),
+        "SendGameMessage emitted",
+    );
+}
+
+/// Used by the `LC::WarpToPosition` arm above — quest `onPush` bounce
+/// paths (`DoPlayerMoveInZone`) ride this.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_warp_to_position_runtime(
+    actor_id: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+    rotation: f32,
+    spawn_type: u8,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(handle) = registry.get(actor_id).await else {
+        tracing::debug!(actor = actor_id, "WarpToPosition: actor not in registry");
+        return;
+    };
+    let session_id = handle.session_id;
+    {
+        let mut c = handle.character.write().await;
+        c.base.position_x = x;
+        c.base.position_y = y;
+        c.base.position_z = z;
+        c.base.rotation = rotation;
+    }
+    if let Some(mut session) = world.session(session_id).await {
+        session.destination_x = x;
+        session.destination_y = y;
+        session.destination_z = z;
+        session.destination_rot = rotation;
+        session.destination_spawn_type = spawn_type;
+        world.upsert_session(session).await;
+    }
+    if let Some(client) = world.client(session_id).await {
+        let mut pkt = crate::packets::send::build_set_actor_position(
+            actor_id,
+            actor_id as i32,
+            x,
+            y,
+            z,
+            rotation,
+            spawn_type.into(),
+            false,
+        );
+        // Untargeted subpackets are dropped by the world-server proxy
+        // fan-out (Garlemald-Server #28).
+        pkt.set_target_id(session_id);
+        client.send_bytes(pkt.to_bytes()).await;
+        tracing::info!(
+            actor = actor_id,
+            x,
+            y,
+            z,
+            rotation,
+            spawn_type,
+            "WarpToPosition (quest drain) applied + SetActorPosition emitted"
+        );
+    } else {
+        tracing::debug!(
+            actor = actor_id,
+            "WarpToPosition (quest drain): no client handle — pose updated, no packet"
+        );
+    }
+}
+
+/// Graphic-only variant of [`broadcast_quest_enpc_update`] — re-emits the
+/// head-marker (`SetActorQuestGraphic`) WITHOUT the SetEventStatus
+/// overrides. Used by `apply_quest_update_enpcs`'s unchanged-entry
+/// refresh: pmeteor's `QuestState.AddENpc` sends nothing for unchanged
+/// registrations, so repeating the status overrides there diverges from
+/// the reference — concretely it kept re-disabling the Ul'dah opening
+/// stopper's own "exit"/"caution" push circles (registered with
+/// `isPushEnabled=false` every sequence), undoing the spawn bundle's
+/// per-condition defaults and letting the player walk out of the
+/// Merchant Strip.
+async fn broadcast_quest_enpc_graphic(
+    player_id: u32,
+    enpc: QuestEnpc,
+    registry: &ActorRegistry,
+    world: &WorldManager,
+) {
+    let Some(player_handle) = registry.get(player_id).await else {
+        return;
+    };
+    let session_id = player_handle.session_id;
+    if session_id == 0 {
+        return;
+    }
+    let Some(client) = world.client(session_id).await else {
+        return;
+    };
+    // Same session-driven zone + private-area resolution as
+    // `broadcast_quest_enpc_update` — the ActorHandle's zone_id is
+    // frozen at registration.
+    let (zone_id, requester_area) = match world.session(session_id).await {
+        Some(s) if s.current_zone_id != 0 => (
+            s.current_zone_id,
+            s.current_private_area_name
+                .clone()
+                .map(|n| (n, s.current_private_area_level)),
+        ),
+        _ => (player_handle.zone_id, None),
+    };
+    let Some(npc_handle) = find_npc_by_class_id(
+        registry,
+        zone_id,
+        enpc.actor_class_id,
+        requester_area.as_ref(),
+    )
+    .await
+    else {
+        return;
+    };
+    let npc_actor_id = {
+        let c = npc_handle.character.read().await;
+        c.base.actor_id
+    };
     let mut graphic =
         crate::packets::send::build_set_actor_quest_graphic(npc_actor_id, enpc.quest_flag_type);
     graphic.set_target_id(player_id);

@@ -48,6 +48,15 @@ pub enum LuaCommand {
         sender: String,
         text: String,
     },
+    /// `player:SendGameMessage(...)` — a localized text-sheet line the
+    /// client renders itself (Meteor `GameMessagePacket`, opcode 0x157
+    /// "with actor ×1"). E.g. 34109 = the opening stoppers' "off
+    /// limits" caution. The WorldMaster actor is the text owner.
+    SendGameMessage {
+        actor_id: u32,
+        text_id: u32,
+        log_type: u8,
+    },
     EndEvent {
         player_id: u32,
         event_owner: u32,

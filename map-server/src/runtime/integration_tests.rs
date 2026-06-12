@@ -14342,3 +14342,250 @@ async fn s4_2_real_director_full_sequence_kill_gate_to_warp() {
         assert_eq!(sched.pending_event_count(), 0);
     }
 }
+
+/// Issue #26 — Ul'dah opener `Man0u0` "Flowers for All" SEQ_000
+/// drive-through. Runs the REAL `scripts/lua/quests/man/man0u0.lua`
+/// through the same pipeline the live talk path uses
+/// (`fire_quest_on_talk_via_command` → yield at `callClientFunction` →
+/// auto-resume → SetFlag / UpdateENPCs drain) and asserts the spec from
+/// the issue:
+///   * at SEQ_000 start only Ascilia is marked (Farmhand / Mistress
+///     suppressed while her push tutorial is pending),
+///   * each talk durably sets its `FLAG_SEQ000_MINITUT*` bit,
+///   * a completed NPC's marker clears on the next `UpdateENPCs`,
+///   * at flags == 0xF the exit door arms (`QFLAG_PUSH`) and pushing it
+///     advances the quest to SEQ_005.
+#[tokio::test]
+async fn man0u0_seq000_tutorial_flags_and_exit_gate() {
+    use crate::actor::quest::{Quest, quest_actor_id};
+    use crate::runtime::quest_apply::{
+        apply_quest_start_sequence, fire_quest_on_push_via_command, fire_quest_on_talk_via_command,
+    };
+
+    const QUEST_ID: u32 = 110_009;
+    const ASCILIA: u32 = 1_000_042;
+    const FRETFUL_FARMHAND: u32 = 1_001_491;
+    const GIL_DIGGING_MISTRESS: u32 = 1_001_495;
+    const EXIT_TRIGGER: u32 = 1_090_372;
+    // scripts/lua/quest.lua
+    const QFLAG_OFF: u8 = 0;
+    const QFLAG_TALK: u8 = 2;
+    const QFLAG_PUSH: u8 = 3;
+
+    let script_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("scripts/lua");
+    if !script_root.join("quests/man/man0u0.lua").exists() {
+        return; // trimmed artifact; skip
+    }
+    let lua = Arc::new(crate::lua::LuaEngine::new(&script_root));
+    {
+        let mut quests = std::collections::HashMap::new();
+        quests.insert(
+            QUEST_ID,
+            crate::gamedata::QuestMeta {
+                id: QUEST_ID,
+                quest_name: "Flowers for All".to_string(),
+                class_name: "Man0u0".to_string(),
+                prerequisite: 0,
+                min_level: 1,
+            },
+        );
+        lua.catalogs().install_quests(quests);
+    }
+
+    let db = crate::database::Database::open(tempdb()).await.unwrap();
+    let world = WorldManager::new();
+    let registry = ActorRegistry::new();
+    let zone = Zone::new(
+        230,
+        "uldah",
+        1,
+        "/Area/Zone/Uldah",
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        Some(&StubNavmeshLoader),
+    );
+    world.register_zone(zone).await;
+
+    let mut player = Character::new(7);
+    player.base.zone_id = 230;
+    let mut quest = Quest::new(quest_actor_id(QUEST_ID), "Man0u0".to_string());
+    quest.clear_dirty();
+    player.quest_journal.add(quest);
+    let handle = ActorHandle::new(7, ActorKindTag::Player, 230, 7, player);
+    registry.insert(handle.clone()).await;
+
+    let enpc_flag = |class_id: u32| {
+        let handle = handle.clone();
+        async move {
+            let c = handle.character.read().await;
+            c.quest_journal
+                .get(QUEST_ID)
+                .and_then(|q| q.state.current.get(&class_id).map(|e| e.quest_flag_type))
+        }
+    };
+    let flags = || {
+        let handle = handle.clone();
+        async move {
+            let c = handle.character.read().await;
+            c.quest_journal
+                .get(QUEST_ID)
+                .map(|q| q.get_flags())
+                .unwrap_or(0)
+        }
+    };
+    let npc_spec = |class_id: u32| crate::lua::LuaNpcSpec {
+        actor_id: 0x4000_0000 | class_id,
+        name: "tutorial_npc".to_string(),
+        class_name: "PopulaceStandard".to_string(),
+        class_path: "Chara/Npc/Populace/PopulaceStandard".to_string(),
+        unique_id: String::new(),
+        zone_id: 230,
+        zone_name: "uldah".to_string(),
+        state: 0,
+        pos: (0.0, 0.0, 0.0),
+        rotation: 0.0,
+        actor_class_id: class_id,
+        quest_graphic: 0,
+    };
+
+    // onStart → StartSequence(SEQ_000) → onStateChange populates the
+    // ENPC table.
+    apply_quest_start_sequence(7, QUEST_ID, 0, &registry, &db, &world, Some(&lua)).await;
+
+    assert_eq!(
+        enpc_flag(ASCILIA).await,
+        Some(QFLAG_TALK),
+        "at SEQ_000 start Ascilia must be marked TALK",
+    );
+    assert_eq!(
+        enpc_flag(FRETFUL_FARMHAND).await,
+        Some(QFLAG_OFF),
+        "Farmhand marker must be suppressed until Ascilia's push tutorial",
+    );
+    assert_eq!(
+        enpc_flag(GIL_DIGGING_MISTRESS).await,
+        Some(QFLAG_OFF),
+        "Mistress marker must be suppressed until Ascilia's push tutorial",
+    );
+    assert_eq!(
+        enpc_flag(EXIT_TRIGGER).await,
+        Some(QFLAG_OFF),
+        "exit door must be unarmed at start",
+    );
+
+    // Talk #1 — Ascilia: processTtrNomal003 + SetFlag(MINITUT0).
+    fire_quest_on_talk_via_command(
+        &handle,
+        QUEST_ID,
+        npc_spec(ASCILIA),
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(
+        flags().await,
+        0b0001,
+        "Ascilia talk #1 must durably set FLAG_SEQ000_MINITUT0",
+    );
+    assert_eq!(
+        enpc_flag(ASCILIA).await,
+        Some(QFLAG_TALK),
+        "Ascilia stays marked until her second talk (MINITUT1)",
+    );
+    assert_eq!(
+        enpc_flag(FRETFUL_FARMHAND).await,
+        Some(QFLAG_TALK),
+        "Farmhand marker must appear once Ascilia's push tutorial is done",
+    );
+    assert_eq!(
+        enpc_flag(GIL_DIGGING_MISTRESS).await,
+        Some(QFLAG_TALK),
+        "Mistress marker must appear once Ascilia's push tutorial is done",
+    );
+
+    // Talk #2 — Ascilia: processTtrMini001 + SetFlag(MINITUT1) → her
+    // marker clears.
+    fire_quest_on_talk_via_command(
+        &handle,
+        QUEST_ID,
+        npc_spec(ASCILIA),
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(flags().await, 0b0011, "Ascilia talk #2 sets MINITUT1");
+    assert_eq!(
+        enpc_flag(ASCILIA).await,
+        Some(QFLAG_OFF),
+        "Ascilia's marker must clear after MINITUT1",
+    );
+
+    // Farmhand + Mistress.
+    fire_quest_on_talk_via_command(
+        &handle,
+        QUEST_ID,
+        npc_spec(FRETFUL_FARMHAND),
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(flags().await, 0b0111, "Farmhand talk sets MINITUT2");
+    assert_eq!(
+        enpc_flag(FRETFUL_FARMHAND).await,
+        Some(QFLAG_OFF),
+        "Farmhand's marker must clear after MINITUT2",
+    );
+
+    fire_quest_on_talk_via_command(
+        &handle,
+        QUEST_ID,
+        npc_spec(GIL_DIGGING_MISTRESS),
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    assert_eq!(flags().await, 0xF, "Mistress talk sets MINITUT3 → all four");
+    assert_eq!(
+        enpc_flag(EXIT_TRIGGER).await,
+        Some(QFLAG_PUSH),
+        "exit door must arm once flags reach 0xF",
+    );
+
+    // Push the exit door → doExitTrigger → StartSequence(SEQ_005).
+    fire_quest_on_push_via_command(
+        &handle,
+        QUEST_ID,
+        npc_spec(EXIT_TRIGGER),
+        &registry,
+        &db,
+        &world,
+        Some(&lua),
+    )
+    .await;
+    let sequence = {
+        let c = handle.character.read().await;
+        c.quest_journal.get(QUEST_ID).map(|q| q.get_sequence())
+    };
+    assert_eq!(
+        sequence,
+        Some(5),
+        "pushing the armed exit door must advance Man0u0 to SEQ_005",
+    );
+}

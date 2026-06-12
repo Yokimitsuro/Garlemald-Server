@@ -191,6 +191,12 @@ async fn spawn_one(
             npc.character.chara.model_id = model_id;
             npc.character.chara.appearance_ids = slots;
         }
+        // MapObj layout binding (doors/gates). Meteor threads these from
+        // `SpawnLocation` into `Npc.MapObjLayoutId/InstanceId`; the spawn
+        // bundle swaps the appearance packet for SetActorBGProperties
+        // when both are non-zero.
+        npc.character.base.mapobj_layout_id = seed.mapobj_layout_id;
+        npc.character.base.mapobj_instance_id = seed.mapobj_instance_id;
         let id = npc.actor_id();
         (id, npc.character, ActorKindTag::Npc, ActorKind::Npc)
     };
